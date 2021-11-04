@@ -1,4 +1,4 @@
-aiohttp==3.7
+aiohttp==3.7.4
 blist
 boto3
 cython==0.29.0
