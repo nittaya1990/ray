@@ -3,6 +3,7 @@ import logging
 from typing import Optional, Union
 
 from ray.util import log_once
+from ray.util.annotations import _mark_annotated
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +39,13 @@ def deprecation_warning(
         old, (" Use `{}` instead.".format(new) if new else f" {help}" if help else "")
     )
 
-    if error is True:
-        raise DeprecationWarning(msg)
-    elif error and issubclass(error, Exception):
-        raise error(msg)
+    if error:
+        if not isinstance(error, bool) and issubclass(error, Exception):
+            # error is an Exception
+            raise error(msg)
+        else:
+            # error is a boolean, construct ValueError ourselves
+            raise ValueError(msg)
     else:
         logger.warning(
             "DeprecationWarning: " + msg + " This will raise an error in the future!"
@@ -63,25 +67,29 @@ def Deprecated(old=None, *, new=None, help=None, error):
     In a further major release, the class, method, function should be erased
     entirely from the codebase.
 
-    Examples:
-        >>> # Deprecated class: Patches the constructor to warn if the class is
-        ... # used.
-        ... @Deprecated(new="NewAndMuchCoolerClass", error=False)
-        ... class OldAndUncoolClass:
-        ...     ...
 
-        >>> # Deprecated class method: Patches the method to warn if called.
-        ... class StillCoolClass:
-        ...     ...
-        ...     @Deprecated(new="StillCoolClass.new_and_much_cooler_method()",
-        ...                 error=False)
-        ...     def old_and_uncool_method(self, uncool_arg):
-        ...         ...
+    .. testcode::
+        :skipif: True
 
-        >>> # Deprecated function: Patches the function to warn if called.
-        ... @Deprecated(new="new_and_much_cooler_function", error=False)
-        ... def old_and_uncool_function(*uncool_args):
-        ...     ...
+        from ray.rllib.utils.deprecation import Deprecated
+        # Deprecated class: Patches the constructor to warn if the class is
+        # used.
+        @Deprecated(new="NewAndMuchCoolerClass", error=False)
+        class OldAndUncoolClass:
+            ...
+
+        # Deprecated class method: Patches the method to warn if called.
+        class StillCoolClass:
+            ...
+            @Deprecated(new="StillCoolClass.new_and_much_cooler_method()",
+                        error=False)
+            def old_and_uncool_method(self, uncool_arg):
+                ...
+
+        # Deprecated function: Patches the function to warn if called.
+        @Deprecated(new="new_and_much_cooler_function", error=False)
+        def old_and_uncool_function(*uncool_args):
+            ...
     """
 
     def _inner(obj):
@@ -101,6 +109,7 @@ def Deprecated(old=None, *, new=None, help=None, error):
                 return obj_init(*args, **kwargs)
 
             obj.__init__ = patched_init
+            _mark_annotated(obj)
             # Return the patched class (with the warning/error when
             # instantiated).
             return obj

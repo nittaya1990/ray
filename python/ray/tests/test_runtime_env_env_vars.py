@@ -48,6 +48,7 @@ def test_environment_variables_actor(ray_start_regular):
 def test_environment_variables_nested_task(ray_start_regular):
     @ray.remote
     def get_env(key):
+        print(os.environ)
         return os.environ.get(key)
 
     @ray.remote
@@ -299,7 +300,29 @@ def test_environment_variables_env_caching(shutdown_only):
     assert pid7 == pid1
 
 
+def test_appendable_environ(ray_start_regular):
+    @ray.remote
+    def get_env(key):
+        return os.environ.get(key)
+
+    custom_env = os.path.pathsep + "/usr/local/bin"
+    remote_env = ray.get(
+        get_env.options(
+            runtime_env={
+                "env_vars": {
+                    "PATH": "${PATH}" + custom_env,
+                }
+            }
+        ).remote("PATH")
+    )
+    assert remote_env.endswith(custom_env)
+    assert len(remote_env) > len(custom_env)
+
+
 if __name__ == "__main__":
     import pytest
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

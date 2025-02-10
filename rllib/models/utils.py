@@ -1,15 +1,20 @@
-from typing import Optional
+from typing import Callable, Optional, Union
 
+from ray.rllib.utils.annotations import DeveloperAPI
 from ray.rllib.utils.framework import try_import_jax, try_import_tf, try_import_torch
 
 
-def get_activation_fn(name: Optional[str] = None, framework: str = "tf"):
+@DeveloperAPI
+def get_activation_fn(
+    name: Optional[Union[Callable, str]] = None,
+    framework: str = "tf",
+):
     """Returns a framework specific activation function, given a name string.
 
     Args:
-        name (Optional[str]): One of "relu" (default), "tanh", "elu",
-            "swish", or "linear" (same as None).
-        framework (str): One of "jax", "tf|tfe|tf2" or "torch".
+        name: One of "relu" (default), "tanh", "elu",
+            "swish" (or "silu", which is the same), or "linear" (same as None).
+        framework: One of "jax", "tf|tf2" or "torch".
 
     Returns:
         A framework-specific activtion function. e.g. tf.nn.tanh or
@@ -22,41 +27,53 @@ def get_activation_fn(name: Optional[str] = None, framework: str = "tf"):
     if callable(name):
         return name
 
+    name_lower = name.lower() if isinstance(name, str) else name
+
     # Infer the correct activation function from the string specifier.
     if framework == "torch":
-        if name in ["linear", None]:
+        if name_lower in ["linear", None]:
             return None
-        if name == "swish":
-            from ray.rllib.utils.torch_utils import Swish
 
-            return Swish
         _, nn = try_import_torch()
-        if name == "relu":
+        # First try getting the correct activation function from nn directly.
+        # Note that torch activation functions are not all lower case.
+        fn = getattr(nn, name, None)
+        if fn is not None:
+            return fn
+
+        if name_lower in ["swish", "silu"]:
+            return nn.SiLU
+        elif name_lower == "relu":
             return nn.ReLU
-        elif name == "tanh":
+        elif name_lower == "tanh":
             return nn.Tanh
-        elif name == "elu":
+        elif name_lower == "elu":
             return nn.ELU
     elif framework == "jax":
-        if name in ["linear", None]:
+        if name_lower in ["linear", None]:
             return None
         jax, _ = try_import_jax()
-        if name == "swish":
+        if name_lower in ["swish", "silu"]:
             return jax.nn.swish
-        if name == "relu":
+        if name_lower == "relu":
             return jax.nn.relu
-        elif name == "tanh":
+        elif name_lower == "tanh":
             return jax.nn.hard_tanh
-        elif name == "elu":
+        elif name_lower == "elu":
             return jax.nn.elu
     else:
-        assert framework in ["tf", "tfe", "tf2"], "Unsupported framework `{}`!".format(
+        assert framework in ["tf", "tf2"], "Unsupported framework `{}`!".format(
             framework
         )
-        if name in ["linear", None]:
+        if name_lower in ["linear", None]:
             return None
+
         tf1, tf, tfv = try_import_tf()
-        fn = getattr(tf.nn, name, None)
+        # Try getting the correct activation function from tf.nn directly.
+        # Note that tf activation functions are all lower case, so this should always
+        # work.
+        fn = getattr(tf.nn, name_lower, None)
+
         if fn is not None:
             return fn
 
@@ -65,6 +82,88 @@ def get_activation_fn(name: Optional[str] = None, framework: str = "tf"):
     )
 
 
+@DeveloperAPI
+def get_initializer_fn(name: Optional[Union[str, Callable]], framework: str = "torch"):
+    """Returns the framework-specific initializer class or function.
+
+    This function relies fully on the specified initializer classes and
+    functions in the frameworks `torch` and `tf2` (see for `torch`
+    https://pytorch.org/docs/stable/nn.init.html and for `tf2` see
+    https://www.tensorflow.org/api_docs/python/tf/keras/initializers).
+
+    Note, for framework `torch` the in-place initializers are needed, i.e. names
+    should end with an underscore `_`, e.g. `glorot_uniform_`.
+
+    Args:
+        name: Name of the initializer class or function in one of the two
+            supported frameworks, i.e. `torch` or `tf2`.
+        framework: The framework string, either `torch  or `tf2`.
+
+    Returns:
+        A framework-specific function or class defining an initializer to be used
+        for network initialization,
+
+    Raises:
+        `ValueError` if the `name` is neither class or function in the specified
+        `framework`. Raises also a `ValueError`, if `name` does not define an
+        in-place initializer for framework `torch`.
+    """
+    # Already a callable or `None` return as is. If `None` we use the default
+    # initializer defined in the framework-specific layers themselves.
+    if callable(name) or name is None:
+        return name
+
+    if framework == "torch":
+        name_lower = name.lower() if isinstance(name, str) else name
+
+        _, nn = try_import_torch()
+
+        # Check, if the name includes an underscore. We must use the
+        # in-place initialization from Torch.
+        if not name_lower.endswith("_"):
+            raise ValueError(
+                "Not an in-place initializer: Torch weight initializers "
+                "need to be provided as their in-place version, i.e. "
+                "<initializaer_name> + '_'. See "
+                "https://pytorch.org/docs/stable/nn.init.html. "
+                f"User provided {name}."
+            )
+
+        # First, try to get the initialization directly from `nn.init`.
+        # Note, that all initialization methods in `nn.init` are lower
+        # case and that `<method>_` defines the "in-place" method.
+        fn = getattr(nn.init, name_lower, None)
+        if fn is not None:
+            # TODO (simon): Raise a warning if not "in-place" method.
+            return fn
+        # Unknown initializer.
+        else:
+            # Inform the user that this initializer does not exist.
+            raise ValueError(
+                f"Unknown initializer name: {name_lower} is not a method in "
+                "`torch.nn.init`!"
+            )
+    elif framework == "tf2":
+        # Note, as initializer classes in TensorFlow can be either given by their
+        # name in camel toe typing or by their shortcut we use the `name` as it is.
+        # See https://www.tensorflow.org/api_docs/python/tf/keras/initializers.
+
+        _, tf, _ = try_import_tf()
+
+        # Try to get the initialization function directly from `tf.keras.initializers`.
+        fn = getattr(tf.keras.initializers, name, None)
+        if fn is not None:
+            return fn
+        # Unknown initializer.
+        else:
+            # Inform the user that this initializer does not exist.
+            raise ValueError(
+                f"Unknown initializer: {name} is not a initializer in "
+                "`tf.keras.initializers`!"
+            )
+
+
+@DeveloperAPI
 def get_filter_config(shape):
     """Returns a default Conv2D filter config (list) for a given image shape.
 
@@ -75,18 +174,6 @@ def get_filter_config(shape):
         List[list]: The Conv2D filter configuration usable as `conv_filters`
             inside a model config dict.
     """
-    # VizdoomGym (large 480x640).
-    filters_480x640 = [
-        [16, [24, 32], [14, 18]],
-        [32, [6, 6], 4],
-        [256, [9, 9], 1],
-    ]
-    # VizdoomGym (small 240x320).
-    filters_240x320 = [
-        [16, [12, 16], [7, 9]],
-        [32, [6, 6], 4],
-        [256, [9, 9], 1],
-    ]
     # 96x96x3 (e.g. CarRacing-v0).
     filters_96x96 = [
         [16, [8, 8], 4],
@@ -98,6 +185,13 @@ def get_filter_config(shape):
         [16, [8, 8], 4],
         [32, [4, 4], 2],
         [256, [11, 11], 1],
+    ]
+    # Dreamer-style (XS-sized model) Atari or DM Control Suite.
+    filters_64x64 = [
+        [16, [4, 4], 2],
+        [32, [4, 4], 2],
+        [64, [4, 4], 2],
+        [128, [4, 4], 2],
     ]
     # Small (1/2) Atari.
     filters_42x42 = [
@@ -112,14 +206,12 @@ def get_filter_config(shape):
     ]
 
     shape = list(shape)
-    if len(shape) in [2, 3] and (shape[:2] == [480, 640] or shape[1:] == [480, 640]):
-        return filters_480x640
-    elif len(shape) in [2, 3] and (shape[:2] == [240, 320] or shape[1:] == [240, 320]):
-        return filters_240x320
-    elif len(shape) in [2, 3] and (shape[:2] == [96, 96] or shape[1:] == [96, 96]):
+    if len(shape) in [2, 3] and (shape[:2] == [96, 96] or shape[1:] == [96, 96]):
         return filters_96x96
     elif len(shape) in [2, 3] and (shape[:2] == [84, 84] or shape[1:] == [84, 84]):
         return filters_84x84
+    elif len(shape) in [2, 3] and (shape[:2] == [64, 64] or shape[1:] == [64, 64]):
+        return filters_64x64
     elif len(shape) in [2, 3] and (shape[:2] == [42, 42] or shape[1:] == [42, 42]):
         return filters_42x42
     elif len(shape) in [2, 3] and (shape[:2] == [10, 10] or shape[1:] == [10, 10]):
@@ -128,18 +220,19 @@ def get_filter_config(shape):
         raise ValueError(
             "No default configuration for obs shape {}".format(shape)
             + ", you must specify `conv_filters` manually as a model option. "
-            "Default configurations are only available for inputs of shape "
-            "[42, 42, K] and [84, 84, K]. You may alternatively want "
-            "to use a custom model or preprocessor."
+            "Default configurations are only available for inputs of the following "
+            "shapes: [42, 42, K], [84, 84, K], [64, 64, K], [10, 10, K]. You may "
+            "alternatively want to use a custom model or preprocessor."
         )
 
 
+@DeveloperAPI
 def get_initializer(name, framework="tf"):
     """Returns a framework specific initializer, given a name string.
 
     Args:
-        name (str): One of "xavier_uniform" (default), "xavier_normal".
-        framework (str): One of "jax", "tf|tfe|tf2" or "torch".
+        name: One of "xavier_uniform" (default), "xavier_normal".
+        framework: One of "jax", "tf|tf2" or "torch".
 
     Returns:
         A framework-specific initializer function, e.g.
@@ -170,7 +263,7 @@ def get_initializer(name, framework="tf"):
         elif name == "xavier_normal":
             return nn.init.xavier_normal_
     else:
-        assert framework in ["tf", "tfe", "tf2"], "Unsupported framework `{}`!".format(
+        assert framework in ["tf", "tf2"], "Unsupported framework `{}`!".format(
             framework
         )
         tf1, tf, tfv = try_import_tf()

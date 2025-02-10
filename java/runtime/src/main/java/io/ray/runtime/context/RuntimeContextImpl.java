@@ -5,10 +5,14 @@ import io.ray.api.BaseActorHandle;
 import io.ray.api.id.ActorId;
 import io.ray.api.id.JobId;
 import io.ray.api.id.TaskId;
+import io.ray.api.id.UniqueId;
+import io.ray.api.runtimecontext.ActorInfo;
+import io.ray.api.runtimecontext.ActorState;
 import io.ray.api.runtimecontext.NodeInfo;
 import io.ray.api.runtimecontext.ResourceValue;
 import io.ray.api.runtimecontext.RuntimeContext;
-import io.ray.runtime.RayRuntimeInternal;
+import io.ray.api.runtimeenv.RuntimeEnv;
+import io.ray.runtime.AbstractRayRuntime;
 import io.ray.runtime.config.RunMode;
 import io.ray.runtime.util.ResourceUtil;
 import java.util.ArrayList;
@@ -21,9 +25,9 @@ import java.util.stream.Collectors;
 
 public class RuntimeContextImpl implements RuntimeContext {
 
-  private RayRuntimeInternal runtime;
+  private AbstractRayRuntime runtime;
 
-  public RuntimeContextImpl(RayRuntimeInternal runtime) {
+  public RuntimeContextImpl(AbstractRayRuntime runtime) {
     this.runtime = runtime;
   }
 
@@ -47,20 +51,30 @@ public class RuntimeContextImpl implements RuntimeContext {
 
   @Override
   public boolean wasCurrentActorRestarted() {
-    if (isSingleProcess()) {
+    if (isLocalMode()) {
       return false;
     }
     return runtime.getGcsClient().wasCurrentActorRestarted(getCurrentActorId());
   }
 
   @Override
-  public boolean isSingleProcess() {
-    return RunMode.SINGLE_PROCESS == runtime.getRayConfig().runMode;
+  public boolean isLocalMode() {
+    return RunMode.LOCAL == runtime.getRayConfig().runMode;
   }
 
   @Override
   public List<NodeInfo> getAllNodeInfo() {
     return runtime.getGcsClient().getAllNodeInfo();
+  }
+
+  @Override
+  public List<ActorInfo> getAllActorInfo() {
+    return runtime.getGcsClient().getAllActorInfo(null, null);
+  }
+
+  @Override
+  public List<ActorInfo> getAllActorInfo(JobId jobId, ActorState actorState) {
+    return runtime.getGcsClient().getAllActorInfo(jobId, actorState);
   }
 
   @Override
@@ -95,5 +109,15 @@ public class RuntimeContextImpl implements RuntimeContext {
   @Override
   public String getNamespace() {
     return runtime.getNamespace();
+  }
+
+  @Override
+  public UniqueId getCurrentNodeId() {
+    return runtime.getCurrentNodeId();
+  }
+
+  @Override
+  public RuntimeEnv getCurrentRuntimeEnv() {
+    return runtime.getWorkerContext().getCurrentRuntimeEnv();
   }
 }

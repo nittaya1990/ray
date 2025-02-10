@@ -13,37 +13,52 @@
 // limitations under the License.
 
 syntax = "proto3";
-option cc_enable_arenas = true;
 
 package ray.rpc;
 
+import "src/ray/protobuf/runtime_env_common.proto";
+
 import "src/ray/protobuf/agent_manager.proto";
 
-message CreateRuntimeEnvRequest {
+message GetOrCreateRuntimeEnvRequest {
+  /// Json serialized [RuntimeEnv].
+  /// For details, checkout "//python/ray/runtime_env/runtime_env.py".
   string serialized_runtime_env = 1;
-  bytes job_id = 2;
-  // Serialized allocated resource instances. Key is resource type, value is allocated
-  // instances. For example,{"CPU":20000,"memory":40000,"GPU":[10000, 10000]} means 2 cpu
-  // cores, 2 Gi memory, GPU 0 and GPU 1.
-  string serialized_allocated_resource_instances = 3;
+
+  RuntimeEnvConfig runtime_env_config = 2;
+  /// Hex format of [JobId].
+  /// For details, checkout "//src/ray/common/id.h".
+  bytes job_id = 3;
+  string source_process = 4;
 }
 
-message CreateRuntimeEnvReply {
+message GetOrCreateRuntimeEnvReply {
   AgentRpcStatus status = 1;
   string error_message = 2;
+  /// Json serialized [RuntimeEnvContext].
+  /// For details, checkeout "//python/ray/_private/runtime_env/context.py".
   string serialized_runtime_env_context = 3;
 }
 
-message DeleteURIsRequest {
-  repeated string uris = 1;
+message DeleteRuntimeEnvIfPossibleRequest {
+  /// Json serialized [RuntimeEnv].
+  string serialized_runtime_env = 1;
+  string source_process = 2;
 }
 
-message DeleteURIsReply {
+message DeleteRuntimeEnvIfPossibleReply {
   AgentRpcStatus status = 1;
   string error_message = 2;
 }
 
-service RuntimeEnvService {
-  rpc CreateRuntimeEnv(CreateRuntimeEnvRequest) returns (CreateRuntimeEnvReply);
-  rpc DeleteURIs(DeleteURIsRequest) returns (DeleteURIsReply);
+message GetRuntimeEnvsInfoRequest {
+  // Maximum number of entries to return.
+  // If not specified, return the whole entries without truncation.
+  optional int64 limit = 1;
+}
+
+message GetRuntimeEnvsInfoReply {
+  repeated RuntimeEnvState runtime_env_states = 1;
+  // Length of the corresponding resource without truncation.
+  int64 total = 2;
 }

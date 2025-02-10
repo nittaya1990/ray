@@ -1,258 +1,27 @@
 import os
 import sys
-
-import logging
-import pytest
-import redis
 import unittest.mock
+import signal
+import subprocess
+
+import grpc
+import pytest
+
 import ray
 import ray._private.services
-from ray.util.client.ray_client_helpers import ray_start_client_server
 from ray.client_builder import ClientContext
 from ray.cluster_utils import Cluster
-from ray._private.test_utils import run_string_as_driver
 from ray.util.client.common import ClientObjectRef
+from ray.util.client.ray_client_helpers import ray_start_client_server
 from ray.util.client.worker import Worker
-from ray._private.gcs_utils import use_gcs_for_bootstrap
-import grpc
+from ray._private.test_utils import wait_for_condition, enable_external_redis
+from ray._private import ray_constants
 
 
-@pytest.fixture
-def password():
-    random_bytes = os.urandom(128)
-    if hasattr(random_bytes, "hex"):
-        return random_bytes.hex()  # Python 3
-    return random_bytes.encode("hex")  # Python 2
-
-
-class TestRedisPassword:
-    @pytest.mark.skipif(use_gcs_for_bootstrap(), reason="Not valid for gcs bootstrap")
-    def test_redis_password(self, password, shutdown_only):
-        @ray.remote
-        def f():
-            return 1
-
-        info = ray.init(_redis_password=password)
-        address = info["redis_address"]
-        redis_ip, redis_port = address.split(":")
-
-        # Check that we can run a task
-        object_ref = f.remote()
-        ray.get(object_ref)
-
-        # Check that Redis connections require a password
-        redis_client = redis.StrictRedis(host=redis_ip, port=redis_port, password=None)
-        with pytest.raises(redis.exceptions.AuthenticationError):
-            redis_client.ping()
-        # We want to simulate how this is called by ray.scripts.start().
-        try:
-            ray._private.services.wait_for_redis_to_start(
-                redis_ip, redis_port, password="wrong password"
-            )
-        # We catch a generic Exception here in case someone later changes the
-        # type of the exception.
-        except Exception as ex:
-            if not (
-                isinstance(ex.__cause__, redis.AuthenticationError)
-                and "invalid password" in str(ex.__cause__)
-            ) and not (
-                isinstance(ex, redis.ResponseError)
-                and "WRONGPASS invalid username-password pair" in str(ex)
-            ):
-                raise
-            # By contrast, we may be fairly confident the exact string
-            # 'invalid password' won't go away, because redis-py simply wraps
-            # the exact error from the Redis library.
-            # https://github.com/andymccurdy/redis-py/blob/master/
-            # redis/connection.py#L132
-            # Except, apparently sometimes redis-py raises a completely
-            # different *type* of error for a bad password,
-            # redis.ResponseError, which is not even derived from
-            # redis.ConnectionError as redis.AuthenticationError is.
-
-        # Check that we can connect to Redis using the provided password
-        redis_client = redis.StrictRedis(
-            host=redis_ip, port=redis_port, password=password
-        )
-        assert redis_client.ping()
-
-    def test_redis_password_cluster(self, password, shutdown_only):
-        @ray.remote
-        def f():
-            return 1
-
-        node_args = {"redis_password": password}
-        cluster = Cluster(initialize_head=True, connect=True, head_node_args=node_args)
-        cluster.add_node(**node_args)
-
-        object_ref = f.remote()
-        ray.get(object_ref)
-
-
-def test_shutdown_and_reset_global_worker(shutdown_only):
-    ray.init(job_config=ray.job_config.JobConfig(code_search_path=["a"]))
-    ray.shutdown()
-    ray.init()
-
-    @ray.remote
-    class A:
-        def f(self):
-            return 100
-
-    a = A.remote()
-    ray.get(a.f.remote())
-
-
-def test_tmpdir_env_var(shutdown_only):
-    result = run_string_as_driver(
-        """
-import ray
-context = ray.init()
-assert context["session_dir"].startswith("/tmp/qqq"), context
-print("passed")
-""",
-        env=dict(os.environ, **{"RAY_TMPDIR": "/tmp/qqq"}),
-    )
-    assert "passed" in result, result
-
-
-def test_ports_assignment(ray_start_cluster):
-    # Make sure value error is raised when there are the same ports.
-
-    cluster = ray_start_cluster
-    with pytest.raises(ValueError):
-        cluster.add_node(dashboard_port=30000, metrics_export_port=30000)
-
-    pre_selected_ports = {
-        "redis_port": 30000,
-        "object_manager_port": 30001,
-        "node_manager_port": 30002,
-        "gcs_server_port": 30003,
-        "ray_client_server_port": 30004,
-        "dashboard_port": 30005,
-        "metrics_agent_port": 30006,
-        "metrics_export_port": 30007,
-    }
-
-    # Make sure we can start a node properly.
-    head_node = cluster.add_node(**pre_selected_ports)
-    cluster.wait_for_nodes()
-    cluster.remove_node(head_node)
-
-    # Make sure the wrong worker list will raise an exception.
-    with pytest.raises(ValueError, match="[30000, 30001, 30002, 30003]"):
-        head_node = cluster.add_node(
-            **pre_selected_ports, worker_port_list="30000,30001,30002,30003"
-        )
-
-    # Make sure the wrong min & max worker will raise an exception
-    with pytest.raises(ValueError, match="from 25000 to 35000"):
-        head_node = cluster.add_node(
-            **pre_selected_ports, min_worker_port=25000, max_worker_port=35000
-        )
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="skip except linux")
-def test_ray_init_from_workers(ray_start_cluster):
-    cluster = ray_start_cluster
-    # add first node
-    node1 = cluster.add_node(node_ip_address="127.0.0.2")
-    # add second node
-    node2 = cluster.add_node(node_ip_address="127.0.0.3")
-    address = cluster.address
-    password = cluster.redis_password
-    assert address.split(":")[0] == "127.0.0.2"
-    assert node1.node_manager_port != node2.node_manager_port
-    info = ray.init(address, _redis_password=password, _node_ip_address="127.0.0.3")
-    assert info["node_ip_address"] == "127.0.0.3"
-
-    node_info = ray._private.services.get_node_to_connect_for_driver(
-        address, cluster.gcs_address, "127.0.0.3", redis_password=password
-    )
-    assert node_info.node_manager_port == node2.node_manager_port
-
-
-def test_ray_init_context(shutdown_only):
-    ctx = ray.init()
-    assert ray.is_initialized()
-    # Check old context fields can be accessed like a dict
-    assert ctx["session_dir"] is not None
-    assert ctx["node_id"] is not None
-    with pytest.raises(KeyError):
-        ctx["xyz"]
-    # Check that __contains__ works
-    assert "session_dir" in ctx
-    assert "abcdefg" not in ctx
-    # Check that get works
-    assert ctx.get("session_dir") is not None
-    assert ctx.get("gfedcba") is None
-    ctx.disconnect()
-    assert not ray.is_initialized()
-
-
-def test_with_ray_init(shutdown_only):
-    @ray.remote
-    def f():
-        return 42
-
-    with ray.init() as ctx:
-        assert ray.is_initialized()
-        assert 42 == ray.get(f.remote())
-        # Check old context fields can be accessed like a dict
-        assert ctx["session_dir"] is not None
-        assert ctx["node_id"] is not None
-        with pytest.raises(KeyError):
-            ctx["xyz"]
-        # Check that __contains__ works
-        assert "session_dir" in ctx
-        assert "abcdefg" not in ctx
-        # Check that get works
-        assert ctx.get("session_dir") is not None
-        assert ctx.get("gfedcba") is None
-    assert not ray.is_initialized()
-
-
-def test_ray_init_invalid_keyword(shutdown_only):
-    with pytest.raises(RuntimeError) as excinfo:
-        ray.init("localhost", logginglevel="<- missing underscore")
-    assert "logginglevel" in str(excinfo.value)
-
-
-def test_ray_init_invalid_keyword_with_client(shutdown_only):
-    with pytest.raises(RuntimeError) as excinfo:
-        ray.init("ray://127.0.0.0", logginglevel="<- missing underscore")
-    assert "logginglevel" in str(excinfo.value)
-
-
-def test_ray_init_valid_keyword_with_client(shutdown_only):
-    with ray_start_client_server() as given_connection:
-        given_connection.disconnect()
-        # logging_level should be passed to the server
-        with ray.init("ray://localhost:50051", logging_level=logging.INFO):
-            pass
-
-
-def test_env_var_override():
-    with unittest.mock.patch.dict(
-        os.environ, {"RAY_NAMESPACE": "envName"}
-    ), ray_start_client_server() as given_connection:
-        given_connection.disconnect()
-
-        with ray.init("ray://localhost:50051"):
-            assert ray.get_runtime_context().namespace == "envName"
-
-
-def test_env_var_no_override():
-    # init() argument has precedence over environment variables
-    with unittest.mock.patch.dict(
-        os.environ, {"RAY_NAMESPACE": "envName"}
-    ), ray_start_client_server() as given_connection:
-        given_connection.disconnect()
-
-        with ray.init("ray://localhost:50051", namespace="argumentName"):
-            assert ray.get_runtime_context().namespace == "argumentName"
-
-
+@pytest.mark.skipif(
+    os.environ.get("CI") and sys.platform == "win32",
+    reason="Flaky when run on windows CI",
+)
 @pytest.mark.parametrize("input", [None, "auto"])
 def test_ray_address(input, call_ray_start):
     address = call_ray_start
@@ -260,6 +29,7 @@ def test_ray_address(input, call_ray_start):
         res = ray.init(input)
         # Ensure this is not a client.connect()
         assert not isinstance(res, ClientContext)
+        assert res.address_info["gcs_address"] == address
         ray.shutdown()
 
     addr = "localhost:{}".format(address.split(":")[-1])
@@ -267,7 +37,99 @@ def test_ray_address(input, call_ray_start):
         res = ray.init(input)
         # Ensure this is not a client.connect()
         assert not isinstance(res, ClientContext)
+        assert res.address_info["gcs_address"] == address
         ray.shutdown()
+
+
+@pytest.mark.parametrize("address", [None, "auto"])
+def test_ray_init_no_local_instance(shutdown_only, address):
+    # Starts a new Ray instance.
+    if address is None:
+        ray.init(address=address)
+    else:
+        # Throws an error if we explicitly want to connect to an existing
+        # instance and none exists.
+        with pytest.raises(ConnectionError):
+            ray.init(address=address)
+
+
+@pytest.mark.skipif(
+    os.environ.get("CI") and sys.platform == "win32",
+    reason="Flaky when run on windows CI",
+)
+@pytest.mark.parametrize("address", [None, "auto"])
+def test_ray_init_existing_instance(call_ray_start, address):
+    ray_address = call_ray_start
+    # If no address is specified, we will default to an existing cluster.
+    res = ray.init(address=address)
+    assert res.address_info["gcs_address"] == ray_address
+    ray.shutdown()
+
+    # Start a second local Ray instance.
+    try:
+        subprocess.check_output("ray start --head", shell=True)
+        # If there are multiple local instances, connect to the latest.
+        res = ray.init(address=address)
+        assert res.address_info["gcs_address"] != ray_address
+        ray.shutdown()
+
+        # If there are multiple local instances and we specify an address
+        # explicitly, it works.
+        with unittest.mock.patch.dict(os.environ, {"RAY_ADDRESS": ray_address}):
+            res = ray.init(address=address)
+            assert res.address_info["gcs_address"] == ray_address
+    finally:
+        ray.shutdown()
+        subprocess.check_output("ray stop --force", shell=True)
+
+
+@pytest.mark.skipif(
+    os.environ.get("CI") and sys.platform == "win32",
+    reason="Flaky when run on windows CI",
+)
+def test_ray_init_existing_instance_via_blocked_ray_start():
+    blocked = subprocess.Popen(
+        ["ray", "start", "--head", "--block", "--num-cpus", "1999"]
+    )
+
+    def _connect_to_existing_instance():
+        while True:
+            try:
+                # Make sure ray.init can connect to the existing cluster.
+                ray.init()
+                if ray.cluster_resources().get("CPU", 0) == 1999:
+                    return True
+                else:
+                    return False
+            except Exception:
+                return False
+            finally:
+                ray.shutdown()
+
+    try:
+        wait_for_condition(
+            _connect_to_existing_instance, timeout=30, retry_interval_ms=1000
+        )
+    finally:
+        blocked.terminate()
+        blocked.wait()
+        subprocess.check_output("ray stop --force", shell=True)
+
+
+@pytest.mark.skipif(
+    os.environ.get("CI") and sys.platform == "win32",
+    reason="Flaky when run on windows CI",
+)
+@pytest.mark.parametrize("address", [None, "auto"])
+def test_ray_init_existing_instance_crashed(address):
+    ray._private.utils.write_ray_address("localhost:6379")
+    try:
+        # If no address is specified, we will default to an existing cluster.
+        ray_constants.NUM_REDIS_GET_RETRIES = 1
+        with pytest.raises(ConnectionError):
+            ray.init(address=address)
+    finally:
+        ray._private.utils.reset_ray_address()
 
 
 class Credentials(grpc.ChannelCredentials):
@@ -374,8 +236,69 @@ def test_ray_init_using_hostname(ray_start_cluster):
     assert node_table[0].get("NodeManagerHostname", "") == hostname
 
 
+def test_new_ray_instance_new_session_dir(shutdown_only):
+    ray.init()
+    session_dir = ray._private.worker._global_node.get_session_dir_path()
+    ray.shutdown()
+    ray.init()
+    if enable_external_redis():
+        assert ray._private.worker._global_node.get_session_dir_path() == session_dir
+    else:
+        assert ray._private.worker._global_node.get_session_dir_path() != session_dir
+
+
+def test_new_cluster_new_session_dir(ray_start_cluster):
+    cluster = ray_start_cluster
+    cluster.add_node()
+    ray.init(address=cluster.address)
+    session_dir = ray._private.worker._global_node.get_session_dir_path()
+    ray.shutdown()
+    cluster.shutdown()
+    cluster.add_node()
+    ray.init(address=cluster.address)
+    if enable_external_redis():
+        assert ray._private.worker._global_node.get_session_dir_path() == session_dir
+    else:
+        assert ray._private.worker._global_node.get_session_dir_path() != session_dir
+    ray.shutdown()
+    cluster.shutdown()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM only on posix")
+def test_ray_init_sigterm_handler():
+    TEST_FILENAME = "sigterm.txt"
+
+    def sigterm_handler_cmd(ray_init=False):
+        return f"""
+import os
+import sys
+import signal
+def sigterm_handler(signum, frame):
+    f = open("{TEST_FILENAME}", "w")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, sigterm_handler)
+
+import ray
+{"ray.init()" if ray_init else ""}
+os.kill(os.getpid(), signal.SIGTERM)
+"""
+
+    # test if sigterm handler is not overwritten by import ray
+    test_child = subprocess.run(["python", "-c", sigterm_handler_cmd()])
+    assert test_child.returncode == 0 and os.path.exists(TEST_FILENAME)
+    os.remove(TEST_FILENAME)
+
+    # test if sigterm handler is overwritten by ray.init
+    test_child = subprocess.run(["python", "-c", sigterm_handler_cmd(ray_init=True)])
+    assert test_child.returncode == signal.SIGTERM and not os.path.exists(TEST_FILENAME)
+
+
 if __name__ == "__main__":
-    import pytest
     import sys
 
-    sys.exit(pytest.main(["-v", __file__]))
+    import pytest
+
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

@@ -6,29 +6,87 @@ import ray
 from ray import workflow
 
 
-@workflow.step
+@ray.remote
 def gen_dataset():
-    # TODO(ekl) seems checkpointing hangs with nested refs of
-    # LazyBlockList.
     return ray.data.range(1000).map(lambda x: x)
 
 
-@workflow.step
+@ray.remote
+def gen_dataset_1():
+    return ray.data.range(1000)
+
+
+@ray.remote
+def gen_dataset_2():
+    return ray.data.range(1000)
+
+
+@ray.remote
 def transform_dataset(in_data):
-    return in_data.map(lambda x: x * 2)
+    return in_data.map(lambda x: {"id": x["id"] * 2})
 
 
-@workflow.step
+@ray.remote
+def transform_dataset_1(in_data):
+    return in_data.map(lambda r: {"v2": r["id"] * 2})
+
+
+@ray.remote
 def sum_dataset(ds):
     return ds.sum()
 
 
-def test_dataset(workflow_start_regular):
-    ds_ref = gen_dataset.step()
-    transformed_ref = transform_dataset.step(ds_ref)
-    output_ref = sum_dataset.step(transformed_ref)
+@pytest.mark.parametrize(
+    "workflow_start_regular_shared",
+    [
+        {
+            "num_cpus": 2,  # increase CPUs schedule dataset tasks
+        }
+    ],
+    indirect=True,
+)
+def test_dataset(workflow_start_regular_shared):
+    ds_ref = gen_dataset.bind()
+    transformed_ref = transform_dataset.bind(ds_ref)
+    output_ref = sum_dataset.bind(transformed_ref)
 
-    result = output_ref.run()
+    result = workflow.run(output_ref)
+    assert result == 2 * sum(range(1000))
+
+
+@pytest.mark.parametrize(
+    "workflow_start_regular_shared",
+    [
+        {
+            "num_cpus": 2,  # increase CPUs schedule dataset tasks
+        }
+    ],
+    indirect=True,
+)
+def test_dataset_1(workflow_start_regular_shared):
+    ds_ref = gen_dataset_1.bind()
+    transformed_ref = transform_dataset.bind(ds_ref)
+    output_ref = sum_dataset.bind(transformed_ref)
+
+    result = workflow.run(output_ref)
+    assert result == 2 * sum(range(1000))
+
+
+@pytest.mark.parametrize(
+    "workflow_start_regular_shared",
+    [
+        {
+            "num_cpus": 2,  # increase CPUs schedule dataset tasks
+        }
+    ],
+    indirect=True,
+)
+def test_dataset_2(workflow_start_regular_shared):
+    ds_ref = gen_dataset_2.bind()
+    transformed_ref = transform_dataset_1.bind(ds_ref)
+    output_ref = sum_dataset.bind(transformed_ref)
+
+    result = workflow.run(output_ref)
     assert result == 2 * sum(range(1000))
 
 

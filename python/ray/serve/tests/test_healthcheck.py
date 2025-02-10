@@ -1,10 +1,16 @@
+import asyncio
+
 import pytest
 
 import ray
-from ray.exceptions import RayError
-from ray._private.test_utils import wait_for_condition
 from ray import serve
-from ray.serve.constants import REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD
+from ray._private.test_utils import async_wait_for_condition, wait_for_condition
+from ray.exceptions import RayError
+from ray.serve._private.common import DeploymentStatus
+from ray.serve._private.constants import (
+    REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD,
+    SERVE_DEFAULT_APP_NAME,
+)
 
 
 class Counter:
@@ -22,7 +28,7 @@ class Counter:
         self._count = 0
 
 
-@serve.deployment(_health_check_period_s=1, _health_check_timeout_s=1)
+@serve.deployment(health_check_period_s=1, health_check_timeout_s=1)
 class Patient:
     def __init__(self):
         self.healthy = True
@@ -48,11 +54,11 @@ class Patient:
         return ray.get_runtime_context().current_actor
 
 
-def check_new_actor_started(handle, original_actors):
+async def check_new_actor_started(handle, original_actors):
     if not isinstance(original_actors, set):
         original_actors = {original_actors._actor_id}
     try:
-        return ray.get(handle.remote())._actor_id not in original_actors
+        return (await handle.remote())._actor_id not in original_actors
     except RayError:
         return False
 
@@ -74,46 +80,55 @@ def test_no_user_defined_method(serve_instance, use_class):
         def A(*args):
             return ray.get_runtime_context().current_actor
 
-    A.deploy()
-    h = A.get_handle()
-    actor = ray.get(h.remote())
+    h = serve.run(A.bind())
+    actor = h.remote().result()
     ray.kill(actor)
 
     # This would time out if we wait for multiple health check failures.
     wait_for_condition(check_new_actor_started, handle=h, original_actors=actor)
 
 
-def test_user_defined_method_fails(serve_instance):
-    Patient.deploy()
-    h = Patient.get_handle()
-    actor = ray.get(h.remote())
-    ray.get(h.set_should_fail.remote())
+@pytest.mark.asyncio
+async def test_user_defined_method_fails(serve_instance):
+    h = serve.run(Patient.bind())
+    actor = await h.remote()
+    await h.set_should_fail.remote()
 
-    wait_for_condition(check_new_actor_started, handle=h, original_actors=actor)
-    ray.get([h.remote() for _ in range(100)])
-
-
-def test_user_defined_method_hangs(serve_instance):
-    Patient.deploy()
-    h = Patient.get_handle()
-    actor = ray.get(h.remote())
-    ray.get(h.set_should_hang.remote())
-
-    wait_for_condition(check_new_actor_started, handle=h, original_actors=actor)
-    ray.get([h.remote() for _ in range(100)])
+    await async_wait_for_condition(
+        check_new_actor_started, handle=h, original_actors=actor
+    )
+    await asyncio.gather(*[h.remote() for _ in range(100)])
 
 
-def test_multiple_replicas(serve_instance):
-    Patient.options(num_replicas=2).deploy()
-    h = Patient.get_handle()
-    actors = {a._actor_id for a in ray.get([h.remote() for _ in range(100)])}
+@pytest.mark.asyncio
+async def test_user_defined_method_hangs(serve_instance):
+    h = serve.run(Patient.options(graceful_shutdown_timeout_s=0).bind())
+    actor = await h.remote()
+    await h.set_should_hang.remote()
+
+    await async_wait_for_condition(
+        check_new_actor_started, handle=h, original_actors=actor
+    )
+    await asyncio.gather(*[h.remote() for _ in range(100)])
+
+
+@pytest.mark.asyncio
+async def test_multiple_replicas(serve_instance):
+    h = serve.run(Patient.options(num_replicas=2).bind())
+    actors = {
+        a._actor_id for a in await asyncio.gather(*[h.remote() for _ in range(100)])
+    }
     assert len(actors) == 2
 
-    ray.get(h.set_should_fail.remote())
+    await h.set_should_fail.remote()
 
-    wait_for_condition(check_new_actor_started, handle=h, original_actors=actors)
+    await async_wait_for_condition(
+        check_new_actor_started, handle=h, original_actors=actors
+    )
 
-    new_actors = {a._actor_id for a in ray.get([h.remote() for _ in range(100)])}
+    new_actors = {
+        a._actor_id for a in await asyncio.gather(*[h.remote() for _ in range(100)])
+    }
     assert len(new_actors) == 2
     assert len(new_actors.intersection(actors)) == 1
 
@@ -130,17 +145,16 @@ def test_inherit_healthcheck(serve_instance):
         def set_should_fail(self):
             self.should_fail = True
 
-    @serve.deployment(_health_check_period_s=1)
+    @serve.deployment(health_check_period_s=1)
     class Child(Parent):
         def __call__(self, *args):
             return ray.get_runtime_context().current_actor
 
-    Child.deploy()
-    h = Child.get_handle()
-    actors = {ray.get(h.remote())._actor_id for _ in range(100)}
+    h = serve.run(Child.bind())
+    actors = {h.remote().result()._actor_id for _ in range(100)}
     assert len(actors) == 1
 
-    ray.get(h.set_should_fail.remote())
+    h.set_should_fail.remote().result()
     wait_for_condition(check_new_actor_started, handle=h, original_actors=actors)
 
 
@@ -148,7 +162,7 @@ def test_nonconsecutive_failures(serve_instance):
     counter = ray.remote(Counter).remote()
 
     # Test that a health check failing every other call isn't marked unhealthy.
-    @serve.deployment(_health_check_period_s=0.1)
+    @serve.deployment(health_check_period_s=0.1)
     class FlakyHealthCheck:
         def check_health(self):
             curr_count = ray.get(counter.inc.remote())
@@ -158,21 +172,20 @@ def test_nonconsecutive_failures(serve_instance):
         def __call__(self, *args):
             return ray.get_runtime_context().current_actor
 
-    FlakyHealthCheck.deploy()
-    h = FlakyHealthCheck.get_handle()
-    a1 = ray.get(h.remote())
+    h = serve.run(FlakyHealthCheck.bind())
+    a1 = h.remote().result()
 
     # Wait for 10 health check periods, should never get marked unhealthy.
     wait_for_condition(lambda: ray.get(counter.get.remote()) > 10)
-    assert ray.get(h.remote())._actor_id == a1._actor_id
+    assert h.remote().result()._actor_id == a1._actor_id
 
 
 def test_consecutive_failures(serve_instance):
-    # Test that the health check must fail N times before being marked unhealthy.
+    # Test that the health check must fail N times before being restarted.
 
     counter = ray.remote(Counter).remote()
 
-    @serve.deployment(_health_check_period_s=1)
+    @serve.deployment(health_check_period_s=1)
     class ChronicallyUnhealthy:
         def __init__(self):
             self._actor_id = ray.get_runtime_context().current_actor._actor_id
@@ -190,14 +203,13 @@ def test_consecutive_failures(serve_instance):
         def __call__(self, *args):
             return self._actor_id
 
-    ChronicallyUnhealthy.deploy()
-    h = ChronicallyUnhealthy.get_handle()
+    h = serve.run(ChronicallyUnhealthy.bind())
 
     def check_fails_3_times():
-        original_actor_id = ray.get(h.set_should_fail.remote())
+        original_actor_id = h.set_should_fail.remote().result()
 
         # Wait until a new actor is started.
-        wait_for_condition(lambda: ray.get(h.remote()) != original_actor_id)
+        wait_for_condition(lambda: h.remote().result() != original_actor_id)
 
         # Check that the health check failed N times before replica was killed.
         assert ray.get(counter.get.remote()) == REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD
@@ -207,6 +219,76 @@ def test_consecutive_failures(serve_instance):
     check_fails_3_times()
     ray.get(counter.reset.remote())
     check_fails_3_times()
+
+
+def test_health_check_failure_cause_deploy_failure(serve_instance):
+    """If a deployment always fails health check, the deployment should be unhealthy."""
+
+    @serve.deployment
+    class AlwaysUnhealthy:
+        def check_health(self):
+            raise Exception("intended to fail")
+
+        def __call__(self, *args):
+            return ray.get_runtime_context().current_actor
+
+    with pytest.raises(RuntimeError):
+        serve.run(AlwaysUnhealthy.bind())
+
+    app_status = serve.status().applications[SERVE_DEFAULT_APP_NAME]
+    assert (
+        app_status.deployments["AlwaysUnhealthy"].status
+        == DeploymentStatus.DEPLOY_FAILED
+    )
+
+
+def test_health_check_failure_makes_deployment_unhealthy_transition(serve_instance):
+    """
+    If a deployment transitions to unhealthy, then continues to fail health check after
+    being restarted, the deployment should be unhealthy.
+    """
+
+    class Toggle:
+        def __init__(self):
+            self._should_fail = False
+
+        def set_should_fail(self):
+            self._should_fail = True
+
+        def should_fail(self):
+            return self._should_fail
+
+    @serve.deployment(health_check_period_s=1, health_check_timeout_s=1)
+    class WillBeUnhealthy:
+        def __init__(self, toggle):
+            self._toggle = toggle
+
+        def check_health(self):
+            if ray.get(self._toggle.should_fail.remote()):
+                raise Exception("intended to fail")
+
+        def __call__(self, *args):
+            return ray.get_runtime_context().current_actor
+
+    def check_status(expected_status: DeploymentStatus):
+        app_status = serve.status().applications[SERVE_DEFAULT_APP_NAME]
+        assert app_status.deployments["WillBeUnhealthy"].status == expected_status
+        return True
+
+    toggle = ray.remote(Toggle).remote()
+    serve.run(WillBeUnhealthy.bind(toggle))
+
+    # Check that deployment is healthy initially
+    assert check_status(DeploymentStatus.HEALTHY)
+
+    ray.get(toggle.set_should_fail.remote())
+
+    # Check that deployment is now unhealthy
+    wait_for_condition(check_status, expected_status=DeploymentStatus.UNHEALTHY)
+
+    # Check that deployment stays unhealthy
+    for _ in range(5):
+        assert check_status(DeploymentStatus.UNHEALTHY)
 
 
 if __name__ == "__main__":

@@ -41,12 +41,12 @@ Java_io_ray_runtime_context_NativeWorkerContext_nativeGetCurrentTaskId(JNIEnv *e
   return IdToJavaByteBuffer<TaskID>(env, task_id);
 }
 
-JNIEXPORT jobject JNICALL
+JNIEXPORT jbyteArray JNICALL
 Java_io_ray_runtime_context_NativeWorkerContext_nativeGetCurrentJobId(JNIEnv *env,
                                                                       jclass) {
-  const auto &job_id =
+  const auto job_id =
       CoreWorkerProcess::GetCoreWorker().GetWorkerContext().GetCurrentJobID();
-  return IdToJavaByteBuffer<JobID>(env, job_id);
+  return IdToJavaByteArray<JobID>(env, job_id);
 }
 
 JNIEXPORT jobject JNICALL
@@ -69,6 +69,23 @@ JNIEXPORT jbyteArray JNICALL
 Java_io_ray_runtime_context_NativeWorkerContext_nativeGetRpcAddress(JNIEnv *env, jclass) {
   const auto &rpc_address = CoreWorkerProcess::GetCoreWorker().GetRpcAddress();
   return NativeStringToJavaByteArray(env, rpc_address.SerializeAsString());
+}
+
+JNIEXPORT jstring JNICALL
+Java_io_ray_runtime_context_NativeWorkerContext_nativeGetSerializedRuntimeEnv(JNIEnv *env,
+                                                                              jclass) {
+  std::string serialized_runtime_env;
+  if (CoreWorkerProcess::GetCoreWorker().GetWorkerType() == WorkerType::DRIVER) {
+    serialized_runtime_env = CoreWorkerProcess::GetCoreWorker()
+                                 .GetJobConfig()
+                                 .runtime_env_info()
+                                 .serialized_runtime_env();
+  } else {
+    serialized_runtime_env = CoreWorkerProcess::GetCoreWorker()
+                                 .GetWorkerContext()
+                                 .GetCurrentSerializedRuntimeEnv();
+  }
+  return env->NewStringUTF(serialized_runtime_env.c_str());
 }
 
 #ifdef __cplusplus

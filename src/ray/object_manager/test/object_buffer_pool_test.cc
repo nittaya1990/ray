@@ -42,7 +42,8 @@ class MockPlasmaClient : public plasma::PlasmaClientInterface {
   MOCK_METHOD0(Disconnect, ray::Status());
 
   MOCK_METHOD4(Get,
-               ray::Status(const std::vector<ObjectID> &object_ids, int64_t timeout_ms,
+               ray::Status(const std::vector<ObjectID> &object_ids,
+                           int64_t timeout_ms,
                            std::vector<plasma::ObjectBuffer> *object_buffers,
                            bool is_from_worker));
 
@@ -50,10 +51,20 @@ class MockPlasmaClient : public plasma::PlasmaClientInterface {
 
   MOCK_METHOD1(Abort, ray::Status(const ObjectID &object_id));
 
+  MOCK_METHOD1(ExperimentalMutableObjectRegisterWriter,
+               ray::Status(const ObjectID &object_id));
+
+  MOCK_METHOD2(GetExperimentalMutableObject,
+               ray::Status(const ObjectID &object_id,
+                           std::unique_ptr<plasma::MutableObject> *mutable_object));
+
   ray::Status CreateAndSpillIfNeeded(const ObjectID &object_id,
                                      const ray::rpc::Address &owner_address,
-                                     int64_t data_size, const uint8_t *metadata,
-                                     int64_t metadata_size, std::shared_ptr<Buffer> *data,
+                                     bool is_experimental_mutable_object,
+                                     int64_t data_size,
+                                     const uint8_t *metadata,
+                                     int64_t metadata_size,
+                                     std::shared_ptr<Buffer> *data,
                                      plasma::flatbuf::ObjectSource source,
                                      int device_num) {
     *data = std::make_shared<LocalMemoryBuffer>(data_size);

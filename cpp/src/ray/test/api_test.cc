@@ -15,10 +15,12 @@
 #include <gtest/gtest.h>
 #include <ray/api.h>
 
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <thread>
 
-#include "boost/filesystem.hpp"
+#include "../config_internal.h"
 #include "ray/util/logging.h"
 
 // using namespace ray;
@@ -98,20 +100,29 @@ class Counter {
   }
 };
 
-RAY_REMOTE(Counter::FactoryCreate, &Counter::Plus1, &Counter::Plus, &Counter::Triple,
-           &Counter::Add, &Counter::GetVal, &Counter::GetIntVal, &Counter::GetList);
+RAY_REMOTE(Counter::FactoryCreate,
+           &Counter::Plus1,
+           &Counter::Plus,
+           &Counter::Triple,
+           &Counter::Add,
+           &Counter::GetVal,
+           &Counter::GetIntVal,
+           &Counter::GetList);
 
 TEST(RayApiTest, LogTest) {
-  auto log_path = boost::filesystem::current_path().string() + "/tmp/";
-  ray::RayLog::StartRayLog("cpp_worker", ray::RayLogLevel::DEBUG, log_path);
+  const std::string app_name = "cpp_worker";
+  const std::string log_dir = std::filesystem::current_path().string() + "/tmp/";
+  ray::RayLog::StartRayLog(app_name,
+                           ray::RayLogLevel::DEBUG,
+                           ray::RayLog::GetLogFilepathFromDirectory(log_dir, app_name));
   std::array<std::string, 3> str_arr{"debug test", "info test", "warning test"};
   RAYLOG(DEBUG) << str_arr[0];
   RAYLOG(INFO) << str_arr[1];
   RAYLOG(WARNING) << str_arr[2];
   RAY_CHECK(true);
 
-  for (auto &it : boost::filesystem::directory_iterator(log_path)) {
-    if (!boost::filesystem::is_directory(it)) {
+  for (auto &it : std::filesystem::directory_iterator(log_dir)) {
+    if (!std::filesystem::is_directory(it)) {
       std::ifstream in(it.path().string(), std::ios::binary);
       std::string line;
       for (int i = 0; i < 3; i++) {
@@ -121,7 +132,7 @@ TEST(RayApiTest, LogTest) {
     }
   }
 
-  boost::filesystem::remove_all(log_path);
+  std::filesystem::remove_all(log_dir);
 }
 
 TEST(RayApiTest, TaskOptionsCheckTest) {
@@ -325,10 +336,32 @@ TEST(RayApiTest, CompareWithFuture) {
 
 TEST(RayApiTest, CreateAndRemovePlacementGroup) {
   std::vector<std::unordered_map<std::string, double>> bundles{{{"CPU", 1}}};
-  ray::PlacementGroupCreationOptions options1{"first_placement_group", bundles,
-                                              ray::PlacementStrategy::PACK};
+  ray::PlacementGroupCreationOptions options1{
+      "first_placement_group", bundles, ray::PlacementStrategy::PACK};
   auto first_placement_group = ray::CreatePlacementGroup(options1);
   EXPECT_TRUE(first_placement_group.Wait(10));
 
   ray::RemovePlacementGroup(first_placement_group.GetID());
+}
+
+TEST(RayApiTest, DefaultActorLifetimeTest) {
+  ray::RayConfig config;
+  ray::internal::ConfigInternal::Instance().Init(config, 0, nullptr);
+  EXPECT_EQ(ray::rpc::JobConfig_ActorLifetime_NON_DETACHED,
+            ray::internal::ConfigInternal::Instance().default_actor_lifetime);
+  config.default_actor_lifetime = ray::ActorLifetime::DETACHED;
+  ray::internal::ConfigInternal::Instance().Init(config, 0, nullptr);
+  EXPECT_EQ(ray::rpc::JobConfig_ActorLifetime_DETACHED,
+            ray::internal::ConfigInternal::Instance().default_actor_lifetime);
+  std::string str = "--ray_default_actor_lifetime=NON_DETACHED";
+  char exec_name[] = {' '};
+  char *args[] = {exec_name, const_cast<char *>(str.c_str())};
+  ray::internal::ConfigInternal::Instance().Init(config, 2, args);
+  EXPECT_EQ(ray::rpc::JobConfig_ActorLifetime_NON_DETACHED,
+            ray::internal::ConfigInternal::Instance().default_actor_lifetime);
+  std::string str2 = "--ray_default_actor_lifetime=detached";
+  char *args2[] = {exec_name, const_cast<char *>(str2.c_str())};
+  ray::internal::ConfigInternal::Instance().Init(config, 2, args2);
+  EXPECT_EQ(ray::rpc::JobConfig_ActorLifetime_DETACHED,
+            ray::internal::ConfigInternal::Instance().default_actor_lifetime);
 }

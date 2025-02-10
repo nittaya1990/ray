@@ -12,38 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "ray/common/asio/instrumented_io_context.h"
+
 namespace ray {
 namespace gcs {
+static instrumented_io_context __mock_io_context_;
+static ClusterResourceManager __mock_cluster_resource_manager_(__mock_io_context_);
+static GcsNodeManager __mock_gcs_node_manager_(
+    nullptr, nullptr, __mock_io_context_, nullptr, ClusterID::Nil());
 
 class MockGcsResourceManager : public GcsResourceManager {
  public:
   using GcsResourceManager::GcsResourceManager;
-  MOCK_METHOD(void, HandleGetResources,
-              (const rpc::GetResourcesRequest &request, rpc::GetResourcesReply *reply,
-               rpc::SendReplyCallback send_reply_callback),
-              (override));
-  MOCK_METHOD(void, HandleUpdateResources,
-              (const rpc::UpdateResourcesRequest &request,
-               rpc::UpdateResourcesReply *reply,
-               rpc::SendReplyCallback send_reply_callback),
-              (override));
-  MOCK_METHOD(void, HandleDeleteResources,
-              (const rpc::DeleteResourcesRequest &request,
-               rpc::DeleteResourcesReply *reply,
-               rpc::SendReplyCallback send_reply_callback),
-              (override));
-  MOCK_METHOD(void, HandleGetAllAvailableResources,
-              (const rpc::GetAllAvailableResourcesRequest &request,
+  explicit MockGcsResourceManager()
+      : GcsResourceManager(__mock_io_context_,
+                           __mock_cluster_resource_manager_,
+                           __mock_gcs_node_manager_,
+                           NodeID::FromRandom(),
+                           nullptr) {}
+  explicit MockGcsResourceManager(ClusterResourceManager &cluster_resource_manager,
+                                  GcsNodeManager &gcs_node_manager)
+      : GcsResourceManager(__mock_io_context_,
+                           cluster_resource_manager,
+                           gcs_node_manager,
+                           NodeID::FromRandom(),
+                           nullptr) {}
+
+  MOCK_METHOD(void,
+              HandleGetAllAvailableResources,
+              (rpc::GetAllAvailableResourcesRequest request,
                rpc::GetAllAvailableResourcesReply *reply,
                rpc::SendReplyCallback send_reply_callback),
               (override));
-  MOCK_METHOD(void, HandleReportResourceUsage,
-              (const rpc::ReportResourceUsageRequest &request,
-               rpc::ReportResourceUsageReply *reply,
-               rpc::SendReplyCallback send_reply_callback),
-              (override));
-  MOCK_METHOD(void, HandleGetAllResourceUsage,
-              (const rpc::GetAllResourceUsageRequest &request,
+  MOCK_METHOD(void,
+              HandleGetAllResourceUsage,
+              (rpc::GetAllResourceUsageRequest request,
                rpc::GetAllResourceUsageReply *reply,
                rpc::SendReplyCallback send_reply_callback),
               (override));

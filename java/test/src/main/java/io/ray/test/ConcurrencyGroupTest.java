@@ -1,5 +1,6 @@
 package io.ray.test;
 
+import com.google.common.collect.ImmutableList;
 import io.ray.api.ActorHandle;
 import io.ray.api.ObjectRef;
 import io.ray.api.Ray;
@@ -192,6 +193,37 @@ public class ConcurrencyGroupTest extends BaseTest {
     Assert.assertEquals(myActor.task(ConcurrencyActor2::f2).remote().get(), "ok");
   }
 
+  /// This case tests that the blocking concurrency group doesn't block the scheduling of
+  /// other concurrency groups. See https://github.com/ray-project/ray/issues/19593 for details.
+  @Test(groups = {"cluster"})
+  public void testBlockingCgNotBlockOthers() {
+    ConcurrencyGroup group1 =
+        new ConcurrencyGroupBuilder<ConcurrencyActor2>()
+            .setName("group1")
+            .setMaxConcurrency(1)
+            .addMethod(ConcurrencyActor2::f1)
+            .build();
+
+    ConcurrencyGroup group2 =
+        new ConcurrencyGroupBuilder<ConcurrencyActor2>()
+            .setName("group2")
+            .setMaxConcurrency(1)
+            .addMethod(ConcurrencyActor2::f2)
+            .build();
+
+    ActorHandle<ConcurrencyActor2> myActor =
+        Ray.actor(ConcurrencyActor2::new).setConcurrencyGroups(group1, group2).remote();
+
+    // Execute f1 twice. and the cg1 is blocking, but cg2 should work well.
+    ObjectRef<String> obj0 = myActor.task(ConcurrencyActor2::f1).remote();
+    ObjectRef<String> obj1 = myActor.task(ConcurrencyActor2::f1).remote();
+    // Wait a while to make sure f2 is scheduled after f1.
+    Ray.wait(ImmutableList.of(obj0, obj1), 2, 5 * 1000);
+
+    // f2 should work well even if group1 is blocking.
+    Assert.assertEquals(myActor.task(ConcurrencyActor2::f2).remote().get(), "ok");
+  }
+
   @DefConcurrencyGroup(name = "io", maxConcurrency = 1)
   @DefConcurrencyGroup(name = "compute", maxConcurrency = 1)
   private static class StaticDefinedConcurrentActor {
@@ -240,5 +272,108 @@ public class ConcurrencyGroupTest extends BaseTest {
     Assert.assertNotEquals(threadId1, threadId3);
     Assert.assertNotEquals(threadId1, threadId5);
     Assert.assertNotEquals(threadId3, threadId5);
+  }
+
+  @DefConcurrencyGroup(name = "io", maxConcurrency = 1)
+  @DefConcurrencyGroup(name = "compute", maxConcurrency = 1)
+  private interface StaticDefinedInterface {
+
+    @UseConcurrencyGroup(name = "io")
+    public default long f1() {
+      return Thread.currentThread().getId();
+    }
+
+    @UseConcurrencyGroup(name = "io")
+    public default long f2() {
+      return Thread.currentThread().getId();
+    }
+
+    @UseConcurrencyGroup(name = "compute")
+    public default long f3(int a, int b) {
+      return Thread.currentThread().getId();
+    }
+
+    @UseConcurrencyGroup(name = "compute")
+    public default long f4() {
+      return Thread.currentThread().getId();
+    }
+
+    public default long f5() {
+      return Thread.currentThread().getId();
+    }
+
+    public default long f6() {
+      return Thread.currentThread().getId();
+    }
+  }
+
+  private static class ChildActor2 implements StaticDefinedInterface {}
+
+  public void testLimitMethodsInOneGroupOfStaticDefinitionForInterface() {
+    ActorHandle<ChildActor2> myActor = Ray.actor(ChildActor2::new).remote();
+
+    long threadId1 = myActor.task(StaticDefinedInterface::f1).remote().get();
+    long threadId2 = myActor.task(StaticDefinedInterface::f2).remote().get();
+    long threadId3 = myActor.task(StaticDefinedInterface::f3, 3, 5).remote().get();
+    long threadId4 = myActor.task(StaticDefinedInterface::f4).remote().get();
+    long threadId5 = myActor.task(StaticDefinedInterface::f5).remote().get();
+    long threadId6 = myActor.task(StaticDefinedInterface::f6).remote().get();
+
+    Assert.assertEquals(threadId1, threadId2);
+    Assert.assertEquals(threadId3, threadId4);
+    Assert.assertEquals(threadId5, threadId6);
+    Assert.assertNotEquals(threadId1, threadId3);
+    Assert.assertNotEquals(threadId1, threadId5);
+    Assert.assertNotEquals(threadId3, threadId5);
+  }
+
+  @DefConcurrencyGroup(name = "io", maxConcurrency = 1)
+  private static class SingleGroupConcurrentActor {
+
+    @UseConcurrencyGroup(name = "io")
+    public long f1() {
+      return Thread.currentThread().getId();
+    }
+
+    @UseConcurrencyGroup(name = "io")
+    public long f2() {
+      return Thread.currentThread().getId();
+    }
+
+    public long f3(int a, int b) {
+      return Thread.currentThread().getId();
+    }
+
+    public long f4() {
+      return Thread.currentThread().getId();
+    }
+
+    public long f5() {
+      return Thread.currentThread().getId();
+    }
+
+    public long f6() {
+      return Thread.currentThread().getId();
+    }
+  }
+
+  private static class ChildActor3 extends SingleGroupConcurrentActor {}
+
+  public void testSingleConcurrencyActor() {
+    ActorHandle<ChildActor3> myActor = Ray.actor(ChildActor3::new).remote();
+
+    long threadId1 = myActor.task(SingleGroupConcurrentActor::f1).remote().get();
+    long threadId2 = myActor.task(SingleGroupConcurrentActor::f2).remote().get();
+    long threadId3 = myActor.task(SingleGroupConcurrentActor::f3, 3, 5).remote().get();
+    long threadId4 = myActor.task(SingleGroupConcurrentActor::f4).remote().get();
+    long threadId5 = myActor.task(SingleGroupConcurrentActor::f5).remote().get();
+    long threadId6 = myActor.task(SingleGroupConcurrentActor::f6).remote().get();
+
+    Assert.assertEquals(threadId1, threadId2);
+    Assert.assertEquals(threadId3, threadId4);
+    Assert.assertEquals(threadId5, threadId6);
+    Assert.assertNotEquals(threadId1, threadId3);
+    Assert.assertNotEquals(threadId1, threadId5);
+    Assert.assertEquals(threadId3, threadId5);
   }
 }

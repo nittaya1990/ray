@@ -16,6 +16,7 @@
 
 #include "absl/synchronization/mutex.h"
 #include "gtest/gtest.h"
+#include "mock/ray/core_worker/memory_store.h"
 #include "ray/common/test_util.h"
 
 namespace ray {
@@ -39,9 +40,15 @@ TEST(TestMemoryStore, TestReportUnhandledErrors) {
   WorkerContext context(WorkerType::WORKER, WorkerID::FromRandom(), JobID::FromInt(0));
   int unhandled_count = 0;
 
+  InstrumentedIOContextWithThread io_context("TestReportUnhandledErrors");
+
   std::shared_ptr<CoreWorkerMemoryStore> provider =
       std::make_shared<CoreWorkerMemoryStore>(
-          nullptr, nullptr, nullptr, [&](const RayObject &obj) { unhandled_count++; });
+          io_context.GetIoService(),
+          nullptr,
+          nullptr,
+          nullptr,
+          [&](const RayObject &obj) { unhandled_count++; });
   RayObject obj1(rpc::ErrorType::TASK_EXECUTION_EXCEPTION);
   RayObject obj2(rpc::ErrorType::TASK_EXECUTION_EXCEPTION);
   auto id1 = ObjectID::FromRandom();
@@ -78,8 +85,7 @@ TEST(TestMemoryStore, TestReportUnhandledErrors) {
 
 TEST(TestMemoryStore, TestMemoryStoreStats) {
   /// Simple validation for test memory store stats.
-  std::shared_ptr<CoreWorkerMemoryStore> provider =
-      std::make_shared<CoreWorkerMemoryStore>(nullptr, nullptr, nullptr, nullptr);
+  auto provider = DefaultCoreWorkerMemoryStoreWithThread::Create();
 
   // Iterate through the memory store and compare the values that are obtained by
   // GetMemoryStoreStatisticalData.
@@ -91,7 +97,7 @@ TEST(TestMemoryStore, TestMemoryStoreStats) {
           expected_item.num_in_plasma += 1;
         } else {
           expected_item.num_local_objects += 1;
-          expected_item.used_object_store_memory += it.second->GetSize();
+          expected_item.num_local_objects_bytes += it.second->GetSize();
         }
       }
     }
@@ -114,7 +120,7 @@ TEST(TestMemoryStore, TestMemoryStoreStats) {
   MemoryStoreStats item = provider->GetMemoryStoreStatisticalData();
   ASSERT_EQ(item.num_in_plasma, expected_item.num_in_plasma);
   ASSERT_EQ(item.num_local_objects, expected_item.num_local_objects);
-  ASSERT_EQ(item.used_object_store_memory, expected_item.used_object_store_memory);
+  ASSERT_EQ(item.num_local_objects_bytes, expected_item.num_local_objects_bytes);
 
   // Delete all other objects and see if stats are recorded correctly.
   provider->Delete({id1, id2});
@@ -124,7 +130,7 @@ TEST(TestMemoryStore, TestMemoryStoreStats) {
   item = provider->GetMemoryStoreStatisticalData();
   ASSERT_EQ(item.num_in_plasma, expected_item2.num_in_plasma);
   ASSERT_EQ(item.num_local_objects, expected_item2.num_local_objects);
-  ASSERT_EQ(item.used_object_store_memory, expected_item2.used_object_store_memory);
+  ASSERT_EQ(item.num_local_objects_bytes, expected_item2.num_local_objects_bytes);
 
   RAY_CHECK(provider->Put(obj1, id1));
   RAY_CHECK(provider->Put(obj2, id2));
@@ -134,7 +140,7 @@ TEST(TestMemoryStore, TestMemoryStoreStats) {
   item = provider->GetMemoryStoreStatisticalData();
   ASSERT_EQ(item.num_in_plasma, expected_item3.num_in_plasma);
   ASSERT_EQ(item.num_local_objects, expected_item3.num_local_objects);
-  ASSERT_EQ(item.used_object_store_memory, expected_item3.used_object_store_memory);
+  ASSERT_EQ(item.num_local_objects_bytes, expected_item3.num_local_objects_bytes);
 }
 
 /// A mock manager that manages all test buffers. This mocks
@@ -185,11 +191,19 @@ TEST(TestMemoryStore, TestObjectAllocator) {
       return std::make_shared<TestBuffer>(mock_buffer_manager, data);
     };
 
-    return std::make_shared<ray::RayObject>(object.GetMetadata(), object.GetNestedRefs(),
-                                            std::move(data_factory), /*copy_data=*/true);
+    return std::make_shared<ray::RayObject>(object.GetMetadata(),
+                                            object.GetNestedRefs(),
+                                            std::move(data_factory),
+                                            /*copy_data=*/true);
   };
+  InstrumentedIOContextWithThread io_context("TestObjectAllocator");
+
   std::shared_ptr<CoreWorkerMemoryStore> memory_store =
-      std::make_shared<CoreWorkerMemoryStore>(nullptr, nullptr, nullptr, nullptr,
+      std::make_shared<CoreWorkerMemoryStore>(io_context.GetIoService(),
+                                              nullptr,
+                                              nullptr,
+                                              nullptr,
+                                              nullptr,
                                               std::move(my_object_allocator));
   const int32_t max_rounds = 1000;
   const std::string hello = "hello";

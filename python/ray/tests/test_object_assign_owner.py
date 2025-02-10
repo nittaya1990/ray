@@ -1,6 +1,10 @@
 import pytest
 import ray
 import time
+import numpy as np
+import os
+from ray._private.test_utils import skip_flaky_core_test_premerge
+from ray.exceptions import OwnerDiedError
 
 
 # https://github.com/ray-project/ray/issues/19659
@@ -95,11 +99,105 @@ def test_owner_assign_when_put(ray_start_cluster, actor_resources):
     time.sleep(2)
     with pytest.raises(ray.exceptions.RayTaskError) as error:
         ray.get(borrower.get_object.remote(object_ref), timeout=2)
-    assert "OwnerDiedError" in error.value.args[1]
+    assert isinstance(error.value.as_instanceof_cause(), OwnerDiedError)
+
+
+def test_multiple_objects(ray_start_cluster):
+    cluster_node_config = [
+        {"num_cpus": 1, "resources": {f"node{i+1}": 10}} for i in range(3)
+    ]
+    cluster = ray_start_cluster
+    for kwargs in cluster_node_config:
+        cluster.add_node(**kwargs)
+    ray.init(address=cluster.address)
+
+    OBJECT_NUMBER = 1000
+
+    @ray.remote(resources={"node1": 1}, num_cpus=0)
+    class Creator:
+        def gen_object_refs(self, owner):
+            refs = []
+            for _ in range(OBJECT_NUMBER):
+                refs.append(ray.put(np.random.rand(2, 2), _owner=owner))
+            ray.get(owner.set_object_refs.remote(refs))
+
+    @ray.remote(resources={"node2": 1}, num_cpus=0)
+    class Owner:
+        def __init__(self):
+            self.refs = None
+
+        def set_object_refs(self, refs):
+            self.refs = refs
+
+        def warmup(self):
+            return 0
+
+        def remote_get_object_refs(self, worker):
+            return ray.get(worker.get_objects.remote(self.refs))
+
+    @ray.remote(resources={"node3": 1}, num_cpus=0)
+    class Borrower:
+        def get_objects(self, refs):
+            for ref in refs:
+                ray.get(ref)
+            return True
+
+    owner = Owner.remote()
+    creator = Creator.remote()
+    borrower = Borrower.remote()
+
+    # Make sure the owner actor is alive.
+    ray.get(owner.warmup.remote())
+
+    ray.get(creator.gen_object_refs.remote(owner))
+
+    ray.kill(creator)
+
+    assert ray.get(owner.remote_get_object_refs.remote(borrower), timeout=60)
+
+
+@skip_flaky_core_test_premerge("https://github.com/ray-project/ray/issues/41175")
+def test_owner_assign_inner_object(shutdown_only):
+
+    ray.init()
+
+    @ray.remote
+    class Owner:
+        def warmup(self):
+            pass
+
+    @ray.remote
+    def get_borrowed_object():
+        ref = ray.put(("test_borrowed"))
+        return [ref]
+
+    owner = Owner.remote()
+    ray.get(owner.warmup.remote())
+
+    class OutObject:
+        def __init__(self, owned_inner_ref, borrowed_inner_ref):
+            self.owned_inner_ref = owned_inner_ref
+            self.borrowed_inner_ref = borrowed_inner_ref
+
+    owned_inner_ref = ray.put("test_owned")
+
+    borrowed_inner_ref = ray.get(get_borrowed_object.remote())[0]
+    out_ref = ray.put(OutObject(owned_inner_ref, borrowed_inner_ref), _owner=owner)
+
+    # wait enough time to delete data when the reference count is lower
+    # than expected
+    del owned_inner_ref, borrowed_inner_ref
+    time.sleep(10)
+
+    assert ray.get(ray.get(out_ref).owned_inner_ref) == "test_owned"
+    assert ray.get(ray.get(out_ref).borrowed_inner_ref) == "test_borrowed"
 
 
 if __name__ == "__main__":
     import pytest
     import sys
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

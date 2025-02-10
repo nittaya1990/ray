@@ -1,14 +1,17 @@
 import collections
-from typing import Dict, List, Optional, Tuple
+import logging
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
-import logging
 
-from ray.tune import trial_runner
+from ray.tune.error import TuneError
+from ray.tune.experiment import Trial
 from ray.tune.result import DEFAULT_METRIC
 from ray.tune.schedulers.trial_scheduler import FIFOScheduler, TrialScheduler
-from ray.tune.trial import Trial
-from ray.tune.error import TuneError
+from ray.util.annotations import PublicAPI
+
+if TYPE_CHECKING:
+    from ray.tune.execution.tune_controller import TuneController
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,7 @@ logger = logging.getLogger(__name__)
 #    `max_attr=81, eta=3` from the blog post. Trials will fill up
 #    from smallest bracket to largest, with largest
 #    having the most rounds of successive halving.
+@PublicAPI
 class HyperBandScheduler(FIFOScheduler):
     """Implements the HyperBand early stopping algorithm.
 
@@ -57,28 +61,28 @@ class HyperBandScheduler(FIFOScheduler):
     Note that Tune's stopping criteria will be applied in conjunction with
     HyperBand's early stopping mechanisms.
 
-    See also: https://homes.cs.washington.edu/~jamieson/hyperband.html
+    See also: https://blog.ml.cmu.edu/2018/12/12/massively-parallel-hyperparameter-optimization/
 
     Args:
-        time_attr (str): The training result attr to use for comparing time.
+        time_attr: The training result attr to use for comparing time.
             Note that you can pass in something non-temporal such as
             `training_iteration` as a measure of progress, the only requirement
             is that the attribute should increase monotonically.
-        metric (str): The training result objective value attribute. Stopping
+        metric: The training result objective value attribute. Stopping
             procedures will use this attribute. If None but a mode was passed,
             the `ray.tune.result.DEFAULT_METRIC` will be used per default.
-        mode (str): One of {min, max}. Determines whether objective is
+        mode: One of {min, max}. Determines whether objective is
             minimizing or maximizing the metric attribute.
-        max_t (int): max time units per trial. Trials will be stopped after
+        max_t: max time units per trial. Trials will be stopped after
             max_t time units (determined by time_attr) have passed.
             The scheduler will terminate trials after this time has passed.
             Note that this is different from the semantics of `max_t` as
             mentioned in the original HyperBand paper.
-        reduction_factor (float): Same as `eta`. Determines how sharp
+        reduction_factor: Same as `eta`. Determines how sharp
             the difference is between bracket space-time allocation ratios.
-        stop_last_trials (bool): Whether to terminate the trials after
+        stop_last_trials: Whether to terminate the trials after
             reaching max_t. Defaults to True.
-    """
+    """  # noqa: E501
 
     _supports_buffered_results = False
 
@@ -95,12 +99,12 @@ class HyperBandScheduler(FIFOScheduler):
         if mode:
             assert mode in ["min", "max"], "`mode` must be 'min' or 'max'!"
 
-        FIFOScheduler.__init__(self)
+        super().__init__()
         self._eta = reduction_factor
         self._s_max_1 = int(np.round(np.log(max_t) / np.log(reduction_factor))) + 1
         self._max_t_attr = max_t
         # bracket max trials
-        self._get_n0 = lambda s: int(np.ceil(self._s_max_1 / (s + 1) * self._eta ** s))
+        self._get_n0 = lambda s: int(np.ceil(self._s_max_1 / (s + 1) * self._eta**s))
         # bracket initial iterations
         self._get_r0 = lambda s: int((max_t * self._eta ** (-s)))
         self._hyperbands = [[]]  # list of hyperband iterations
@@ -144,7 +148,7 @@ class HyperBandScheduler(FIFOScheduler):
 
         return True
 
-    def on_trial_add(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def on_trial_add(self, tune_controller: "TuneController", trial: Trial):
         """Adds new trial.
 
         On a new trial add, if current bracket is not filled,
@@ -156,7 +160,7 @@ class HyperBandScheduler(FIFOScheduler):
                 "{} has been instantiated without a valid `metric` ({}) or "
                 "`mode` ({}) parameter. Either pass these parameters when "
                 "instantiating the scheduler, or pass them as parameters "
-                "to `tune.run()`".format(
+                "to `tune.TuneConfig()`".format(
                     self.__class__.__name__, self._metric, self._mode
                 )
             )
@@ -188,7 +192,7 @@ class HyperBandScheduler(FIFOScheduler):
         self._trial_info[trial] = cur_bracket, self._state["band_idx"]
 
     def _create_bracket(self, s):
-        return Bracket(
+        return _Bracket(
             time_attr=self._time_attr,
             max_trials=self._get_n0(s),
             init_t_attr=self._get_r0(s),
@@ -207,7 +211,7 @@ class HyperBandScheduler(FIFOScheduler):
         return len(cur_band) == self._s_max_1
 
     def on_trial_result(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ):
         """If bracket is finished, all trials will be stopped.
 
@@ -224,7 +228,8 @@ class HyperBandScheduler(FIFOScheduler):
         if bracket.continue_trial(trial):
             return TrialScheduler.CONTINUE
 
-        action = self._process_bracket(trial_runner, bracket)
+        logger.debug(f"Processing bracket after trial {trial} result")
+        action = self._process_bracket(tune_controller, bracket)
         logger.debug(
             f"{action} for {trial} on "
             f"{self._time_attr}={result.get(self._time_attr)}"
@@ -232,7 +237,7 @@ class HyperBandScheduler(FIFOScheduler):
         return action
 
     def _process_bracket(
-        self, trial_runner: "trial_runner.TrialRunner", bracket: "Bracket"
+        self, tune_controller: "TuneController", bracket: "_Bracket"
     ) -> str:
         """This is called whenever a trial makes progress.
 
@@ -240,64 +245,118 @@ class HyperBandScheduler(FIFOScheduler):
         Trials will be successively halved. If bracket is done, all
         non-running trials will be stopped and cleaned up,
         and during each halving phase, bad trials will be stopped while good
-        trials will return to "PENDING"."""
+        trials will return to "PENDING".
+
+        Note some implicit conditions here: In ``on_trial_result`` a trial is
+        either continued (e.g. if it didn't reach the time threshold for the bracket)
+        or this method (``_process_bracket``) is called. If there are other trials left
+        that still haven't reached the threshold, the trial is PAUSED. This means
+        that when the bracket is actually processed (``bracket.cur_iter_done``), there
+        is at most one RUNNING trial (which is the trial that is currently processed)
+        and the rest are either PAUSED (as explained above) or TERMINATED/ERRORED
+        (if they finish separately).
+        """
 
         action = TrialScheduler.PAUSE
         if bracket.cur_iter_done():
             if bracket.finished():
-                bracket.cleanup_full(trial_runner)
+                bracket.cleanup_full(tune_controller)
                 return TrialScheduler.STOP
 
+            bracket.is_being_processed = True
+
             good, bad = bracket.successive_halving(self._metric, self._metric_op)
+
+            logger.debug(
+                f"Processing {len(good)} good and {len(bad)} bad trials in "
+                f"bracket {bracket}.\n"
+                f"Good: {good}\nBad: {bad}"
+            )
+
             # kill bad trials
             self._num_stopped += len(bad)
             for t in bad:
-                if t.status == Trial.PAUSED:
-                    trial_runner.stop_trial(t)
+                if t.status == Trial.PAUSED or t.is_saving:
+                    logger.debug(f"Stopping other trial {str(t)}")
+                    tune_controller.stop_trial(t)
                 elif t.status == Trial.RUNNING:
+                    # See the docstring: There can only be at most one RUNNING
+                    # trial, which is the current trial.
+                    logger.debug(f"Stopping current trial {str(t)}")
                     bracket.cleanup_trial(t)
                     action = TrialScheduler.STOP
                 else:
+                    # Trials cannot be ERROR/TERMINATED, as then they would have
+                    # been removed from the bracket (in `bracket.cleanup_trial`).
+                    # Trials cannot be PENDING, as then they wouldn't have reported
+                    # enough results to finish the bracket, and it wouldn't be
+                    # processed.
                     raise TuneError(
-                        f"Trial with unexpected bad status " f"encountered: {t.status}"
+                        f"Trial with unexpected bad status encountered: "
+                        f"{str(t)} is {t.status}"
                     )
 
             # ready the good trials - if trial is too far ahead, don't continue
             for t in good:
-                if t.status not in [Trial.PAUSED, Trial.RUNNING]:
-                    raise TuneError(
-                        f"Trial with unexpected good status " f"encountered: {t.status}"
-                    )
                 if bracket.continue_trial(t):
-                    if t.status == Trial.PAUSED:
-                        t.status = Trial.PENDING
+                    # The scheduler should have cleaned up this trial already.
+                    assert t.status not in (Trial.ERROR, Trial.TERMINATED), (
+                        f"Good trial {t.trial_id} is in an invalid state: {t.status}\n"
+                        "Expected trial to be either PAUSED, PENDING, or RUNNING.\n"
+                        "If you encounter this, please file an issue on the Ray Github."
+                    )
+                    if t.status == Trial.PAUSED or t.is_saving:
+                        logger.debug(f"Unpausing trial {str(t)}")
+                        self._unpause_trial(tune_controller, t)
+                        bracket.trials_to_unpause.add(t)
                     elif t.status == Trial.RUNNING:
+                        # See the docstring: There can only be at most one RUNNING
+                        # trial, which is the current trial.
+                        logger.debug(f"Continuing current trial {str(t)}")
                         action = TrialScheduler.CONTINUE
+                    # else: PENDING trial (from a previous unpause) should stay as is.
+                elif bracket.finished() and bracket.stop_last_trials:
+                    # Scheduler decides to not continue trial because the bracket
+                    # reached max_t. In this case, stop the trials
+                    if t.status == Trial.PAUSED or t.is_saving:
+                        logger.debug(f"Bracket finished. Stopping other trial {str(t)}")
+                        tune_controller.stop_trial(t)
+                    elif t.status == Trial.RUNNING:
+                        # See the docstring: There can only be at most one RUNNING
+                        # trial, which is the current trial.
+                        logger.debug(
+                            f"Bracket finished. Stopping current trial {str(t)}"
+                        )
+                        bracket.cleanup_trial(t)
+                        action = TrialScheduler.STOP
         return action
 
-    def on_trial_remove(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def _unpause_trial(self, tune_controller: "TuneController", trial: Trial):
+        """No-op by default."""
+        return
+
+    def on_trial_remove(self, tune_controller: "TuneController", trial: Trial):
         """Notification when trial terminates.
 
         Trial info is removed from bracket. Triggers halving if bracket is
         not finished."""
         bracket, _ = self._trial_info[trial]
         bracket.cleanup_trial(trial)
-        if not bracket.finished():
-            self._process_bracket(trial_runner, bracket)
+        if not bracket.finished() and not bracket.is_being_processed:
+            logger.debug(f"Processing bracket after trial {trial} removed")
+            self._process_bracket(tune_controller, bracket)
 
     def on_trial_complete(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ):
         """Cleans up trial info from bracket if trial completed early."""
-        self.on_trial_remove(trial_runner, trial)
+        self.on_trial_remove(tune_controller, trial)
 
-    def on_trial_error(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def on_trial_error(self, tune_controller: "TuneController", trial: Trial):
         """Cleans up trial info from bracket if trial errored early."""
-        self.on_trial_remove(trial_runner, trial)
+        self.on_trial_remove(tune_controller, trial)
 
-    def choose_trial_to_run(
-        self, trial_runner: "trial_runner.TrialRunner"
-    ) -> Optional[Trial]:
+    def choose_trial_to_run(self, tune_controller: "TuneController") -> Optional[Trial]:
         """Fair scheduling within iteration by completion percentage.
 
         List of trials not used since all trials are tracked as state
@@ -312,9 +371,9 @@ class HyperBandScheduler(FIFOScheduler):
             for bracket in sorted(scrubbed, key=lambda b: b.completion_percentage()):
                 for trial in bracket.current_trials():
                     if (
-                        trial.status == Trial.PENDING
-                        and trial_runner.trial_executor.has_resources_for_trial(trial)
-                    ):
+                        trial.status == Trial.PAUSED
+                        and trial in bracket.trials_to_unpause
+                    ) or trial.status == Trial.PENDING:
                         return trial
         return None
 
@@ -353,7 +412,7 @@ class HyperBandScheduler(FIFOScheduler):
         }
 
 
-class Bracket:
+class _Bracket:
     """Logical object for tracking Hyperband bracket progress. Keeps track
     of proper parameters as designated by HyperBand.
 
@@ -385,6 +444,9 @@ class Bracket:
         self._total_work = self._calculate_total_work(self._n0, self._r0, s)
         self._completed_progress = 0
         self.stop_last_trials = stop_last_trials
+        self.is_being_processed = False
+
+        self.trials_to_unpause = set()
 
     def add_trial(self, trial: Trial):
         """Add trial to bracket assuming bracket is not filled.
@@ -417,6 +479,10 @@ class Bracket:
         if not self.stop_last_trials and self._halves == 0:
             return True
         elif self._get_result_time(result) < self._cumul_r:
+            logger.debug(
+                f"Continuing trial {trial} as it hasn't reached the time threshold "
+                f"{self._cumul_r}, yet."
+            )
             return True
         return False
 
@@ -434,12 +500,24 @@ class Bracket:
         if self._halves == 0 and not self.stop_last_trials:
             return self._live_trials, []
         assert self._halves > 0
-        self._halves -= 1
-        self._n /= self._eta
-        self._n = int(np.ceil(self._n))
 
+        # "Halving" is a misnomer. We're actually reducing by factor `eta`.
+        self._halves -= 1
+
+        # If we had 8 trials in the bracket and eta=2, we will keep 4.
+        # If we had 9 trials in the bracket and eta=3, we will keep 3.
+        self._n = int(np.ceil(self._n / self._eta))
+
+        # Likewise, we increase the number of iterations until we process the bracket
+        # again.
+        # Remember r0 = max_t * self._eta ** (-s)
+        # Let max_t=16, eta=2, s=1. Then r0=8, and we calculate r1=16.
+        # Let max_t=16, eta=2, s=2. Then r0=4, and we calculate r1=8, r2=16.
+
+        # Let max_t=81, eta=3, s=1. Then r0=27, and we calculate r1=81.
+        # Let max_t=81, eta=3, s=2. Then r0=9, and we calculate r1=27, r2=81.
         self._r *= self._eta
-        self._r = int(min(self._r, self._max_t_attr - self._cumul_r))
+        self._r = int(min(self._r, self._max_t_attr))
         self._cumul_r = self._r
         sorted_trials = sorted(
             self._live_trials, key=lambda t: metric_op * self._live_trials[t][metric]
@@ -468,6 +546,7 @@ class Bracket:
             )
         self._completed_progress += delta
         self._live_trials[trial] = result
+        self.trials_to_unpause.discard(trial)
 
     def cleanup_trial(self, trial: Trial):
         """Clean up statistics tracking for terminated trials (either by force
@@ -478,14 +557,14 @@ class Bracket:
         left in a bracket with a large max-iteration."""
         self._live_trials.pop(trial, None)
 
-    def cleanup_full(self, trial_runner: "trial_runner.TrialRunner"):
+    def cleanup_full(self, tune_controller: "TuneController"):
         """Cleans up bracket after bracket is completely finished.
 
         Lets the last trial continue to run until termination condition
         kicks in."""
         for trial in self.current_trials():
             if trial.status == Trial.PAUSED:
-                trial_runner.stop_trial(trial)
+                tune_controller.stop_trial(trial)
 
     def completion_percentage(self) -> float:
         """Returns a progress metric.

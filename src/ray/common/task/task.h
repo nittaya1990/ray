@@ -21,8 +21,6 @@
 
 namespace ray {
 
-typedef std::function<void()> CancelTaskCallback;
-
 /// \class RayTask
 ///
 /// A RayTask represents a Ray task and a specification of its execution (e.g.,
@@ -33,15 +31,20 @@ class RayTask {
  public:
   /// Construct an empty task. This should only be used to pass a task
   /// as an out parameter to a function or method.
-  RayTask() {}
+  RayTask() = default;
+
+  /// Construct a `RayTask` object from a protobuf message.
+  explicit RayTask(rpc::TaskSpec task_spec);
 
   /// Construct a `RayTask` object from a protobuf message.
   ///
   /// \param message The protobuf message.
-  explicit RayTask(const rpc::Task &message);
+  explicit RayTask(rpc::Task message);
 
   /// Construct a `RayTask` object from a `TaskSpecification`.
-  RayTask(TaskSpecification task_spec);
+  explicit RayTask(TaskSpecification task_spec);
+
+  RayTask(TaskSpecification task_spec, std::string preferred_node_id);
 
   /// Get the immutable specification for the task.
   ///
@@ -53,6 +56,12 @@ class RayTask {
   ///
   /// \return The object dependencies.
   const std::vector<rpc::ObjectReference> &GetDependencies() const;
+
+  /// Get the task's preferred node id for scheduling. If the returned value
+  /// is empty, then it means the task has no preferred node.
+  ///
+  /// \return The preferred node id.
+  const std::string &GetPreferredNodeID() const;
 
   std::string DebugString() const;
 
@@ -66,6 +75,8 @@ class RayTask {
   /// A cached copy of the task's object dependencies, including arguments from
   /// the TaskSpecification.
   std::vector<rpc::ObjectReference> dependencies_;
+
+  std::string preferred_node_id_;
 };
 
 }  // namespace ray

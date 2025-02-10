@@ -29,7 +29,7 @@ run_testng() {
     # exit_code == 2 means there are skipped tests.
     if [ $exit_code -ne 2 ] && [ $exit_code -ne 0 ] ; then
         # Only print log files if it ran in cluster mode
-        if [[ ! "$*" =~ SINGLE_PROCESS ]]; then
+        if [[ ! "$*" =~ LOCAL ]]; then
           if [ $exit_code -gt 128 ] ; then
               # Test crashed. Print the driver log for diagnosis.
               cat /tmp/ray/session_latest/logs/java-core-driver-*$pid*
@@ -60,6 +60,17 @@ run_timeout() {
 }
 
 pushd "$ROOT_DIR"/..
+
+if [[ ! -d ".git" ]]; then
+  # git is removed, but we need one for the git diff check to work, so create
+  # a dummy one here.
+  git init
+  git config --global user.email "nobody@ray.io"
+  git config --global user.name "nobody"
+  git add .
+  git commit -a -m "capture for diff"
+fi
+
 echo "Build java maven deps."
 bazel build //java:gen_maven_deps
 
@@ -82,6 +93,7 @@ MAX_ROUNDS=1
 if [ $MAX_ROUNDS -gt 1 ]; then
   export RAY_BACKEND_LOG_LEVEL=debug
 fi
+export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=1
 
 round=1
 while true; do
@@ -101,9 +113,8 @@ while true; do
   fi
 done
 
-echo "Running tests under single-process mode."
-# bazel test //java:all_tests --jvmopt="-Dray.run-mode=SINGLE_PROCESS" --config=ci || single_exit_code=$?
-run_testng java -Dray.run-mode="SINGLE_PROCESS" -cp "$ROOT_DIR"/../bazel-bin/java/all_tests_shaded.jar org.testng.TestNG -d /tmp/ray_java_test_output "$ROOT_DIR"/testng.xml
+echo "Running tests under local mode."
+run_testng java -Dray.run-mode="LOCAL" -cp "$ROOT_DIR"/../bazel-bin/java/all_tests_shaded.jar org.testng.TestNG -d /tmp/ray_java_test_output "$ROOT_DIR"/testng.xml
 
 echo "Running connecting existing cluster tests."
 case "${OSTYPE}" in
@@ -122,8 +133,7 @@ for file in "$docdemo_path"*.java; do
   file=${file#"$docdemo_path"}
   class=${file%".java"}
   echo "Running $class"
-  java -cp bazel-bin/java/all_tests_shaded.jar -Dray.job.num-java-workers-per-process=1\
-   -Dray.raylet.startup-token=0 "io.ray.docdemo.$class"
+  java -cp bazel-bin/java/all_tests_shaded.jar -Dray.raylet.startup-token=0 "io.ray.docdemo.$class"
 done
 popd
 

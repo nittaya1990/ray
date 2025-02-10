@@ -17,15 +17,17 @@
 #include <boost/asio.hpp>
 #include <boost/bind/bind.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
-#include <iostream>
 
+#include "ray/common/client_connection.h"
+#include "ray/common/scheduling/resource_set.h"
 #include "ray/common/status.h"
 #include "ray/util/util.h"
 
 namespace {
 
 const std::vector<std::string> GenerateEnumNames(const char *const *enum_names_ptr,
-                                                 int start_index, int end_index) {
+                                                 int start_index,
+                                                 int end_index) {
   std::vector<std::string> enum_names;
   for (int i = 0; i < start_index; ++i) {
     enum_names.push_back("EmptyMessageType");
@@ -54,34 +56,57 @@ namespace ray {
 
 namespace raylet {
 
-Raylet::Raylet(instrumented_io_context &main_service, const std::string &socket_name,
+Raylet::Raylet(instrumented_io_context &main_service,
+               const NodeID &self_node_id,
+               const std::string &socket_name,
                const std::string &node_ip_address,
+               const std::string &node_name,
                const NodeManagerConfig &node_manager_config,
                const ObjectManagerConfig &object_manager_config,
-               std::shared_ptr<gcs::GcsClient> gcs_client, int metrics_export_port)
-    : main_service_(main_service),
-      self_node_id_(
-          !RayConfig::instance().OVERRIDE_NODE_ID_FOR_TESTING().empty()
-              ? NodeID::FromHex(RayConfig::instance().OVERRIDE_NODE_ID_FOR_TESTING())
-              : NodeID::FromRandom()),
+               std::shared_ptr<gcs::GcsClient> gcs_client,
+               int metrics_export_port,
+               bool is_head_node,
+               std::function<void(const rpc::NodeDeathInfo &)> shutdown_raylet_gracefully)
+    : self_node_id_(self_node_id),
       gcs_client_(gcs_client),
-      node_manager_(main_service, self_node_id_, node_manager_config,
-                    object_manager_config, gcs_client_),
+      node_manager_(main_service,
+                    self_node_id_,
+                    node_name,
+                    node_manager_config,
+                    object_manager_config,
+                    gcs_client_,
+                    shutdown_raylet_gracefully),
       socket_name_(socket_name),
       acceptor_(main_service, ParseUrlEndpoint(socket_name)),
       socket_(main_service) {
+  SetCloseOnExec(acceptor_);
   self_node_info_.set_node_id(self_node_id_.Binary());
   self_node_info_.set_state(GcsNodeInfo::ALIVE);
   self_node_info_.set_node_manager_address(node_ip_address);
+  self_node_info_.set_node_name(node_name);
   self_node_info_.set_raylet_socket_name(socket_name);
   self_node_info_.set_object_store_socket_name(object_manager_config.store_socket_name);
   self_node_info_.set_object_manager_port(node_manager_.GetObjectManagerPort());
   self_node_info_.set_node_manager_port(node_manager_.GetServerPort());
   self_node_info_.set_node_manager_hostname(boost::asio::ip::host_name());
   self_node_info_.set_metrics_export_port(metrics_export_port);
-  const auto &resource_map = node_manager_config.resource_config.GetResourceMap();
+  self_node_info_.set_runtime_env_agent_port(node_manager_config.runtime_env_agent_port);
+  self_node_info_.mutable_state_snapshot()->set_state(NodeSnapshot::ACTIVE);
+  auto resource_map = node_manager_config.resource_config.GetResourceMap();
   self_node_info_.mutable_resources_total()->insert(resource_map.begin(),
                                                     resource_map.end());
+  self_node_info_.set_start_time_ms(current_sys_time_ms());
+  self_node_info_.set_is_head_node(is_head_node);
+  self_node_info_.mutable_labels()->insert(node_manager_config.labels.begin(),
+                                           node_manager_config.labels.end());
+
+  // Setting up autoscaler related fields from ENV
+  auto instance_id = std::getenv(kNodeCloudInstanceIdEnv);
+  self_node_info_.set_instance_id(instance_id ? instance_id : "");
+  auto cloud_node_type_name = std::getenv(kNodeTypeNameEnv);
+  self_node_info_.set_node_type_name(cloud_node_type_name ? cloud_node_type_name : "");
+  auto instance_type_name = std::getenv(kNodeCloudInstanceTypeNameEnv);
+  self_node_info_.set_instance_type_name(instance_type_name ? instance_type_name : "");
 }
 
 Raylet::~Raylet() {}
@@ -93,8 +118,12 @@ void Raylet::Start() {
   DoAccept();
 }
 
+void Raylet::UnregisterSelf(const rpc::NodeDeathInfo &node_death_info,
+                            std::function<void()> unregister_done_callback) {
+  gcs_client_->Nodes().UnregisterSelf(node_death_info, unregister_done_callback);
+}
+
 void Raylet::Stop() {
-  RAY_CHECK_OK(gcs_client_->Nodes().DrainSelf());
   node_manager_.Stop();
   acceptor_.close();
 }
@@ -108,20 +137,7 @@ ray::Status Raylet::RegisterGcs() {
                   << ":" << self_node_info_.node_manager_port()
                   << " object_manager address: " << self_node_info_.node_manager_address()
                   << ":" << self_node_info_.object_manager_port()
-                  << " hostname: " << self_node_info_.node_manager_address();
-
-    // Add resource information.
-    const NodeManagerConfig &node_manager_config = node_manager_.GetInitialConfig();
-    std::unordered_map<std::string, std::shared_ptr<rpc::ResourceTableData>> resources;
-    for (const auto &resource_pair :
-         node_manager_config.resource_config.GetResourceMap()) {
-      auto resource = std::make_shared<rpc::ResourceTableData>();
-      resource->set_resource_capacity(resource_pair.second);
-      resources.emplace(resource_pair.first, resource);
-    }
-    RAY_CHECK_OK(gcs_client_->NodeResources().AsyncUpdateResources(self_node_id_,
-                                                                   resources, nullptr));
-
+                  << " hostname: " << self_node_info_.node_manager_hostname();
     RAY_CHECK_OK(node_manager_.RegisterGcs());
   };
 
@@ -131,8 +147,9 @@ ray::Status Raylet::RegisterGcs() {
 }
 
 void Raylet::DoAccept() {
-  acceptor_.async_accept(socket_, boost::bind(&Raylet::HandleAccept, this,
-                                              boost::asio::placeholders::error));
+  acceptor_.async_accept(
+      socket_,
+      boost::bind(&Raylet::HandleAccept, this, boost::asio::placeholders::error));
 }
 
 void Raylet::HandleAccept(const boost::system::error_code &error) {
@@ -146,18 +163,22 @@ void Raylet::HandleAccept(const boost::system::error_code &error) {
                                             const std::vector<uint8_t> &message) {
       node_manager_.ProcessClientMessage(client, message_type, message.data());
     };
-    flatbuffers::FlatBufferBuilder fbb;
-    protocol::DisconnectClientBuilder builder(fbb);
-    builder.add_disconnect_type(static_cast<int>(rpc::WorkerExitType::SYSTEM_ERROR_EXIT));
-    fbb.Finish(builder.Finish());
-    std::vector<uint8_t> message_data(fbb.GetBufferPointer(),
-                                      fbb.GetBufferPointer() + fbb.GetSize());
     // Accept a new local client and dispatch it to the node manager.
     auto new_connection = ClientConnection::Create(
-        client_handler, message_handler, std::move(socket_), "worker",
+        client_handler,
+        message_handler,
+        std::move(socket_),
+        "worker",
         node_manager_message_enum,
-        static_cast<int64_t>(protocol::MessageType::DisconnectClient), message_data);
-  }
+        static_cast<int64_t>(protocol::MessageType::DisconnectClient));
+  } else {
+    RAY_LOG(ERROR) << "Raylet failed to accept new connection: " << error.message();
+    if (error == boost::asio::error::operation_aborted) {
+      // The server is being destroyed. Don't continue accepting connections.
+      return;
+    }
+  };
+
   // We're ready to accept another client.
   DoAccept();
 }

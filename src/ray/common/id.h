@@ -26,6 +26,7 @@
 
 #include "ray/common/constants.h"
 #include "ray/util/logging.h"
+#include "ray/util/random.h"
 #include "ray/util/util.h"
 #include "ray/util/visibility.h"
 
@@ -75,10 +76,12 @@ class BaseID {
 
  protected:
   BaseID(const std::string &binary) {
-    RAY_CHECK(binary.size() == Size() || binary.size() == 0)
-        << "expected size is " << Size() << ", but got data " << binary << " of size "
-        << binary.size();
-    std::memcpy(const_cast<uint8_t *>(this->Data()), binary.data(), binary.size());
+    if (!binary.empty()) {
+      RAY_CHECK(binary.size() == Size())
+          << "expected size is " << Size() << ", but got data " << binary << " of size "
+          << binary.size();
+      std::memcpy(const_cast<uint8_t *>(this->Data()), binary.data(), Size());
+    }
   }
   // All IDs are immutable for hash evaluations. MutableData is only allow to use
   // in construction time, so this function is protected.
@@ -144,7 +147,8 @@ class ActorID : public BaseID<ActorID> {
   /// \param parent_task_counter The counter of the parent task.
   ///
   /// \return The random `ActorID`.
-  static ActorID Of(const JobID &job_id, const TaskID &parent_task_id,
+  static ActorID Of(const JobID &job_id,
+                    const TaskID &parent_task_id,
                     const size_t parent_task_counter);
 
   /// Creates a nil ActorID with the given job.
@@ -210,8 +214,10 @@ class TaskID : public BaseID<TaskID> {
   /// \param actor_id The ID of the actor to which this task belongs.
   ///
   /// \return The ID of the actor task.
-  static TaskID ForActorTask(const JobID &job_id, const TaskID &parent_task_id,
-                             size_t parent_task_counter, const ActorID &actor_id);
+  static TaskID ForActorTask(const JobID &job_id,
+                             const TaskID &parent_task_id,
+                             size_t parent_task_counter,
+                             const ActorID &actor_id);
 
   /// Creates a TaskID for normal task.
   ///
@@ -221,7 +227,8 @@ class TaskID : public BaseID<TaskID> {
   ///        parent task before this one.
   ///
   /// \return The ID of the normal task.
-  static TaskID ForNormalTask(const JobID &job_id, const TaskID &parent_task_id,
+  static TaskID ForNormalTask(const JobID &job_id,
+                              const TaskID &parent_task_id,
                               size_t parent_task_counter);
 
   /// Given a base task ID, create a task ID that represents the n-th execution
@@ -312,7 +319,12 @@ class ObjectID : public BaseID<ObjectID> {
   /// \return The computed object ID.
   static ObjectID ForActorHandle(const ActorID &actor_id);
 
+  /// Whether this ObjectID represents an actor handle. This is the ObjectID
+  /// returned by the actor's creation task.
   static bool IsActorID(const ObjectID &object_id);
+  /// Return the ID of the actor that produces this object. For the actor
+  /// creation task and for tasks executed by the actor, this will return a
+  /// non-nil ActorID.
   static ActorID ToActorID(const ObjectID &object_id);
 
   MSGPACK_DEFINE(id_);
@@ -327,16 +339,34 @@ class ObjectID : public BaseID<ObjectID> {
 };
 
 class PlacementGroupID : public BaseID<PlacementGroupID> {
+ private:
+  static constexpr size_t kUniqueBytesLength = 14;
+
  public:
-  static constexpr size_t kLength = 16;
+  /// Length of `PlacementGroupID` in bytes.
+  static constexpr size_t kLength = kUniqueBytesLength + JobID::kLength;
 
   /// Size of `PlacementGroupID` in bytes.
   ///
   /// \return Size of `PlacementGroupID` in bytes.
   static constexpr size_t Size() { return kLength; }
 
+  /// Creates a `PlacementGroupID` by hashing the given information.
+  ///
+  /// \param job_id The job id to which this actor belongs.
+  ///
+  /// \return The random `PlacementGroupID`.
+  static PlacementGroupID Of(const JobID &job_id);
+
+  static PlacementGroupID FromRandom() = delete;
+
   /// Constructor of `PlacementGroupID`.
   PlacementGroupID() : BaseID() {}
+
+  /// Get the job id to which this placement group belongs.
+  ///
+  /// \return The job id to which this placement group belongs.
+  JobID JobId() const;
 
   MSGPACK_DEFINE(id_);
 
@@ -373,15 +403,18 @@ std::ostream &operator<<(std::ostream &os, const PlacementGroupID &id);
     type() : UniqueID() {}                                                               \
     static type FromRandom() { return type(UniqueID::FromRandom()); }                    \
     static type FromBinary(const std::string &binary) { return type(binary); }           \
+    static type FromHex(const std::string &hex) { return type(UniqueID::FromHex(hex)); } \
     static type Nil() { return type(UniqueID::Nil()); }                                  \
     static constexpr size_t Size() { return kUniqueIDSize; }                             \
                                                                                          \
    private:                                                                              \
     explicit type(const std::string &binary) {                                           \
-      RAY_CHECK(binary.size() == Size() || binary.size() == 0)                           \
-          << "expected size is " << Size() << ", but got data " << binary << " of size " \
-          << binary.size();                                                              \
-      std::memcpy(&id_, binary.data(), binary.size());                                   \
+      if (!binary.empty()) {                                                             \
+        RAY_CHECK(binary.size() == Size())                                               \
+            << "expected size is " << Size() << ", but got data " << binary              \
+            << " of size " << binary.size();                                             \
+        std::memcpy(&id_, binary.data(), Size());                                        \
+      }                                                                                  \
     }                                                                                    \
   };
 
@@ -408,10 +441,14 @@ T BaseID<T>::FromRandom() {
 
 template <typename T>
 T BaseID<T>::FromBinary(const std::string &binary) {
-  RAY_CHECK(binary.size() == T::Size() || binary.size() == 0)
-      << "expected size is " << T::Size() << ", but got data size is " << binary.size();
   T t;
-  std::memcpy(t.MutableData(), binary.data(), binary.size());
+  if (binary.empty()) {
+    return t;  // nil
+  }
+  RAY_CHECK(binary.size() == T::Size())
+      << "expected size is " << T::Size() << ", but got data size is " << binary.size();
+
+  std::memcpy(t.MutableData(), binary.data(), T::Size());
   return t;
 }
 
@@ -462,8 +499,7 @@ const T &BaseID<T>::Nil() {
 
 template <typename T>
 bool BaseID<T>::IsNil() const {
-  static T nil_id = T::Nil();
-  return *this == nil_id;
+  return *this == T::Nil();
 }
 
 template <typename T>
@@ -515,6 +551,41 @@ std::string BaseID<T>::Hex() const {
   return result;
 }
 
+template <>
+struct DefaultLogKey<JobID> {
+  constexpr static std::string_view key = kLogKeyJobID;
+};
+
+template <>
+struct DefaultLogKey<WorkerID> {
+  constexpr static std::string_view key = kLogKeyWorkerID;
+};
+
+template <>
+struct DefaultLogKey<NodeID> {
+  constexpr static std::string_view key = kLogKeyNodeID;
+};
+
+template <>
+struct DefaultLogKey<ActorID> {
+  constexpr static std::string_view key = kLogKeyActorID;
+};
+
+template <>
+struct DefaultLogKey<TaskID> {
+  constexpr static std::string_view key = kLogKeyTaskID;
+};
+
+template <>
+struct DefaultLogKey<ObjectID> {
+  constexpr static std::string_view key = kLogKeyObjectID;
+};
+
+template <>
+struct DefaultLogKey<PlacementGroupID> {
+  constexpr static std::string_view key = kLogKeyPlacementGroupID;
+};
+
 }  // namespace ray
 
 namespace std {
@@ -522,10 +593,6 @@ namespace std {
 #define DEFINE_UNIQUE_ID(type)                                           \
   template <>                                                            \
   struct hash<::ray::type> {                                             \
-    size_t operator()(const ::ray::type &id) const { return id.Hash(); } \
-  };                                                                     \
-  template <>                                                            \
-  struct hash<const ::ray::type> {                                       \
     size_t operator()(const ::ray::type &id) const { return id.Hash(); } \
   };
 
@@ -539,3 +606,7 @@ DEFINE_UNIQUE_ID(PlacementGroupID);
 
 #undef DEFINE_UNIQUE_ID
 }  // namespace std
+
+namespace ray {
+extern const NodeID kGCSNodeID;
+}

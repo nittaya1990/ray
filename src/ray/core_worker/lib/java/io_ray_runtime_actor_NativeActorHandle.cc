@@ -52,32 +52,34 @@ JNIEXPORT jbyteArray JNICALL Java_io_ray_runtime_actor_NativeActorHandle_nativeS
   ObjectID actor_handle_id;
   Status status = CoreWorkerProcess::GetCoreWorker().SerializeActorHandle(
       actor_id, &output, &actor_handle_id);
-  env->SetByteArrayRegion(actorHandleId, 0, ObjectID::kLength,
+  env->SetByteArrayRegion(actorHandleId,
+                          0,
+                          ObjectID::kLength,
                           reinterpret_cast<const jbyte *>(actor_handle_id.Data()));
   THROW_EXCEPTION_AND_RETURN_IF_NOT_OK(env, status, nullptr);
   return NativeStringToJavaByteArray(env, output);
 }
 
 JNIEXPORT jbyteArray JNICALL
-Java_io_ray_runtime_actor_NativeActorHandle_nativeDeserialize(JNIEnv *env, jclass o,
+Java_io_ray_runtime_actor_NativeActorHandle_nativeDeserialize(JNIEnv *env,
+                                                              jclass o,
                                                               jbyteArray data) {
   auto buffer = JavaByteArrayToNativeBuffer(env, data);
   RAY_CHECK(buffer->Size() > 0);
   auto binary = std::string(reinterpret_cast<char *>(buffer->Data()), buffer->Size());
   auto actor_id = CoreWorkerProcess::GetCoreWorker().DeserializeAndRegisterActorHandle(
-      binary, /*outer_object_id=*/ObjectID::Nil());
+      binary, /*outer_object_id=*/ObjectID::Nil(), /*add_local_ref=*/true);
 
   return IdToJavaByteArray<ActorID>(env, actor_id);
 }
 
 JNIEXPORT void JNICALL
 Java_io_ray_runtime_actor_NativeActorHandle_nativeRemoveActorHandleReference(
-    JNIEnv *env, jclass clz, jbyteArray workerId, jbyteArray actorId) {
+    JNIEnv *env, jclass clz, jbyteArray actorId) {
   // We can't control the timing of Java GC, so it's normal that this method is called but
   // core worker is shutting down (or already shut down). If we can't get a core worker
   // instance here, skip calling the `RemoveLocalReference` method.
-  const auto worker_id = JavaByteArrayToId<ray::WorkerID>(env, workerId);
-  auto core_worker = CoreWorkerProcess::TryGetWorker(worker_id);
+  auto core_worker = CoreWorkerProcess::TryGetWorker();
   if (core_worker != nullptr) {
     const auto actor_id = JavaByteArrayToId<ActorID>(env, actorId);
     core_worker->RemoveActorHandleReference(actor_id);

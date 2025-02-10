@@ -9,6 +9,12 @@ except ImportError:
     pyspark = None
 
 
+@pytest.mark.skip(
+    reason=(
+        "Ray Client not supported with Ray Data streaming execution, "
+        "which is enabled for all datasets by default in Ray 2.9."
+    )
+)
 @pytest.mark.skipif(pyspark is None, reason="PySpark dependency not found")
 @pytest.mark.parametrize(
     "call_ray_start",
@@ -32,4 +38,9 @@ def test_client_data_get(call_ray_start):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-v", __file__]))
+    import os
+
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

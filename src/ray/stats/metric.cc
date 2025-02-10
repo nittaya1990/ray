@@ -85,6 +85,16 @@ bool StatsConfig::IsInitialized() const { return is_initialized_; }
 /// Metric
 ///
 using MeasureDouble = opencensus::stats::Measure<double>;
+Metric::Metric(const std::string &name,
+               const std::string &description,
+               const std::string &unit,
+               const std::vector<std::string> &tag_keys)
+    : name_(name), description_(description), unit_(unit), measure_(nullptr) {
+  for (const auto &key : tag_keys) {
+    tag_keys_.push_back(opencensus::tags::TagKey::Register(key));
+  }
+}
+
 void Metric::Record(double value, const TagsType &tags) {
   if (StatsConfig::instance().IsStatsDisabled()) {
     return;
@@ -122,7 +132,8 @@ void Metric::Record(double value,
                     const std::unordered_map<std::string, std::string> &tags) {
   TagsType tags_pair_vec;
   std::for_each(
-      tags.begin(), tags.end(),
+      tags.begin(),
+      tags.end(),
       [&tags_pair_vec](std::pair<std::string, std::string> tag) {
         return tags_pair_vec.push_back({TagKeyType::Register(tag.first), tag.second});
       });

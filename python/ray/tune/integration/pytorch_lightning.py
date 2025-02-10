@@ -1,213 +1,136 @@
+import inspect
 import logging
-from typing import Dict, List, Optional, Union
-
-from pytorch_lightning import Callback, Trainer, LightningModule
-from ray import tune
-
 import os
+import tempfile
+import warnings
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Type, Union
+
+from ray import train
+from ray.train import Checkpoint
+from ray.util import log_once
+from ray.util.annotations import Deprecated, PublicAPI
+
+try:
+    from lightning import Callback, LightningModule, Trainer
+except ModuleNotFoundError:
+    from pytorch_lightning import Callback, LightningModule, Trainer
+
 
 logger = logging.getLogger(__name__)
 
+# Get all Pytorch Lightning Callback hooks based on whatever PTL version is being used.
+_allowed_hooks = {
+    name
+    for name, fn in inspect.getmembers(Callback, predicate=inspect.isfunction)
+    if name.startswith("on_")
+}
 
+
+def _override_ptl_hooks(callback_cls: Type["TuneCallback"]) -> Type["TuneCallback"]:
+    """Overrides all allowed PTL Callback hooks with our custom handle logic."""
+
+    def generate_overridden_hook(fn_name):
+        def overridden_hook(
+            self,
+            trainer: Trainer,
+            *args,
+            pl_module: Optional[LightningModule] = None,
+            **kwargs,
+        ):
+            if fn_name in self._on:
+                self._handle(trainer=trainer, pl_module=pl_module)
+
+        return overridden_hook
+
+    # Set the overridden hook to all the allowed hooks in TuneCallback.
+    for fn_name in _allowed_hooks:
+        setattr(callback_cls, fn_name, generate_overridden_hook(fn_name))
+
+    return callback_cls
+
+
+@_override_ptl_hooks
 class TuneCallback(Callback):
-    """Base class for Tune's PyTorch Lightning callbacks."""
+    """Base class for Tune's PyTorch Lightning callbacks.
 
-    _allowed = [
-        "init_start",
-        "init_end",
-        "fit_start",
-        "fit_end",
-        "sanity_check_start",
-        "sanity_check_end",
-        "epoch_start",
-        "epoch_end",
-        "batch_start",
-        "validation_batch_start",
-        "validation_batch_end",
-        "test_batch_start",
-        "test_batch_end",
-        "batch_end",
-        "train_start",
-        "train_end",
-        "validation_start",
-        "validation_end",
-        "test_start",
-        "test_end",
-        "keyboard_interrupt",
-    ]
+    Args:
+        When to trigger checkpoint creations. Must be one of
+        the PyTorch Lightning event hooks (less the ``on_``), e.g.
+        "train_batch_start", or "train_end". Defaults to "validation_end"
+    """
 
     def __init__(self, on: Union[str, List[str]] = "validation_end"):
         if not isinstance(on, list):
             on = [on]
-        if any(w not in self._allowed for w in on):
-            raise ValueError(
-                "Invalid trigger time selected: {}. Must be one of {}".format(
-                    on, self._allowed
+
+        for hook in on:
+            if f"on_{hook}" not in _allowed_hooks:
+                raise ValueError(
+                    f"Invalid hook selected: {hook}. Must be one of "
+                    f"{_allowed_hooks}"
                 )
-            )
+
+        # Add back the "on_" prefix for internal consistency.
+        on = [f"on_{hook}" for hook in on]
+
         self._on = on
 
     def _handle(self, trainer: Trainer, pl_module: Optional[LightningModule]):
         raise NotImplementedError
 
-    def on_init_start(self, trainer: Trainer):
-        if "init_start" in self._on:
-            self._handle(trainer, None)
 
-    def on_init_end(self, trainer: Trainer):
-        if "init_end" in self._on:
-            self._handle(trainer, None)
+@PublicAPI
+class TuneReportCheckpointCallback(TuneCallback):
+    """PyTorch Lightning report and checkpoint callback
 
-    def on_fit_start(
-        self, trainer: Trainer, pl_module: Optional[LightningModule] = None
-    ):
-        if "fit_start" in self._on:
-            self._handle(trainer, None)
-
-    def on_fit_end(self, trainer: Trainer, pl_module: Optional[LightningModule] = None):
-        if "fit_end" in self._on:
-            self._handle(trainer, None)
-
-    def on_sanity_check_start(self, trainer: Trainer, pl_module: LightningModule):
-        if "sanity_check_start" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_sanity_check_end(self, trainer: Trainer, pl_module: LightningModule):
-        if "sanity_check_end" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_epoch_start(self, trainer: Trainer, pl_module: LightningModule):
-        if "epoch_start" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_epoch_end(self, trainer: Trainer, pl_module: LightningModule):
-        if "epoch_end" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_batch_start(self, trainer: Trainer, pl_module: LightningModule):
-        if "batch_start" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_validation_batch_start(
-        self,
-        trainer: Trainer,
-        pl_module: LightningModule,
-        batch,
-        batch_idx,
-        dataloader_idx,
-    ):
-        if "validation_batch_start" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_validation_batch_end(
-        self,
-        trainer: Trainer,
-        pl_module: LightningModule,
-        outputs,
-        batch,
-        batch_idx,
-        dataloader_idx,
-    ):
-        if "validation_batch_end" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_test_batch_start(
-        self,
-        trainer: Trainer,
-        pl_module: LightningModule,
-        batch,
-        batch_idx,
-        dataloader_idx,
-    ):
-        if "test_batch_start" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_test_batch_end(
-        self,
-        trainer: Trainer,
-        pl_module: LightningModule,
-        outputs,
-        batch,
-        batch_idx,
-        dataloader_idx,
-    ):
-        if "test_batch_end" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_batch_end(self, trainer: Trainer, pl_module: LightningModule):
-        if "batch_end" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_train_start(self, trainer: Trainer, pl_module: LightningModule):
-        if "train_start" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_train_end(self, trainer: Trainer, pl_module: LightningModule):
-        if "train_end" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_validation_start(self, trainer: Trainer, pl_module: LightningModule):
-        if "validation_start" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_validation_end(self, trainer: Trainer, pl_module: LightningModule):
-        if "validation_end" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_test_start(self, trainer: Trainer, pl_module: LightningModule):
-        if "test_start" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_test_end(self, trainer: Trainer, pl_module: LightningModule):
-        if "test_end" in self._on:
-            self._handle(trainer, pl_module)
-
-    def on_keyboard_interrupt(self, trainer: Trainer, pl_module: LightningModule):
-        if "keyboard_interrupt" in self._on:
-            self._handle(trainer, pl_module)
-
-
-class TuneReportCallback(TuneCallback):
-    """PyTorch Lightning to Ray Tune reporting callback
-
-    Reports metrics to Ray Tune.
+    Saves checkpoints after each validation step. Also reports metrics to Tune,
+    which is needed for checkpoint registration.
 
     Args:
-        metrics (str|list|dict): Metrics to report to Tune. If this is a list,
+        metrics: Metrics to report to Tune. If this is a list,
             each item describes the metric key reported to PyTorch Lightning,
             and it will reported under the same name to Tune. If this is a
             dict, each key will be the name reported to Tune and the respective
             value will be the metric key reported to PyTorch Lightning.
-        on (str|list): When to trigger checkpoint creations. Must be one of
+        filename: Filename of the checkpoint within the checkpoint
+            directory. Defaults to "checkpoint".
+        save_checkpoints: If True (default), checkpoints will be saved and
+            reported to Ray. If False, only metrics will be reported.
+        on: When to trigger checkpoint creations and metric reports. Must be one of
             the PyTorch Lightning event hooks (less the ``on_``), e.g.
-            "batch_start", or "train_end". Defaults to "validation_end".
+            "train_batch_start", or "train_end". Defaults to "validation_end".
+
 
     Example:
 
     .. code-block:: python
 
         import pytorch_lightning as pl
-        from ray.tune.integration.pytorch_lightning import TuneReportCallback
+        from ray.tune.integration.pytorch_lightning import (
+            TuneReportCheckpointCallback)
 
-        # Report loss and accuracy to Tune after each validation epoch:
-        trainer = pl.Trainer(callbacks=[TuneReportCallback(
-                ["val_loss", "val_acc"], on="validation_end")])
+        # Save checkpoint after each training batch and after each
+        # validation epoch.
+        trainer = pl.Trainer(callbacks=[TuneReportCheckpointCallback(
+            metrics={"loss": "val_loss", "mean_accuracy": "val_acc"},
+            filename="trainer.ckpt", on="validation_end")])
 
-        # Same as above, but report as `loss` and `mean_accuracy`:
-        trainer = pl.Trainer(callbacks=[TuneReportCallback(
-                {"loss": "val_loss", "mean_accuracy": "val_acc"},
-                on="validation_end")])
 
     """
 
     def __init__(
         self,
-        metrics: Union[None, str, List[str], Dict[str, str]] = None,
+        metrics: Optional[Union[str, List[str], Dict[str, str]]] = None,
+        filename: str = "checkpoint",
+        save_checkpoints: bool = True,
         on: Union[str, List[str]] = "validation_end",
     ):
-        super(TuneReportCallback, self).__init__(on)
+        super(TuneReportCheckpointCallback, self).__init__(on=on)
         if isinstance(metrics, str):
             metrics = [metrics]
+        self._save_checkpoints = save_checkpoints
+        self._filename = filename
         self._metrics = metrics
 
     def _get_report_dict(self, trainer: Trainer, pl_module: LightningModule):
@@ -233,94 +156,51 @@ class TuneReportCallback(TuneCallback):
 
         return report_dict
 
-    def _handle(self, trainer: Trainer, pl_module: LightningModule):
-        report_dict = self._get_report_dict(trainer, pl_module)
-        if report_dict is not None:
-            tune.report(**report_dict)
+    @contextmanager
+    def _get_checkpoint(self, trainer: Trainer) -> Optional[Checkpoint]:
+        if not self._save_checkpoints:
+            yield None
+            return
 
-
-class _TuneCheckpointCallback(TuneCallback):
-    """PyTorch Lightning checkpoint callback
-
-    Saves checkpoints after each validation step.
-
-    Checkpoint are currently not registered if no ``tune.report()`` call
-    is made afterwards. Consider using ``TuneReportCheckpointCallback``
-    instead.
-
-    Args:
-        filename (str): Filename of the checkpoint within the checkpoint
-            directory. Defaults to "checkpoint".
-        on (str|list): When to trigger checkpoint creations. Must be one of
-            the PyTorch Lightning event hooks (less the ``on_``), e.g.
-            "batch_start", or "train_end". Defaults to "validation_end".
-
-
-    """
-
-    def __init__(
-        self, filename: str = "checkpoint", on: Union[str, List[str]] = "validation_end"
-    ):
-        super(_TuneCheckpointCallback, self).__init__(on)
-        self._filename = filename
+        with tempfile.TemporaryDirectory() as checkpoint_dir:
+            trainer.save_checkpoint(os.path.join(checkpoint_dir, self._filename))
+            checkpoint = Checkpoint.from_directory(checkpoint_dir)
+            yield checkpoint
 
     def _handle(self, trainer: Trainer, pl_module: LightningModule):
         if trainer.sanity_checking:
             return
-        step = f"epoch={trainer.current_epoch}-step={trainer.global_step}"
-        with tune.checkpoint_dir(step=step) as checkpoint_dir:
-            trainer.save_checkpoint(os.path.join(checkpoint_dir, self._filename))
+
+        report_dict = self._get_report_dict(trainer, pl_module)
+        if not report_dict:
+            return
+
+        with self._get_checkpoint(trainer) as checkpoint:
+            train.report(report_dict, checkpoint=checkpoint)
 
 
-class TuneReportCheckpointCallback(TuneCallback):
-    """PyTorch Lightning report and checkpoint callback
-
-    Saves checkpoints after each validation step. Also reports metrics to Tune,
-    which is needed for checkpoint registration.
-
-    Args:
-        metrics (str|list|dict): Metrics to report to Tune. If this is a list,
-            each item describes the metric key reported to PyTorch Lightning,
-            and it will reported under the same name to Tune. If this is a
-            dict, each key will be the name reported to Tune and the respective
-            value will be the metric key reported to PyTorch Lightning.
-        filename (str): Filename of the checkpoint within the checkpoint
-            directory. Defaults to "checkpoint".
-        on (str|list): When to trigger checkpoint creations. Must be one of
-            the PyTorch Lightning event hooks (less the ``on_``), e.g.
-            "batch_start", or "train_end". Defaults to "validation_end".
+class _TuneCheckpointCallback(TuneCallback):
+    def __init__(self, *args, **kwargs):
+        raise DeprecationWarning(
+            "`ray.tune.integration.pytorch_lightning._TuneCheckpointCallback` "
+            "is deprecated."
+        )
 
 
-    Example:
-
-    .. code-block:: python
-
-        import pytorch_lightning as pl
-        from ray.tune.integration.pytorch_lightning import (
-            TuneReportCheckpointCallback)
-
-        # Save checkpoint after each training batch and after each
-        # validation epoch.
-        trainer = pl.Trainer(callbacks=[TuneReportCheckpointCallback(
-            metrics={"loss": "val_loss", "mean_accuracy": "val_acc"},
-            filename="trainer.ckpt", on="validation_end")])
-
-
-    """
-
-    _checkpoint_callback_cls = _TuneCheckpointCallback
-    _report_callbacks_cls = TuneReportCallback
-
+@Deprecated
+class TuneReportCallback(TuneReportCheckpointCallback):
     def __init__(
         self,
-        metrics: Union[None, str, List[str], Dict[str, str]] = None,
-        filename: str = "checkpoint",
+        metrics: Optional[Union[str, List[str], Dict[str, str]]] = None,
         on: Union[str, List[str]] = "validation_end",
     ):
-        super(TuneReportCheckpointCallback, self).__init__(on)
-        self._checkpoint = self._checkpoint_callback_cls(filename, on)
-        self._report = self._report_callbacks_cls(metrics, on)
-
-    def _handle(self, trainer: Trainer, pl_module: LightningModule):
-        self._checkpoint._handle(trainer, pl_module)
-        self._report._handle(trainer, pl_module)
+        if log_once("tune_ptl_report_deprecated"):
+            warnings.warn(
+                "`ray.tune.integration.pytorch_lightning.TuneReportCallback` "
+                "is deprecated. Use "
+                "`ray.tune.integration.pytorch_lightning.TuneReportCheckpointCallback`"
+                " instead."
+            )
+        super(TuneReportCallback, self).__init__(
+            metrics=metrics, save_checkpoints=False, on=on
+        )

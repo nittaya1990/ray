@@ -1,66 +1,106 @@
-.. include:: /_includes/rllib_announcement.rst
-
-.. include:: /_includes/rllib_we_are_hiring.rst
+.. include:: /_includes/rllib/we_are_hiring.rst
 
 .. _rllib-guides:
 
-===========
 User Guides
 ===========
+
+.. include:: /_includes/rllib/new_api_stack.rst
+
+.. toctree::
+    :hidden:
+
+    rllib-advanced-api
+    rllib-callback
+    checkpoints
+    metrics-logger
+    single-agent-episode
+    rllib-replay-buffers
+    rllib-offline
+    rl-modules
+    rllib-learner
+    rllib-torch2x
+    rllib-fault-tolerance
+    rllib-dev
+    scaling-guide
 
 .. _rllib-feature-guide:
 
 RLlib Feature Guides
 --------------------
 
-.. panels::
-    :container: container pb-4 full-width
-    :column: col-md-4 px-2 py-2
-    :img-top-cls: pt-5 w-75 d-block mx-auto
+.. grid:: 1 2 3 4
+    :gutter: 1
+    :class-container: container pb-3
 
-    ---
-    :img-top: /rllib/images/rllib-logo.svg
+    .. grid-item-card::
+        :img-top: /rllib/images/rllib-logo.svg
+        :class-img-top: pt-2 w-75 d-block mx-auto fixed-height-img
 
-    +++
-    .. link-button:: rllib-models
-        :type: ref
-        :text: Working With Models, Preprocessors and Action Distributions
-        :classes: btn-link btn-block stretched-link
+        .. button-ref:: rllib-advanced-api-doc
 
-    ---
-    :img-top: /rllib/images/rllib-logo.svg
+            Advanced features of the RLlib python API
 
-    +++
-    .. link-button:: rllib-concepts
-        :type: ref
-        :text: How To Customize Your Policies?
-        :classes: btn-link btn-block stretched-link
+    .. grid-item-card::
+        :img-top: /rllib/images/rllib-logo.svg
+        :class-img-top: pt-2 w-75 d-block mx-auto fixed-height-img
 
-    ---
-    :img-top: /rllib/images/rllib-logo.svg
+        .. button-ref:: rllib-callback
 
-    +++
-    .. link-button:: rllib-sample-collection
-        :type: ref
-        :text: How To Use Sample Collections and Trajectory Views?
-        :classes: btn-link btn-block stretched-link
+            Injecting custom code into RLlib through callbacks
 
-    ---
-    :img-top: /rllib/images/rllib-logo.svg
+    .. grid-item-card::
+        :img-top: /rllib/images/rllib-logo.svg
+        :class-img-top: pt-2 w-75 d-block mx-auto fixed-height-img
 
-    +++
-    .. link-button:: rllib-offline
-        :type: ref
-        :text: Working With Offline Data
-        :classes: btn-link btn-block stretched-link
+        .. button-ref:: metrics-logger
 
-    ---
-    :img-top: /rllib/images/rllib-logo.svg
+            Logging metrics and statistics from custom code
 
-    +++
-    .. link-button:: rllib-dev
-        :type: ref
-        :text: How To Contribute To RLlib?
-        :classes: btn-link btn-block stretched-link
+    .. grid-item-card::
+        :img-top: /rllib/images/rllib-logo.svg
+        :class-img-top: pt-2 w-75 d-block mx-auto fixed-height-img
 
-.. include:: /_includes/rllib_announcement_bottom.rst
+        .. button-ref:: checkpoints
+
+            Checkpointing your experiments and models
+
+    .. grid-item-card::
+        :img-top: /rllib/images/rllib-logo.svg
+        :class-img-top: pt-2 w-75 d-block mx-auto fixed-height-img
+
+        .. button-ref:: single-agent-episode
+
+            How to process trajectories through episodes
+
+    .. grid-item-card::
+        :img-top: /rllib/images/rllib-logo.svg
+        :class-img-top: pt-2 w-75 d-block mx-auto fixed-height-img
+
+        .. button-ref:: rllib-offline
+
+            Offline RL with offline datasets
+
+    .. grid-item-card::
+        :img-top: /rllib/images/rllib-logo.svg
+        :class-img-top: pt-2 w-75 d-block mx-auto fixed-height-img
+
+        .. button-ref:: rllib-replay-buffers
+
+            Working with replay buffers
+
+    .. grid-item-card::
+        :img-top: /rllib/images/rllib-logo.svg
+        :class-img-top: pt-2 w-75 d-block mx-auto fixed-height-img
+
+        .. button-ref:: rllib-dev
+
+            Contribute to RLlib
+
+    .. grid-item-card::
+        :img-top: /rllib/images/rllib-logo.svg
+        :class-img-top: pt-2 w-75 d-block mx-auto fixed-height-img
+
+        .. button-ref:: scaling-guide
+
+            How to run RLlib experiments at scale

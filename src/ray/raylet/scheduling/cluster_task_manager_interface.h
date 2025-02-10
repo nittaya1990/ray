@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include "ray/raylet/worker.h"
 #include "ray/rpc/server_call.h"
 #include "src/ray/protobuf/node_manager.pb.h"
 
@@ -33,19 +32,13 @@ class ClusterTaskManagerInterface {
   ///
   /// \param Output parameter. `resource_load` and `resource_load_by_shape` are the only
   /// fields used.
-  virtual void FillResourceUsage(
-      rpc::ResourcesData &data,
-      const std::shared_ptr<SchedulingResources> &last_reported_resources = nullptr) = 0;
-
-  /// Populate the list of pending or infeasible actor tasks for node stats.
-  ///
-  /// \param Output parameter.
-  virtual void FillPendingActorInfo(rpc::GetNodeStatsReply *reply) const = 0;
+  virtual void FillResourceUsage(rpc::ResourcesData &data) = 0;
 
   /// Attempt to cancel an already queued task.
   ///
   /// \param task_id: The id of the task to remove.
   /// \param failure_type: The failure type.
+  /// \param scheduling_failure_message: The failure message.
   ///
   /// \return True if task was successfully removed. This function will return
   /// false if the task is already running.
@@ -55,6 +48,23 @@ class ClusterTaskManagerInterface {
           rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_INTENDED,
       const std::string &scheduling_failure_message = "") = 0;
 
+  virtual bool CancelAllTaskOwnedBy(
+      const WorkerID &worker_id,
+      rpc::RequestWorkerLeaseReply::SchedulingFailureType failure_type =
+          rpc::RequestWorkerLeaseReply::SCHEDULING_CANCELLED_INTENDED,
+      const std::string &scheduling_failure_message = "") = 0;
+
+  /// Attempt to cancel all queued tasks that match the predicate.
+  ///
+  /// \param predicate: A function that returns true if a task needs to be cancelled.
+  /// \param failure_type: The reason for cancellation.
+  /// \param scheduling_failure_message: The reason message for cancellation.
+  /// \return True if any task was successfully cancelled.
+  virtual bool CancelTasks(
+      std::function<bool(const std::shared_ptr<internal::Work> &)> predicate,
+      rpc::RequestWorkerLeaseReply::SchedulingFailureType failure_type,
+      const std::string &scheduling_failure_message) = 0;
+
   /// Queue task and schedule. This hanppens when processing the worker lease request.
   ///
   /// \param task: The incoming task to be queued and scheduled.
@@ -62,7 +72,8 @@ class ClusterTaskManagerInterface {
   ///                         but no spillback.
   /// \param reply: The reply of the lease request.
   /// \param send_reply_callback: The function used during dispatching.
-  virtual void QueueAndScheduleTask(const RayTask &task, bool grant_or_reject,
+  virtual void QueueAndScheduleTask(RayTask task,
+                                    bool grant_or_reject,
                                     bool is_selected_based_on_locality,
                                     rpc::RequestWorkerLeaseReply *reply,
                                     rpc::SendReplyCallback send_reply_callback) = 0;
@@ -74,7 +85,8 @@ class ClusterTaskManagerInterface {
   /// \param[in] num_pending_tasks Number of pending tasks.
   /// \param[in] any_pending True if there's any pending exemplar.
   /// \return True if any progress is any tasks are pending.
-  virtual bool AnyPendingTasksForResourceAcquisition(RayTask *exemplar, bool *any_pending,
+  virtual bool AnyPendingTasksForResourceAcquisition(RayTask *exemplar,
+                                                     bool *any_pending,
                                                      int *num_pending_actor_creation,
                                                      int *num_pending_tasks) const = 0;
 

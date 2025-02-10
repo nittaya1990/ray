@@ -1,6 +1,8 @@
 import os
 import pytest
+import unittest
 import ray
+from ray._private.utils import update_envs
 
 
 @pytest.mark.skipif("sys.platform != 'linux'")
@@ -31,10 +33,41 @@ def test_environ_file_on_linux(ray_start_10_cpus):
     assert len(actor_os_environ) > 0
 
 
+def test_update_envs():
+    with unittest.mock.patch.dict(os.environ):
+        env_vars = {
+            "PATH": "/test/lib/path:${PATH}",
+            "LD_LIBRARY_PATH": "/test/path1:${LD_LIBRARY_PATH}:./test/path2",
+            "DYLD_LIBRARY_PATH": "${DYLD_LIBRARY_PATH}:/test/path",
+            "LD_PRELOAD": "",
+        }
+        old_path = os.environ["PATH"]
+        os.environ["LD_LIBRARY_PATH"] = "./"
+        os.environ["DYLD_LIBRARY_PATH"] = "/lib64"
+        os.environ["LD_PRELOAD"] = "/lib:/usr/local/lib"
+        update_envs(env_vars)
+        assert os.environ["PATH"] == "/test/lib/path:" + old_path
+        assert os.environ["LD_LIBRARY_PATH"] == "/test/path1:./:./test/path2"
+        assert os.environ["DYLD_LIBRARY_PATH"] == "/lib64:/test/path"
+        assert os.environ["LD_PRELOAD"] == env_vars["LD_PRELOAD"]
+
+        # Test the empty string scenario
+        os.environ["LD_LIBRARY_PATH"] = ""
+        del os.environ["DYLD_LIBRARY_PATH"]
+        del os.environ["LD_PRELOAD"]
+        update_envs(env_vars)
+        assert os.environ["LD_LIBRARY_PATH"] == "/test/path1::./test/path2"
+        assert os.environ["DYLD_LIBRARY_PATH"] == ":/test/path"
+        assert os.environ["LD_PRELOAD"] == env_vars["LD_PRELOAD"]
+
+
 if __name__ == "__main__":
     import pytest
     import sys
 
     os.environ["LC_ALL"] = "en_US.UTF-8"
     os.environ["LANG"] = "en_US.UTF-8"
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

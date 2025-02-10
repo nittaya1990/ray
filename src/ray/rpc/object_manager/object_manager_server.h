@@ -23,10 +23,13 @@
 namespace ray {
 namespace rpc {
 
-#define RAY_OBJECT_MANAGER_RPC_HANDLERS               \
-  RPC_SERVICE_HANDLER(ObjectManagerService, Push, -1) \
-  RPC_SERVICE_HANDLER(ObjectManagerService, Pull, -1) \
-  RPC_SERVICE_HANDLER(ObjectManagerService, FreeObjects, -1)
+#define RAY_OBJECT_MANAGER_RPC_SERVICE_HANDLER(METHOD) \
+  RPC_SERVICE_HANDLER_CUSTOM_AUTH(ObjectManagerService, METHOD, -1, AuthType::NO_AUTH)
+
+#define RAY_OBJECT_MANAGER_RPC_HANDLERS        \
+  RAY_OBJECT_MANAGER_RPC_SERVICE_HANDLER(Push) \
+  RAY_OBJECT_MANAGER_RPC_SERVICE_HANDLER(Pull) \
+  RAY_OBJECT_MANAGER_RPC_SERVICE_HANDLER(FreeObjects)
 
 /// Implementations of the `ObjectManagerGrpcService`, check interface in
 /// `src/ray/protobuf/object_manager.proto`.
@@ -39,13 +42,15 @@ class ObjectManagerServiceHandler {
   /// \param[in] request The request message.
   /// \param[out] reply The reply message.
   /// \param[in] send_reply_callback The callback to be called when the request is done.
-  virtual void HandlePush(const PushRequest &request, PushReply *reply,
+  virtual void HandlePush(PushRequest request,
+                          PushReply *reply,
                           SendReplyCallback send_reply_callback) = 0;
   /// Handle a `Pull` request
-  virtual void HandlePull(const PullRequest &request, PullReply *reply,
+  virtual void HandlePull(PullRequest request,
+                          PullReply *reply,
                           SendReplyCallback send_reply_callback) = 0;
   /// Handle a `FreeObjects` request
-  virtual void HandleFreeObjects(const FreeObjectsRequest &request,
+  virtual void HandleFreeObjects(FreeObjectsRequest request,
                                  FreeObjectsReply *reply,
                                  SendReplyCallback send_reply_callback) = 0;
 };
@@ -66,7 +71,8 @@ class ObjectManagerGrpcService : public GrpcService {
 
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
     RAY_OBJECT_MANAGER_RPC_HANDLERS
   }
 

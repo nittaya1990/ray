@@ -15,6 +15,7 @@
 #pragma once
 
 #include <ray/api/common_types.h>
+#include <ray/api/ray_runtime_holder.h>
 #include <ray/api/serializer.h>
 #include <ray/api/type_traits.h>
 
@@ -33,6 +34,11 @@ namespace internal {
 template <typename T>
 inline static std::enable_if_t<!std::is_pointer<T>::value, msgpack::sbuffer>
 PackReturnValue(T result) {
+  if constexpr (is_actor_handle_v<T>) {
+    auto serialized_actor_handle =
+        RayRuntimeHolder::Instance().Runtime()->SerializeActorHandle(result.ID());
+    return Serializer::Serialize(serialized_actor_handle);
+  }
   return Serializer::Serialize(std::move(result));
 }
 
@@ -47,16 +53,6 @@ inline static msgpack::sbuffer PackVoid() {
 }
 
 msgpack::sbuffer PackError(std::string error_msg);
-
-using ArgsBuffer = msgpack::sbuffer;
-using ArgsBufferList = std::vector<ArgsBuffer>;
-
-using RemoteFunction = std::function<msgpack::sbuffer(const ArgsBufferList &)>;
-using RemoteFunctionMap_t = std::unordered_map<std::string, RemoteFunction>;
-
-using RemoteMemberFunction =
-    std::function<msgpack::sbuffer(msgpack::sbuffer *, const ArgsBufferList &)>;
-using RemoteMemberFunctionMap_t = std::unordered_map<std::string, RemoteMemberFunction>;
 
 /// It's help to invoke functions and member functions, the class Invoker<Function> help
 /// do type erase.
@@ -84,7 +80,8 @@ struct Invoker {
     return result;
   }
 
-  static inline msgpack::sbuffer ApplyMember(const Function &func, msgpack::sbuffer *ptr,
+  static inline msgpack::sbuffer ApplyMember(const Function &func,
+                                             msgpack::sbuffer *ptr,
                                              const ArgsBufferList &args_buffer) {
     using RetrunType = boost::callable_traits::return_type_t<Function>;
     using ArgsTuple =
@@ -116,6 +113,10 @@ struct Invoker {
     if constexpr (is_object_ref_v<T>) {
       // Construct an ObjectRef<T> by id.
       return T(std::string(args_buffer.data(), args_buffer.size()));
+    } else if constexpr (is_actor_handle_v<T>) {
+      auto actor_handle =
+          Serializer::Deserialize<std::string>(args_buffer.data(), args_buffer.size());
+      return T::FromBytes(actor_handle);
     } else {
       auto [success, value] =
           Serializer::DeserializeWhenNil<T>(args_buffer.data(), args_buffer.size());
@@ -124,7 +125,8 @@ struct Invoker {
     }
   }
 
-  static inline bool GetArgsTuple(std::tuple<> &tup, const ArgsBufferList &args_buffer,
+  static inline bool GetArgsTuple(std::tuple<> &tup,
+                                  const ArgsBufferList &args_buffer,
                                   std::index_sequence<>) {
     return true;
   }
@@ -155,7 +157,8 @@ struct Invoker {
   }
 
   template <typename R, typename F, size_t... I, typename... Args>
-  static R CallInternal(const F &f, const std::index_sequence<I...> &,
+  static R CallInternal(const F &f,
+                        const std::index_sequence<I...> &,
                         std::tuple<Args...> args) {
     (void)args;
     using ArgsTuple = boost::callable_traits::args_t<F>;
@@ -165,21 +168,23 @@ struct Invoker {
   template <typename R, typename F, typename Self, typename... Args>
   static std::enable_if_t<std::is_void<R>::value, msgpack::sbuffer> CallMember(
       const F &f, Self *self, std::tuple<Args...> args) {
-    CallMemberInternal<R>(f, self, std::make_index_sequence<sizeof...(Args)>{},
-                          std::move(args));
+    CallMemberInternal<R>(
+        f, self, std::make_index_sequence<sizeof...(Args)>{}, std::move(args));
     return PackVoid();
   }
 
   template <typename R, typename F, typename Self, typename... Args>
   static std::enable_if_t<!std::is_void<R>::value, msgpack::sbuffer> CallMember(
       const F &f, Self *self, std::tuple<Args...> args) {
-    auto r = CallMemberInternal<R>(f, self, std::make_index_sequence<sizeof...(Args)>{},
-                                   std::move(args));
+    auto r = CallMemberInternal<R>(
+        f, self, std::make_index_sequence<sizeof...(Args)>{}, std::move(args));
     return PackReturnValue(r);
   }
 
   template <typename R, typename F, typename Self, size_t... I, typename... Args>
-  static R CallMemberInternal(const F &f, Self *self, const std::index_sequence<I...> &,
+  static R CallMemberInternal(const F &f,
+                              Self *self,
+                              const std::index_sequence<I...> &,
                               std::tuple<Args...> args) {
     (void)args;
     using ArgsTuple = boost::callable_traits::args_t<F>;
@@ -279,6 +284,25 @@ class FunctionManager {
     return &it->second;
   }
 
+  static std::string GetClassNameByFuncName(const std::string &func_name) {
+    if (func_name.empty()) {
+      return "";
+    }
+
+    const std::string &prefix = "RAY_FUNC(";
+    size_t start_pos = 0;
+    auto pos = func_name.find(prefix);
+    if (pos != func_name.npos) {
+      start_pos = pos + prefix.size();
+    }
+    auto end_pod = func_name.find_last_of("::");
+    if (end_pod == func_name.npos || end_pod <= start_pos) {
+      return "";
+    }
+
+    return func_name.substr(start_pos, (end_pod - start_pos - 1));
+  }
+
  private:
   FunctionManager() = default;
   ~FunctionManager() = default;
@@ -288,16 +312,20 @@ class FunctionManager {
   template <typename Function>
   bool RegisterNonMemberFunc(std::string const &name, Function f) {
     return map_invokers_
-        .emplace(name, std::bind(&Invoker<Function>::Apply, std::move(f),
-                                 std::placeholders::_1))
+        .emplace(
+            name,
+            std::bind(&Invoker<Function>::Apply, std::move(f), std::placeholders::_1))
         .second;
   }
 
   template <typename Function>
   bool RegisterMemberFunc(std::string const &name, Function f) {
     return map_mem_func_invokers_
-        .emplace(name, std::bind(&Invoker<Function>::ApplyMember, std::move(f),
-                                 std::placeholders::_1, std::placeholders::_2))
+        .emplace(name,
+                 std::bind(&Invoker<Function>::ApplyMember,
+                           std::move(f),
+                           std::placeholders::_1,
+                           std::placeholders::_2))
         .second;
   }
 

@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "ray/object_manager/plasma/object_lifecycle_manager.h"
+
 #include <limits>
 
 #include "absl/random/random.h"
 #include "absl/strings/str_format.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-
-#include "ray/object_manager/plasma/object_lifecycle_manager.h"
 
 using namespace ray;
 using namespace testing;
@@ -39,12 +39,21 @@ class MockEvictionPolicy : public IEvictionPolicy {
 
 class MockObjectStore : public IObjectStore {
  public:
-  MOCK_METHOD3(CreateObject, const LocalObject *(const ray::ObjectInfo &,
-                                                 plasma::flatbuf::ObjectSource, bool));
+  MOCK_METHOD3(CreateObject,
+               const LocalObject *(const ray::ObjectInfo &,
+                                   plasma::flatbuf::ObjectSource,
+                                   bool));
   MOCK_CONST_METHOD1(GetObject, const LocalObject *(const ObjectID &));
   MOCK_METHOD1(SealObject, const LocalObject *(const ObjectID &));
   MOCK_METHOD1(DeleteObject, bool(const ObjectID &));
   MOCK_CONST_METHOD1(GetDebugDump, void(std::stringstream &buffer));
+};
+
+class MockObjectStatsCollector : public ObjectStatsCollector {
+ public:
+  MOCK_METHOD1(OnObjectCreated, void(const LocalObject &));
+  MOCK_METHOD1(OnObjectSealed, void(const LocalObject &));
+  MOCK_METHOD1(OnObjectDeleting, void(const LocalObject &));
 };
 
 struct ObjectLifecycleManagerTest : public Test {
@@ -52,11 +61,16 @@ struct ObjectLifecycleManagerTest : public Test {
     Test::SetUp();
     auto eviction_policy = std::make_unique<MockEvictionPolicy>();
     auto object_store = std::make_unique<MockObjectStore>();
+    auto stats_collector = std::make_unique<MockObjectStatsCollector>();
     eviction_policy_ = eviction_policy.get();
     object_store_ = object_store.get();
+    stats_collector_ = stats_collector.get();
+    auto delete_object_cb = [this](auto &id) { notify_deleted_ids_.push_back(id); };
     manager_ = std::make_unique<ObjectLifecycleManager>(
-        ObjectLifecycleManager(std::move(object_store), std::move(eviction_policy),
-                               [this](auto &id) { notify_deleted_ids_.push_back(id); }));
+        ObjectLifecycleManager(std::move(object_store),
+                               std::move(eviction_policy),
+                               delete_object_cb,
+                               std::move(stats_collector)));
     sealed_object_.state = ObjectState::PLASMA_SEALED;
     not_sealed_object_.state = ObjectState::PLASMA_CREATED;
     one_ref_object_.state = ObjectState::PLASMA_SEALED;
@@ -67,6 +81,7 @@ struct ObjectLifecycleManagerTest : public Test {
 
   MockEvictionPolicy *eviction_policy_;
   MockObjectStore *object_store_;
+  MockObjectStatsCollector *stats_collector_;
   std::unique_ptr<ObjectLifecycleManager> manager_;
   std::vector<ObjectID> notify_deleted_ids_;
 

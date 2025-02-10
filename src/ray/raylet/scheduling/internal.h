@@ -15,14 +15,12 @@
 #pragma once
 
 #include "ray/common/ray_object.h"
+#include "ray/common/scheduling/cluster_resource_data.h"
 #include "ray/common/task/task.h"
 #include "ray/common/task/task_common.h"
 #include "src/ray/protobuf/node_manager.pb.h"
 
-namespace ray {
-namespace raylet {
-
-namespace internal {
+namespace ray::raylet::internal {
 
 enum class WorkStatus {
   /// Waiting to be scheduled.
@@ -47,8 +45,6 @@ enum class UnscheduledWorkCause {
   WORKER_NOT_FOUND_JOB_CONFIG_NOT_EXIST,
   /// Waiting becasue the worker wasn't available since its registration timed out.
   WORKER_NOT_FOUND_REGISTRATION_TIMEOUT,
-  /// Waiting because the worker wasn't available since it was rate limited.
-  WORKER_NOT_FOUND_RATE_LIMITED,
 };
 
 /// Work represents all the information needed to make a scheduling decision.
@@ -57,19 +53,22 @@ enum class UnscheduledWorkCause {
 class Work {
  public:
   RayTask task;
-  const bool grant_or_reject;
-  const bool is_selected_based_on_locality;
+  bool grant_or_reject;
+  bool is_selected_based_on_locality;
   rpc::RequestWorkerLeaseReply *reply;
   std::function<void(void)> callback;
   std::shared_ptr<TaskResourceInstances> allocated_instances;
-  Work(RayTask task, bool grant_or_reject, bool is_selected_based_on_locality,
-       rpc::RequestWorkerLeaseReply *reply, std::function<void(void)> callback,
+  Work(RayTask task,
+       bool grant_or_reject,
+       bool is_selected_based_on_locality,
+       rpc::RequestWorkerLeaseReply *reply,
+       std::function<void(void)> callback,
        WorkStatus status = WorkStatus::WAITING)
-      : task(task),
+      : task(std::move(task)),
         grant_or_reject(grant_or_reject),
         is_selected_based_on_locality(is_selected_based_on_locality),
         reply(reply),
-        callback(callback),
+        callback(std::move(callback)),
         allocated_instances(nullptr),
         status_(status){};
   Work(const Work &Work) = delete;
@@ -102,9 +101,6 @@ class Work {
       UnscheduledWorkCause::WAITING_FOR_RESOURCE_ACQUISITION;
 };
 
-typedef std::function<const rpc::GcsNodeInfo *(const NodeID &node_id)> NodeInfoGetter;
+using NodeInfoGetter = std::function<const rpc::GcsNodeInfo *(const NodeID &node_id)>;
 
-}  // namespace internal
-
-}  // namespace raylet
-}  // namespace ray
+}  // namespace ray::raylet::internal

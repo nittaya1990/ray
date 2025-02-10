@@ -2,15 +2,16 @@ package io.ray.runtime.config;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
-import com.google.common.collect.ImmutableMap;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigException;
 import com.typesafe.config.ConfigFactory;
 import com.typesafe.config.ConfigRenderOptions;
-import com.typesafe.config.ConfigValue;
 import io.ray.api.id.JobId;
 import io.ray.api.options.ActorLifetime;
+import io.ray.api.runtimeenv.RuntimeEnvConfig;
+import io.ray.api.runtimeenv.types.RuntimeEnvName;
 import io.ray.runtime.generated.Common.WorkerType;
+import io.ray.runtime.runtimeenv.RuntimeEnvImpl;
 import io.ray.runtime.util.NetworkUtil;
 import java.io.File;
 import java.util.ArrayList;
@@ -40,6 +41,7 @@ public class RayConfig {
   public String logDir;
 
   private String bootstrapAddress;
+  public final String redisUsername;
   public final String redisPassword;
 
   // RPC socket name of object store.
@@ -53,6 +55,8 @@ public class RayConfig {
   public int startupToken;
 
   public int runtimeEnvHash;
+
+  public RuntimeEnvImpl runtimeEnvImpl = null;
 
   public final ActorLifetime defaultActorLifetime;
 
@@ -74,12 +78,9 @@ public class RayConfig {
 
   public final List<String> headArgs;
 
-  public final int numWorkersPerProcess;
-
   public final String namespace;
 
   public final List<String> jvmOptionsForJavaWorker;
-  public final Map<String, String> workerEnv;
 
   private void validate() {
     if (workerMode == WorkerType.WORKER) {
@@ -109,7 +110,7 @@ public class RayConfig {
     boolean isDriver = workerMode == WorkerType.DRIVER;
     // Run mode.
     if (config.hasPath("ray.local-mode")) {
-      runMode = config.getBoolean("ray.local-mode") ? RunMode.SINGLE_PROCESS : RunMode.CLUSTER;
+      runMode = config.getBoolean("ray.local-mode") ? RunMode.LOCAL : RunMode.CLUSTER;
     } else {
       runMode = config.getEnum(RunMode.class, "ray.run-mode");
     }
@@ -149,15 +150,6 @@ public class RayConfig {
 
     // jvm options for java workers of this job.
     jvmOptionsForJavaWorker = config.getStringList("ray.job.jvm-options");
-
-    ImmutableMap.Builder<String, String> workerEnvBuilder = ImmutableMap.builder();
-    Config workerEnvConfig = config.getConfig("ray.job.worker-env");
-    if (workerEnvConfig != null) {
-      for (Map.Entry<String, ConfigValue> entry : workerEnvConfig.entrySet()) {
-        workerEnvBuilder.put(entry.getKey(), workerEnvConfig.getString(entry.getKey()));
-      }
-    }
-    workerEnv = workerEnvBuilder.build();
     updateSessionDir(null);
 
     // Object store socket name.
@@ -179,6 +171,7 @@ public class RayConfig {
       this.bootstrapAddress = null;
     }
 
+    redisUsername = config.getString("ray.redis.username");
     redisPassword = config.getString("ray.redis.password");
     // Raylet node manager port.
     if (config.hasPath("ray.raylet.node-manager-port")) {
@@ -199,13 +192,59 @@ public class RayConfig {
     }
     codeSearchPath = Arrays.asList(codeSearchPathString.split(":"));
 
-    numWorkersPerProcess = config.getInt("ray.job.num-java-workers-per-process");
-
     startupToken = config.getInt("ray.raylet.startup-token");
 
     /// Driver needn't this config item.
     if (workerMode == WorkerType.WORKER && config.hasPath("ray.internal.runtime-env-hash")) {
       runtimeEnvHash = config.getInt("ray.internal.runtime-env-hash");
+    }
+
+    {
+      /// Runtime Env env-vars
+      Map<String, String> envVars = new HashMap<>();
+      List<String> jarUrls = null;
+      final String envVarsPath = "ray.job.runtime-env.env-vars";
+      if (config.hasPath(envVarsPath)) {
+        Config envVarsConfig = config.getConfig(envVarsPath);
+        envVarsConfig
+            .entrySet()
+            .forEach(
+                (entry) -> {
+                  envVars.put(entry.getKey(), ((String) entry.getValue().unwrapped()));
+                });
+      }
+
+      /// Runtime env jars
+      final String jarsPath = "ray.job.runtime-env.jars";
+      if (config.hasPath(jarsPath)) {
+        jarUrls = config.getStringList(jarsPath);
+      }
+
+      /// Runtime env config
+      RuntimeEnvConfig runtimeEnvConfig = null;
+      final String timeoutPath = "ray.job.runtime-env.config.setup-timeout-seconds";
+      if (config.hasPath(timeoutPath)) {
+        runtimeEnvConfig = new RuntimeEnvConfig();
+        runtimeEnvConfig.setSetupTimeoutSeconds(config.getInt(timeoutPath));
+      }
+      final String eagerInstallPath = "ray.job.runtime-env.config.eager-install";
+      if (config.hasPath(eagerInstallPath)) {
+        if (runtimeEnvConfig == null) {
+          runtimeEnvConfig = new RuntimeEnvConfig();
+        }
+        runtimeEnvConfig.setEagerInstall(config.getBoolean(eagerInstallPath));
+      }
+
+      runtimeEnvImpl = new RuntimeEnvImpl();
+      if (!envVars.isEmpty()) {
+        runtimeEnvImpl.set(RuntimeEnvName.ENV_VARS, envVars);
+      }
+      if (!jarUrls.isEmpty()) {
+        runtimeEnvImpl.set(RuntimeEnvName.JARS, jarUrls);
+      }
+      if (runtimeEnvConfig != null) {
+        runtimeEnvImpl.setConfig(runtimeEnvConfig);
+      }
     }
 
     {

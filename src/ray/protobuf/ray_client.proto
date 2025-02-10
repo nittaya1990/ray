@@ -13,7 +13,6 @@
 // limitations under the License.
 
 syntax = "proto3";
-option cc_enable_arenas = true;
 
 package ray.rpc;
 
@@ -36,7 +35,7 @@ message Arg {
   Type type = 4;
 }
 
-// A message representing the valid options to modify a task exectution
+// A message representing the valid options to modify a task execution
 //
 // TODO(barakmich): In the longer term, if everything were a client,
 // this message could be the actual standard for which options are
@@ -64,19 +63,26 @@ message ClientTask {
   string name = 2;
   // A reference to the payload.
   bytes payload_id = 3;
-  // Positional parameters to pass to this call.
+  // Positional parameters to pass to this call. Deprecated in favor of data field
   repeated Arg args = 4;
-  // Keyword parameters to pass to this call.
+  // Keyword parameters to pass to this call. Deprecated in favor of data field
   map<string, Arg> kwargs = 5;
   // The ID of the client namespace associated with the Datapath stream
   // making this request.
   string client_id = 6;
   // Options for modifying the remote task execution environment.
   TaskOptions options = 7;
-  // Options passed to create the default remote task excution environment.
+  // Options passed to create the default remote task execution environment.
   TaskOptions baseline_options = 8;
   // A namespace parameter.
   string namespace = 9;
+  // Serialized args and kwargs. Under the hood this should just be a pickled
+  // tuple containing (args, kwargs).
+  bytes data = 10;
+  // Identifies which chunk the serialized args and kwargs belong to
+  int32 chunk_id = 11;
+  // Total number of chunks
+  int32 total_chunks = 12;
 }
 
 message ClientTaskTicket {
@@ -107,6 +113,8 @@ message PutRequest {
   int32 total_chunks = 4;
   // Total size in bytes of the data being put
   int64 total_size = 5;
+  // The owner of the put
+  bytes owner_id = 6;
 }
 
 message PutResponse {
@@ -128,6 +136,9 @@ message GetRequest {
   float timeout = 2;
   // Whether to schedule this as a callback on the server side.
   bool asynchronous = 3;
+  // The chunk_id to start retrieving data from, in case the request is interrupted
+  // after partial retrieval by a disconnect
+  int32 start_chunk_id = 5;
 
   // Deprecated fields.
   bytes id = 1 [deprecated = true];
@@ -141,6 +152,12 @@ message GetResponse {
   bytes data = 2;
   // An error blob (for example, an exception) on failure.
   bytes error = 3;
+  // Identifies which chunk the data belongs to
+  int32 chunk_id = 4;
+  // Total number of chunks
+  int32 total_chunks = 5;
+  // Total size in bytes of the data being retrieved
+  uint64 total_size = 6;
 }
 
 // Waits for data to be ready on the server, with a timeout.
@@ -171,6 +188,7 @@ message ClusterInfoType {
     RUNTIME_CONTEXT = 4;
     TIMELINE = 5;
     PING = 6;
+    DASHBOARD_URL = 7;
   }
 }
 
@@ -189,6 +207,7 @@ message ClusterInfoResponse {
     string namespace = 3;
     string runtime_env = 4;
     bool capture_client_tasks = 5;
+    string gcs_address = 6;
   }
 
   ClusterInfoType.TypeEnum type = 1;
@@ -223,6 +242,7 @@ message TerminateResponse {
 
 message KVExistsRequest {
   bytes key = 1;
+  optional bytes namespace = 2;
 }
 
 message KVExistsResponse {
@@ -231,16 +251,19 @@ message KVExistsResponse {
 
 message KVGetRequest {
   bytes key = 1;
+  optional bytes namespace = 2;
 }
 
 message KVGetResponse {
-  bytes value = 1;
+  // Not set when key does not exist.
+  optional bytes value = 1;
 }
 
 message KVPutRequest {
   bytes key = 1;
   bytes value = 2;
   bool overwrite = 3;
+  optional bytes namespace = 4;
 }
 
 message KVPutResponse {
@@ -249,18 +272,29 @@ message KVPutResponse {
 
 message KVDelRequest {
   bytes key = 1;
+  bool del_by_prefix = 2;
+  optional bytes namespace = 3;
 }
 
 message KVDelResponse {
+  int32 deleted_num = 1;
 }
 
 message KVListRequest {
   bytes prefix = 1;
+  optional bytes namespace = 2;
 }
 
 message KVListResponse {
   repeated bytes keys = 1;
 }
+
+message ClientPinRuntimeEnvURIRequest {
+  string uri = 1;
+  int32 expiration_s = 2;
+}
+
+message ClientPinRuntimeEnvURIResponse {}
 
 message InitRequest {
   // job_config of ray.init
@@ -293,8 +327,7 @@ service RayletDriver {
   }
   rpc PrepRuntimeEnv(PrepRuntimeEnvRequest) returns (PrepRuntimeEnvResponse) {
   }
-  rpc GetObject(GetRequest) returns (GetResponse) {
-  }
+  rpc GetObject(GetRequest) returns (stream GetResponse) {}
   rpc PutObject(PutRequest) returns (PutResponse) {
   }
   rpc WaitObject(WaitRequest) returns (WaitResponse) {
@@ -318,6 +351,8 @@ service RayletDriver {
   rpc ListNamedActors(ClientListNamedActorsRequest)
       returns (ClientListNamedActorsResponse) {
   }
+  rpc PinRuntimeEnvURI(ClientPinRuntimeEnvURIRequest)
+      returns (ClientPinRuntimeEnvURIResponse) {}
 }
 
 message ReleaseRequest {
@@ -344,6 +379,7 @@ message ConnectionInfoResponse {
   // The Python version (e.g., "3.7.2").
   string python_version = 4;
   // The protocol version of the server (e.g., "2020-02-01").
+  // DEPRECATED. Not used anywhere. Will remove.
   string protocol_version = 5;
 }
 
@@ -408,7 +444,7 @@ service RayletDataStreamer {
 // A request to change the quantity or type of the logs
 // currently being streamed. Initially, all logs are disabled.
 message LogSettingsRequest {
-  // Set to recieve logs.
+  // Set to receive logs.
   bool enabled = 1;
   // At what loglevel should logs be forwarded on the stream.
   int32 loglevel = 2;

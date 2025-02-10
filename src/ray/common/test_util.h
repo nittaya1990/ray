@@ -14,16 +14,15 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
 #include <functional>
 #include <future>
 #include <string>
 
 #include "gtest/gtest.h"
+#include "ray/common/asio/asio_util.h"
 #include "ray/common/id.h"
 #include "ray/util/util.h"
 #include "src/ray/protobuf/common.pb.h"
-
 namespace ray {
 
 static inline std::vector<rpc::ObjectReference> ObjectIdsToRefs(
@@ -63,7 +62,8 @@ bool WaitForCondition(std::function<bool()> condition, int timeout_ms);
 /// \param[in] expected_count The expected count.
 /// \param[in] timeout_ms Timeout in milliseconds to wait for for.
 /// \return Whether the expected count is met.
-void WaitForExpectedCount(std::atomic<int> &current_count, int expected_count,
+void WaitForExpectedCount(std::atomic<int> &current_count,
+                          int expected_count,
                           int timeout_ms = 60000);
 
 /// Used to kill process whose pid is stored in `socket_name.id` file.
@@ -111,22 +111,58 @@ extern std::string TEST_MOCK_WORKER_EXEC_PATH;
 /// 5. start/stop raylet monitor
 class TestSetupUtil {
  public:
-  static void StartUpRedisServers(const std::vector<int> &redis_server_ports);
+  static void StartUpRedisServers(const std::vector<int> &redis_server_ports,
+                                  bool save = false);
   static void ShutDownRedisServers();
   static void FlushAllRedisServers();
 
-  static std::string StartGcsServer(const std::string &redis_address);
+  static std::string StartGcsServer(int port);
   static void StopGcsServer(const std::string &gcs_server_socket_name);
-  static std::string StartRaylet(const std::string &node_ip_address, const int &port,
+  static std::string StartRaylet(const std::string &node_ip_address,
+                                 const int &port,
                                  const std::string &bootstrap_address,
                                  const std::string &resource,
                                  std::string *store_socket_name);
   static void StopRaylet(const std::string &raylet_socket_name);
-
- private:
-  static int StartUpRedisServer(const int &port);
-  static void ShutDownRedisServer(const int &port);
-  static void FlushRedisServer(const int &port);
+  static void ExecuteRedisCmd(int port, std::vector<std::string> cmd);
+  static int StartUpRedisServer(int port, bool save = false);
+  static void ShutDownRedisServer(int port);
+  static void FlushRedisServer(int port);
 };
+
+template <size_t k, typename T>
+struct SaveArgToUniquePtrAction {
+  std::unique_ptr<T> *pointer;
+
+  template <typename... Args>
+  void operator()(const Args &...args) const {
+    *pointer = std::make_unique<T>(std::get<k>(std::tie(args...)));
+  }
+};
+
+// Copies the k-th arg with make_unique(arg<k>) into ptr.
+template <size_t k, typename T>
+SaveArgToUniquePtrAction<k, T> SaveArgToUniquePtr(std::unique_ptr<T> *ptr) {
+  return {ptr};
+}
+
+template <typename Lambda>
+auto SyncPostAndWait(instrumented_io_context &io_context,
+                     const std::string &name,
+                     Lambda f) {
+  using ReturnType = std::invoke_result_t<Lambda>;
+  std::promise<ReturnType> promise;
+  io_context.post(
+      [&]() {
+        if constexpr (std::is_void_v<ReturnType>) {
+          f();
+          promise.set_value();
+        } else {
+          promise.set_value(f());
+        }
+      },
+      name);
+  return promise.get_future().get();
+}
 
 }  // namespace ray

@@ -13,6 +13,7 @@ import os
 import ray
 
 from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -67,10 +68,22 @@ def pg_launcher(pre_created_pgs, num_pgs_to_create):
         # TODO(sang): Comment in this line causes GCS actor management
         # failure. We need to fix it.
         if random() < 0.5:
-            tasks.append(mock_task.options(placement_group=pg).remote())
+            tasks.append(
+                mock_task.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg
+                    )
+                ).remote()
+            )
         else:
             if actor_cnt < max_actor_cnt:
-                actors.append(MockActor.options(placement_group=pg).remote())
+                actors.append(
+                    MockActor.options(
+                        scheduling_strategy=PlacementGroupSchedulingStrategy(
+                            placement_group=pg
+                        )
+                    ).remote()
+                )
                 actor_cnt += 1
 
     # Remove the rest of placement groups.
@@ -155,13 +168,25 @@ if __name__ == "__main__":
     result["avg_pg_create_time_ms"] = total_creating_time / total_trial * 1000
     result["avg_pg_remove_time_ms"] = total_removing_time / total_trial * 1000
     result["success"] = 1
+    result["perf_metrics"] = [
+        {
+            "perf_metric_name": "avg_pg_create_time_ms",
+            "perf_metric_value": result["avg_pg_create_time_ms"],
+            "perf_metric_type": "LATENCY",
+        },
+        {
+            "perf_metric_name": "avg_pg_remove_time_ms",
+            "perf_metric_value": result["avg_pg_remove_time_ms"],
+            "perf_metric_type": "LATENCY",
+        },
+    ]
     print(
         "Avg placement group creating time: "
         f"{total_creating_time / total_trial * 1000} ms"
     )
     print(
         "Avg placement group removing time: "
-        f"{total_removing_time / total_trial* 1000} ms"
+        f"{total_removing_time / total_trial * 1000} ms"
     )
     print("PASSED.")
 

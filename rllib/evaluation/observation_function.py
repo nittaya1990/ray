@@ -2,11 +2,13 @@ from typing import Dict
 
 from ray.rllib.env import BaseEnv
 from ray.rllib.policy import Policy
-from ray.rllib.evaluation import Episode, RolloutWorker
+from ray.rllib.evaluation import RolloutWorker
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.framework import TensorType
 from ray.rllib.utils.typing import AgentID, PolicyID
 
 
+@OldAPIStack
 class ObservationFunction:
     """Interceptor function for rewriting observations from the environment.
 
@@ -26,7 +28,7 @@ class ObservationFunction:
         worker: RolloutWorker,
         base_env: BaseEnv,
         policies: Dict[PolicyID, Policy],
-        episode: Episode,
+        episode,
         **kw
     ) -> Dict[AgentID, TensorType]:
         """Callback run on each environment step to observe the environment.
@@ -41,33 +43,44 @@ class ObservationFunction:
         TODO(ekl): enable batch processing.
 
         Args:
-            agent_obs (dict): Dictionary of default observations from the
+            agent_obs: Dictionary of default observations from the
                 environment. The default implementation of observe() simply
                 returns this dict.
-            worker (RolloutWorker): Reference to the current rollout worker.
-            base_env (BaseEnv): BaseEnv running the episode. The underlying
+            worker: Reference to the current rollout worker.
+            base_env: BaseEnv running the episode. The underlying
                 sub environment objects (BaseEnvs are vectorized) can be
                 retrieved by calling `base_env.get_sub_environments()`.
-            policies (dict): Mapping of policy id to policy objects. In single
+            policies: Mapping of policy id to policy objects. In single
                 agent mode there will only be a single "default" policy.
-            episode (Episode): Episode state object.
+            episode: Episode state object.
             kwargs: Forward compatibility placeholder.
 
         Returns:
-            new_agent_obs (dict): copy of agent obs with updates. You can
+            new_agent_obs: copy of agent obs with updates. You can
                 rewrite or drop data from the dict if needed (e.g., the env
                 can have a dummy "global" observation, and the observer can
                 merge the global state into individual observations.
 
-        Examples:
-            >>> # Observer that merges global state into individual obs. It is
-            ... # rewriting the discrete obs into a tuple with global state.
-            >>> example_obs_fn1({"a": 1, "b": 2, "global_state": 101}, ...)
+        .. testcode::
+            :skipif: True
+
+            # Observer that merges global state into individual obs. It is
+            # rewriting the discrete obs into a tuple with global state.
+            example_obs_fn1({"a": 1, "b": 2, "global_state": 101}, ...)
+
+        .. testoutput::
+
             {"a": [1, 101], "b": [2, 101]}
 
-            >>> # Observer for e.g., custom centralized critic model. It is
-            ... # rewriting the discrete obs into a dict with more data.
-            >>> example_obs_fn2({"a": 1, "b": 2}, ...)
+        .. testcode::
+            :skipif: True
+
+            # Observer for e.g., custom centralized critic model. It is
+            # rewriting the discrete obs into a dict with more data.
+            example_obs_fn2({"a": 1, "b": 2}, ...)
+
+        .. testoutput::
+
             {"a": {"self": 1, "other": 2}, "b": {"self": 2, "other": 1}}
         """
 

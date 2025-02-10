@@ -1,28 +1,29 @@
-.. _data_user_guide :
+.. _data_user_guide:
 
 ===========
 User Guides
 ===========
 
-If you’re new to Ray Datasets, we recommend starting with the :ref:`Ray Datasets Quick Start <ray_datasets_quick_start>`.
-This user guide will help you navigate the Ray Datasets project and show you how achieve several tasks, for instance
-you will learn
-
-- how to load data and preprocess it for machine learning applications,
-- how to use Tensors with Ray Datasets,
-- how to run Dataset Pipelines in common scenarios,
-- how to run Dask, Spark, Mars or Modin on Ray,
-- and how to tune your Ray Datasets applications for performance.
+If you’re new to Ray Data, start with the
+:ref:`Ray Data Quickstart <data_quickstart>`.
+This user guide helps you navigate the Ray Data project and
+show you how achieve several tasks.
 
 .. toctree::
     :maxdepth: 2
 
-    dataset-ml-preprocessing
-    dataset-tensor-support
-    advanced-pipelines
-    dask-on-ray
-    raydp
-    mars-on-ray
-    modin/index
-    custom-data
+    loading-data
+    inspecting-data
+    transforming-data
+    iterating-over-data
+    shuffling-data
+    saving-data
+    working-with-images
+    working-with-text
+    working-with-tensors
+    working-with-pytorch
+    monitoring-your-workload
+    execution-configurations
+    batch_inference
     performance-tips
+    custom-datasource-example

@@ -3,24 +3,32 @@ import json
 import platform
 import random
 import sys
-import shutil
-import zlib
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import numpy as np
 import pytest
+
 import ray
+from ray._private.external_storage import (
+    create_url_with_offset,
+    parse_url_with_offset,
+    _get_unique_spill_filename,
+    FileSystemStorage,
+    ExternalStorageSmartOpenImpl,
+)
+from ray._private.internal_api import memory_summary
+from ray._private.test_utils import wait_for_condition
+from ray._raylet import GcsClientOptions
 from ray.tests.conftest import (
-    file_system_object_spilling_config,
     buffer_object_spilling_config,
+    file_system_object_spilling_config,
     mock_distributed_fs_object_spilling_config,
 )
-from ray.external_storage import create_url_with_offset, parse_url_with_offset
-from ray._private.gcs_utils import use_gcs_for_bootstrap
-from ray._private.test_utils import wait_for_condition
-from ray.cluster_utils import Cluster, cluster_not_supported
-from ray.internal.internal_api import memory_summary
-from ray._raylet import GcsClientOptions
+
+# Note: Disk write speed can be as low as 6 MiB/s in AWS Mac instances, so we have to
+# increase the timeout.
+pytestmark = [pytest.mark.timeout(900 if platform.system() == "Darwin" else 180)]
 
 
 def run_basic_workload():
@@ -31,11 +39,20 @@ def run_basic_workload():
     ray.get(ray.put(arr))
 
 
-def is_dir_empty(temp_folder, append_path=ray.ray_constants.DEFAULT_OBJECT_PREFIX):
+def is_dir_empty(temp_folder, node_id, append_path=True):
+    """Test if directory temp_folder/f"{DEFAULT_OBJECT_PREFIX}_{node_id}" is empty.
+    For file based spilling, this is where the objects are spilled.
+    For other use cases, specify append_path as False so that temp_folder itself
+    is tested for emptiness.
+    """
     # append_path is used because the file based spilling will append
     # new directory path.
     num_files = 0
-    temp_folder = temp_folder / append_path
+    if append_path:
+        temp_folder = (
+            temp_folder
+            / f"{ray._private.ray_constants.DEFAULT_OBJECT_PREFIX}_{node_id}"
+        )
     if not temp_folder.exists():
         return True
     for path in temp_folder.iterdir():
@@ -44,13 +61,10 @@ def is_dir_empty(temp_folder, append_path=ray.ray_constants.DEFAULT_OBJECT_PREFI
 
 
 def assert_no_thrashing(address):
-    state = ray.state.GlobalState()
-    if use_gcs_for_bootstrap():
-        options = GcsClientOptions.from_gcs_address(address)
-    else:
-        options = GcsClientOptions.from_redis_address(
-            address, ray.ray_constants.REDIS_DEFAULT_PASSWORD
-        )
+    state = ray._private.state.GlobalState()
+    options = GcsClientOptions.create(
+        address, None, allow_cluster_id_nil=True, fetch_cluster_id_if_nil=False
+    )
     state._initialize_global_state(options)
     summary = memory_summary(address=address, stats_only=True)
     restored_bytes = 0
@@ -64,6 +78,30 @@ def assert_no_thrashing(address):
     assert (
         consumed_bytes >= restored_bytes
     ), f"consumed: {consumed_bytes}, restored: {restored_bytes}"
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="Doesn't support Windows.")
+def test_spill_file_uniqueness(shutdown_only):
+    ray_context = ray.init(num_cpus=0, object_store_memory=75 * 1024 * 1024)
+    arr = np.random.rand(128 * 1024)  # 1 MB
+    refs = []
+    refs.append([ray.put(arr)])
+
+    # for the same object_ref, generating spill urls 10 times yields
+    # 10 different urls
+    spill_url_set = {_get_unique_spill_filename(refs) for _ in range(10)}
+    assert len(spill_url_set) == 10
+
+    for StorageType in [FileSystemStorage, ExternalStorageSmartOpenImpl]:
+        with patch.object(
+            StorageType, "_get_objects_from_store"
+        ) as mock_get_objects_from_store:
+            mock_get_objects_from_store.return_value = [(b"somedata", b"metadata")]
+            storage = StorageType(ray_context["node_id"], "/tmp")
+            spilled_url_set = {
+                storage.spill_objects(refs, [b"localhost"])[0] for _ in range(10)
+            }
+            assert len(spilled_url_set) == 10
 
 
 def test_invalid_config_raises_exception(shutdown_only):
@@ -112,9 +150,14 @@ def test_url_generation_and_parse():
 def test_default_config(shutdown_only):
     ray.init(num_cpus=0, object_store_memory=75 * 1024 * 1024)
     # Make sure the object spilling configuration is properly set.
-    config = json.loads(ray.worker._global_node._config["object_spilling_config"])
+    config = json.loads(
+        ray._private.worker._global_node._config["object_spilling_config"]
+    )
     assert config["type"] == "filesystem"
-    assert config["params"]["directory_path"] == ray.worker._global_node._session_dir
+    assert (
+        config["params"]["directory_path"]
+        == ray._private.worker._global_node._session_dir
+    )
     # Make sure the basic workload can succeed.
     run_basic_workload()
     ray.shutdown()
@@ -128,7 +171,7 @@ def test_default_config(shutdown_only):
             "object_store_full_delay_ms": 100,
         },
     )
-    assert "object_spilling_config" not in ray.worker._global_node._config
+    assert "object_spilling_config" not in ray._private.worker._global_node._config
     run_basic_workload()
     ray.shutdown()
 
@@ -141,7 +184,9 @@ def test_default_config(shutdown_only):
             )
         },
     )
-    config = json.loads(ray.worker._global_node._config["object_spilling_config"])
+    config = json.loads(
+        ray._private.worker._global_node._config["object_spilling_config"]
+    )
     assert config["type"] == "mock_distributed_fs"
 
 
@@ -152,7 +197,9 @@ def test_default_config_buffering(shutdown_only):
             "object_spilling_config": (json.dumps(buffer_object_spilling_config))
         },
     )
-    config = json.loads(ray.worker._global_node._config["object_spilling_config"])
+    config = json.loads(
+        ray._private.worker._global_node._config["object_spilling_config"]
+    )
     assert config["type"] == buffer_object_spilling_config["type"]
     assert (
         config["params"]["buffer_size"]
@@ -182,11 +229,30 @@ def test_default_config_cluster(ray_start_cluster_enabled):
     ray.get([task.remote() for _ in range(2)])
 
 
+def test_node_id_in_spill_dir_name():
+    node_id = ray.NodeID.from_random().hex()
+    session_dir = "test_session_dir"
+    storage = ray._private.external_storage.setup_external_storage(
+        file_system_object_spilling_config, node_id, session_dir
+    )
+
+    import os
+
+    dir_prefix = ray._private.ray_constants.DEFAULT_OBJECT_PREFIX
+    expected_dir_name = f"{dir_prefix}_{node_id}"
+    for path in storage._directory_paths:
+        dir_name = os.path.basename(path)
+        assert dir_name == expected_dir_name
+
+    # Clean up
+    storage.destroy_external_storage()
+
+
 @pytest.mark.skipif(platform.system() == "Windows", reason="Hangs on Windows.")
 def test_spilling_not_done_for_pinned_object(object_spilling_config, shutdown_only):
     # Limit our object store to 75 MiB of memory.
     object_spilling_config, temp_folder = object_spilling_config
-    address = ray.init(
+    ray_context = ray.init(
         object_store_memory=75 * 1024 * 1024,
         _system_config={
             "max_io_workers": 4,
@@ -200,8 +266,8 @@ def test_spilling_not_done_for_pinned_object(object_spilling_config, shutdown_on
     ref = ray.get(ray.put(arr))  # noqa
     ref2 = ray.put(arr)  # noqa
 
-    wait_for_condition(lambda: is_dir_empty(temp_folder))
-    assert_no_thrashing(address["address"])
+    wait_for_condition(lambda: is_dir_empty(temp_folder, ray_context["node_id"]))
+    assert_no_thrashing(ray_context["address"])
 
 
 def test_spill_remote_object(
@@ -251,9 +317,10 @@ def test_spill_remote_object(
     assert_no_thrashing(cluster.address)
 
 
-def test_spill_objects_automatically(object_spilling_config, shutdown_only):
+@pytest.mark.skipif(platform.system() == "Windows", reason="Hangs on Windows.")
+def test_spill_objects_automatically(fs_only_object_spilling_config, shutdown_only):
     # Limit our object store to 75 MiB of memory.
-    object_spilling_config, _ = object_spilling_config
+    object_spilling_config, _ = fs_only_object_spilling_config
     address = ray.init(
         num_cpus=1,
         object_store_memory=75 * 1024 * 1024,
@@ -284,7 +351,7 @@ def test_spill_objects_automatically(object_spilling_config, shutdown_only):
         index = random.choice(list(range(buffer_length)))
         ref = replay_buffer[index]
         solution = solution_buffer[index]
-        sample = ray.get(ref, timeout=0)
+        sample = ray.get(ref, timeout=None)
         assert np.array_equal(sample, solution)
     assert_no_thrashing(address["address"])
 
@@ -324,7 +391,7 @@ def test_unstable_spill_objects_automatically(unstable_spilling_config, shutdown
         index = random.choice(list(range(buffer_length)))
         ref = replay_buffer[index]
         solution = solution_buffer[index]
-        sample = ray.get(ref, timeout=0)
+        sample = ray.get(ref, timeout=None)
         assert np.array_equal(sample, solution)
     assert_no_thrashing(address["address"])
 
@@ -362,7 +429,7 @@ def test_slow_spill_objects_automatically(slow_spilling_config, shutdown_only):
         index = random.choice(list(range(buffer_length)))
         ref = replay_buffer[index]
         solution = solution_buffer[index]
-        sample = ray.get(ref, timeout=0)
+        sample = ray.get(ref, timeout=None)
         assert np.array_equal(sample, solution)
     assert_no_thrashing(address["address"])
 
@@ -476,195 +543,71 @@ async def test_spill_during_get(object_spilling_config, shutdown_only, is_async)
     assert_no_thrashing(address["address"])
 
 
-def test_spill_deadlock(object_spilling_config, shutdown_only):
-    object_spilling_config, _ = object_spilling_config
-    # Limit our object store to 75 MiB of memory.
-    address = ray.init(
-        object_store_memory=75 * 1024 * 1024,
-        _system_config={
-            "max_io_workers": 1,
-            "automatic_object_spilling_enabled": True,
-            "object_store_full_delay_ms": 100,
-            "object_spilling_config": object_spilling_config,
-            "min_spilling_size": 0,
-        },
-    )
-    arr = np.random.rand(1024 * 1024)  # 8 MB data
-    replay_buffer = []
-
-    # Create objects of more than 400 MiB.
-    for _ in range(50):
-        ref = None
-        while ref is None:
-            ref = ray.put(arr)
-            replay_buffer.append(ref)
-        # This is doing random sampling with 50% prob.
-        if random.randint(0, 9) < 5:
-            for _ in range(5):
-                ref = random.choice(replay_buffer)
-                sample = ray.get(ref, timeout=0)
-                assert np.array_equal(sample, arr)
-    assert_no_thrashing(address["address"])
-
-
-def test_partial_retval_allocation(ray_start_cluster_enabled):
-    cluster = ray_start_cluster_enabled
-    cluster.add_node(object_store_memory=100 * 1024 * 1024)
-    ray.init(cluster.address)
-
-    @ray.remote(num_returns=4)
-    def f():
-        return [np.zeros(50 * 1024 * 1024, dtype=np.uint8) for _ in range(4)]
-
-    ret = f.remote()
-    for obj in ret:
-        obj = ray.get(obj)
-        print(obj.size)
-
-
-def test_pull_spilled_object(
-    ray_start_cluster_enabled, multi_node_object_spilling_config, shutdown_only
-):
-    cluster = ray_start_cluster_enabled
-    object_spilling_config, _ = multi_node_object_spilling_config
-
-    # Head node.
-    cluster.add_node(
-        num_cpus=1,
-        resources={"custom": 0},
-        object_store_memory=75 * 1024 * 1024,
-        _system_config={
-            "max_io_workers": 2,
-            "min_spilling_size": 1 * 1024 * 1024,
-            "automatic_object_spilling_enabled": True,
-            "object_store_full_delay_ms": 100,
-            "object_spilling_config": object_spilling_config,
-        },
-    )
-    ray.init(cluster.address)
-
-    # add 1 worker node
-    cluster.add_node(
-        num_cpus=1, resources={"custom": 1}, object_store_memory=75 * 1024 * 1024
-    )
-    cluster.wait_for_nodes()
-
-    @ray.remote(num_cpus=1, resources={"custom": 1})
-    def create_objects():
-        results = []
-        for size in range(5):
-            arr = np.random.rand(size * 1024 * 1024)
-            hash_value = zlib.crc32(arr.tobytes())
-            results.append([ray.put(arr), hash_value])
-        # ensure the objects are spilled
-        arr = np.random.rand(5 * 1024 * 1024)
-        ray.get(ray.put(arr))
-        ray.get(ray.put(arr))
-        return results
-
-    @ray.remote(num_cpus=1, resources={"custom": 0})
-    def get_object(arr):
-        return zlib.crc32(arr.tobytes())
-
-    results = ray.get(create_objects.remote())
-    for value_ref, hash_value in results:
-        hash_value1 = ray.get(get_object.remote(value_ref))
-        assert hash_value == hash_value1
-
-
-# TODO(chenshen): fix error handling when spilled file
-# missing/corrupted
-@pytest.mark.skipif(True, reason="Currently hangs.")
-def test_pull_spilled_object_failure(object_spilling_config, ray_start_cluster):
-    object_spilling_config, temp_folder = object_spilling_config
-    cluster = ray_start_cluster
-
-    # Head node.
-    cluster.add_node(
-        num_cpus=1,
-        resources={"custom": 0},
-        object_store_memory=75 * 1024 * 1024,
-        _system_config={
-            "max_io_workers": 2,
-            "min_spilling_size": 1 * 1024 * 1024,
-            "automatic_object_spilling_enabled": True,
-            "object_store_full_delay_ms": 100,
-            "object_spilling_config": object_spilling_config,
-        },
-    )
-    ray.init(cluster.address)
-
-    # add 1 worker node
-    cluster.add_node(
-        num_cpus=1, resources={"custom": 1}, object_store_memory=75 * 1024 * 1024
-    )
-    cluster.wait_for_nodes()
-
-    @ray.remote(num_cpus=1, resources={"custom": 1})
-    def create_objects():
-        arr = np.random.rand(5 * 1024 * 1024)
-        hash_value = zlib.crc32(arr.tobytes())
-        results = [ray.put(arr), hash_value]
-        # ensure the objects are spilled
-        arr = np.random.rand(5 * 1024 * 1024)
-        ray.get(ray.put(arr))
-        ray.get(ray.put(arr))
-        return results
-
-    @ray.remote(num_cpus=1, resources={"custom": 0})
-    def get_object(arr):
-        return zlib.crc32(arr.tobytes())
-
-    [ref, hash_value] = ray.get(create_objects.remote())
-
-    # remove spilled file
-    shutil.rmtree(temp_folder)
-
-    hash_value1 = ray.get(get_object.remote(ref))
-    assert hash_value == hash_value1
-
-
-@pytest.mark.xfail(cluster_not_supported, reason="cluster not supported")
-def test_spill_dir_cleanup_on_raylet_start(object_spilling_config):
-    object_spilling_config, temp_folder = object_spilling_config
-    cluster = Cluster()
-    cluster.add_node(
-        num_cpus=0,
-        object_store_memory=75 * 1024 * 1024,
-        _system_config={"object_spilling_config": object_spilling_config},
-    )
-    ray.init(address=cluster.address)
-    node2 = cluster.add_node(num_cpus=1, object_store_memory=75 * 1024 * 1024)
-
-    # This task will run on node 2 because node 1 has no CPU resource
-    @ray.remote(num_cpus=1)
+@pytest.mark.parametrize(
+    "ray_start_regular",
+    [
+        {
+            "object_store_memory": 75 * 1024 * 1024,
+            "_system_config": {"max_io_workers": 1},
+        }
+    ],
+    indirect=True,
+)
+def test_spill_worker_failure(ray_start_regular):
     def run_workload():
+        @ray.remote
+        def f():
+            return np.zeros(50 * 1024 * 1024, dtype=np.uint8)
+
         ids = []
-        for _ in range(2):
-            arr = np.random.rand(5 * 1024 * 1024)  # 40 MB
-            ids.append(ray.put(arr))
-        return ids
+        for _ in range(5):
+            x = f.remote()
+            ids.append(x)
+        for id in ids:
+            ray.get(id)
+        del ids
 
-    ids = ray.get(run_workload.remote())
-    assert not is_dir_empty(temp_folder)
+    run_workload()
 
-    # Kill node 2
-    cluster.remove_node(node2)
+    def get_spill_worker():
+        import psutil
 
-    # Verify that the spill folder is not empty
-    assert not is_dir_empty(temp_folder)
+        for proc in psutil.process_iter():
+            try:
+                name = ray._private.ray_constants.WORKER_PROCESS_TYPE_SPILL_WORKER_IDLE
+                if name in proc.name():
+                    return proc
+                # for macOS
+                if proc.cmdline() and name in proc.cmdline()[0]:
+                    return proc
+                # for Windows
+                if proc.cmdline() and "--worker-type=SPILL_WORKER" in proc.cmdline():
+                    return proc
+            except psutil.AccessDenied:
+                pass
+            except psutil.NoSuchProcess:
+                pass
 
-    # Start a new node
-    cluster.add_node(num_cpus=1, object_store_memory=75 * 1024 * 1024)
+    # Spilling occurred. Get the PID of the spill worker.
+    spill_worker_proc = get_spill_worker()
+    assert spill_worker_proc
 
-    # Verify that the spill folder is now cleaned up
-    assert is_dir_empty(temp_folder)
+    # Kill the spill worker
+    spill_worker_proc.kill()
+    spill_worker_proc.wait()
 
-    # We hold the object refs to prevent them from being deleted
-    del ids
-    ray.shutdown()
-    cluster.shutdown()
+    # Now we trigger spilling again
+    run_workload()
+
+    # A new spill worker should be created
+    spill_worker_proc = get_spill_worker()
+    assert spill_worker_proc
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-sv", __file__]))
+    import os
+
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

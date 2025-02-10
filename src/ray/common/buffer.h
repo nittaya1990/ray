@@ -21,6 +21,7 @@
 
 #include "ray/common/status.h"
 #include "ray/thirdparty/aligned_alloc.h"
+#include "ray/util/logging.h"
 
 #define BUFFER_ALIGNMENT 64
 
@@ -143,7 +144,8 @@ class SharedMemoryBuffer : public Buffer {
   }
 
   static std::shared_ptr<SharedMemoryBuffer> Slice(const std::shared_ptr<Buffer> &buffer,
-                                                   int64_t offset, int64_t size) {
+                                                   int64_t offset,
+                                                   int64_t size) {
     return std::make_shared<SharedMemoryBuffer>(buffer, offset, size);
   }
 

@@ -1,484 +1,470 @@
+import io
 import logging
+from dataclasses import dataclass
 from typing import (
-    Callable,
-    Optional,
-    List,
-    Tuple,
-    Union,
-    Any,
-    Dict,
-    Iterator,
-    Iterable,
     TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Union,
 )
-import urllib.parse
+
+import numpy as np
+
+import ray
+from ray.data._internal.util import (
+    RetryingContextManager,
+    RetryingPyFileSystem,
+    _check_pyarrow_version,
+    _is_local_scheme,
+    iterate_with_retry,
+    make_async_gen,
+)
+from ray.data.block import Block, BlockAccessor
+from ray.data.context import DataContext
+from ray.data.datasource.datasource import Datasource, ReadTask
+from ray.data.datasource.file_meta_provider import (
+    BaseFileMetadataProvider,
+    DefaultFileMetadataProvider,
+)
+from ray.data.datasource.partitioning import (
+    Partitioning,
+    PathPartitionFilter,
+    PathPartitionParser,
+)
+from ray.data.datasource.path_util import (
+    _has_file_extension,
+    _resolve_paths_and_filesystem,
+)
+from ray.util.annotations import DeveloperAPI
 
 if TYPE_CHECKING:
+    import pandas as pd
     import pyarrow
 
-from ray.types import ObjectRef
-from ray.data.block import Block, BlockAccessor
-from ray.data.context import DatasetContext
-from ray.data.impl.arrow_block import ArrowRow
-from ray.data.impl.block_list import BlockMetadata
-from ray.data.impl.output_buffer import BlockOutputBuffer
-from ray.data.datasource.datasource import Datasource, ReadTask, WriteResult
-from ray.util.annotations import DeveloperAPI
-from ray.data.impl.util import _check_pyarrow_version
-from ray.data.impl.remote_fn import cached_remote_fn
 
 logger = logging.getLogger(__name__)
 
 
-@DeveloperAPI
-class BlockWritePathProvider:
-    """Abstract callable that provides concrete output paths when writing
-    dataset blocks.
+# We should parallelize file size fetch operations beyond this threshold.
+FILE_SIZE_FETCH_PARALLELIZATION_THRESHOLD = 16
 
-    Current subclasses:
-        DefaultBlockWritePathProvider
-    """
-
-    def _get_write_path_for_block(
-        self,
-        base_path: str,
-        *,
-        filesystem: Optional["pyarrow.fs.FileSystem"] = None,
-        dataset_uuid: Optional[str] = None,
-        block: Optional[ObjectRef[Block]] = None,
-        block_index: Optional[int] = None,
-        file_format: Optional[str] = None,
-    ) -> str:
-        """
-        Resolves and returns the write path for the given dataset block. When
-        implementing this method, care should be taken to ensure that a unique
-        path is provided for every dataset block.
-
-        Args:
-            base_path: The base path to write the dataset block out to. This is
-                expected to be the same for all blocks in the dataset, and may
-                point to either a directory or file prefix.
-            filesystem: The filesystem implementation that will be used to
-                write a file out to the write path returned.
-            dataset_uuid: Unique identifier for the dataset that this block
-                belongs to.
-            block: Object reference to the block to write.
-            block_index: Ordered index of the block to write within its parent
-                dataset.
-            file_format: File format string for the block that can be used as
-                the file extension in the write path returned.
-        """
-        raise NotImplementedError
-
-    def __call__(
-        self,
-        base_path: str,
-        *,
-        filesystem: Optional["pyarrow.fs.FileSystem"] = None,
-        dataset_uuid: Optional[str] = None,
-        block: Optional[ObjectRef[Block]] = None,
-        block_index: Optional[int] = None,
-        file_format: Optional[str] = None,
-    ) -> str:
-        return self._get_write_path_for_block(
-            base_path,
-            filesystem=filesystem,
-            dataset_uuid=dataset_uuid,
-            block=block,
-            block_index=block_index,
-            file_format=file_format,
-        )
-
-
-class DefaultBlockWritePathProvider(BlockWritePathProvider):
-    """Default block write path provider implementation that writes each
-    dataset block out to a file of the form:
-    {base_path}/{dataset_uuid}_{block_index}.{file_format}
-    """
-
-    def _get_write_path_for_block(
-        self,
-        base_path: str,
-        *,
-        filesystem: Optional["pyarrow.fs.FileSystem"] = None,
-        dataset_uuid: Optional[str] = None,
-        block: Optional[ObjectRef[Block]] = None,
-        block_index: Optional[int] = None,
-        file_format: Optional[str] = None,
-    ) -> str:
-        suffix = f"{dataset_uuid}_{block_index:06}.{file_format}"
-        # Use forward slashes for cross-filesystem compatibility, since PyArrow
-        # FileSystem paths are always forward slash separated, see:
-        # https://arrow.apache.org/docs/python/filesystems.html
-        return f"{base_path}/{suffix}"
+# 16 file size fetches from S3 takes ~1.5 seconds with Arrow's S3FileSystem.
+PATHS_PER_FILE_SIZE_FETCH_TASK = 16
 
 
 @DeveloperAPI
-class FileBasedDatasource(Datasource[Union[ArrowRow, Any]]):
-    """File-based datasource, for reading and writing files.
+@dataclass
+class FileShuffleConfig:
+    """Configuration for file shuffling.
 
-    This class should not be used directly, and should instead be subclassed
-    and tailored to particular file formats. Classes deriving from this class
-    must implement _read_file().
+    This configuration object controls how files are shuffled while reading file-based
+    datasets.
 
-    Current subclasses:
-        JSONDatasource, CSVDatasource, NumpyDatasource, BinaryDatasource
+    .. note::
+        Even if you provided a seed, you might still observe a non-deterministic row
+        order. This is because tasks are executed in parallel and their completion
+        order might vary. If you need to preserve the order of rows, set
+        `DataContext.get_current().execution_options.preserve_order`.
+
+    Args:
+        seed: An optional integer seed for the file shuffler. If provided, Ray Data
+            shuffles files deterministically based on this seed.
+
+    Example:
+        >>> import ray
+        >>> from ray.data import FileShuffleConfig
+        >>> shuffle = FileShuffleConfig(seed=42)
+        >>> ds = ray.data.read_images("s3://anonymous@ray-example-data/batoidea", shuffle=shuffle)
+    """  # noqa: E501
+
+    seed: Optional[int] = None
+
+    def __post_init__(self):
+        """Ensure that the seed is either None or an integer."""
+        if self.seed is not None and not isinstance(self.seed, int):
+            raise ValueError("Seed must be an integer or None.")
+
+
+@DeveloperAPI
+class FileBasedDatasource(Datasource):
+    """File-based datasource for reading files.
+
+    Don't use this class directly. Instead, subclass it and implement `_read_stream()`.
     """
 
-    def prepare_read(
+    # If `_WRITE_FILE_PER_ROW` is `True`, this datasource calls `_write_row` and writes
+    # each row to a file. Otherwise, this datasource calls `_write_block` and writes
+    # each block to a file.
+    _WRITE_FILE_PER_ROW = False
+    _FILE_EXTENSIONS: Optional[Union[str, List[str]]] = None
+    # Number of threads for concurrent reading within each read task.
+    # If zero or negative, reading will be performed in the main thread.
+    _NUM_THREADS_PER_TASK = 0
+
+    def __init__(
         self,
-        parallelism: int,
         paths: Union[str, List[str]],
+        *,
         filesystem: Optional["pyarrow.fs.FileSystem"] = None,
         schema: Optional[Union[type, "pyarrow.lib.Schema"]] = None,
         open_stream_args: Optional[Dict[str, Any]] = None,
-        # TODO(ekl) deprecate this once read fusion is available.
-        _block_udf: Optional[Callable[[Block], Block]] = None,
-        **reader_args,
-    ) -> List[ReadTask]:
-        """Creates and returns read tasks for a file-based datasource."""
+        meta_provider: BaseFileMetadataProvider = DefaultFileMetadataProvider(),
+        partition_filter: PathPartitionFilter = None,
+        partitioning: Partitioning = None,
+        ignore_missing_paths: bool = False,
+        shuffle: Optional[Union[Literal["files"], FileShuffleConfig]] = None,
+        include_paths: bool = False,
+        file_extensions: Optional[List[str]] = None,
+    ):
         _check_pyarrow_version()
+
+        self._supports_distributed_reads = not _is_local_scheme(paths)
+        if not self._supports_distributed_reads and ray.util.client.ray.is_connected():
+            raise ValueError(
+                "Because you're using Ray Client, read tasks scheduled on the Ray "
+                "cluster can't access your local files. To fix this issue, store "
+                "files in cloud storage or a distributed filesystem like NFS."
+            )
+
+        self._schema = schema
+        self._data_context = DataContext.get_current()
+        self._open_stream_args = open_stream_args
+        self._meta_provider = meta_provider
+        self._partition_filter = partition_filter
+        self._partitioning = partitioning
+        self._ignore_missing_paths = ignore_missing_paths
+        self._include_paths = include_paths
+        paths, self._filesystem = _resolve_paths_and_filesystem(paths, filesystem)
+        self._filesystem = RetryingPyFileSystem.wrap(
+            self._filesystem, context=self._data_context
+        )
+        paths, file_sizes = map(
+            list,
+            zip(
+                *meta_provider.expand_paths(
+                    paths,
+                    self._filesystem,
+                    partitioning,
+                    ignore_missing_paths=ignore_missing_paths,
+                )
+            ),
+        )
+
+        if ignore_missing_paths and len(paths) == 0:
+            raise ValueError(
+                "None of the provided paths exist. "
+                "The 'ignore_missing_paths' field is set to True."
+            )
+
+        if self._partition_filter is not None:
+            # Use partition filter to skip files which are not needed.
+            path_to_size = dict(zip(paths, file_sizes))
+            paths = self._partition_filter(paths)
+            file_sizes = [path_to_size[p] for p in paths]
+            if len(paths) == 0:
+                raise ValueError(
+                    "No input files found to read. Please double check that "
+                    "'partition_filter' field is set properly."
+                )
+
+        if file_extensions is not None:
+            path_to_size = dict(zip(paths, file_sizes))
+            paths = [p for p in paths if _has_file_extension(p, file_extensions)]
+            file_sizes = [path_to_size[p] for p in paths]
+            if len(paths) == 0:
+                raise ValueError(
+                    "No input files found to read with the following file extensions: "
+                    f"{file_extensions}. Please double check that "
+                    "'file_extensions' field is set properly."
+                )
+
+        _validate_shuffle_arg(shuffle)
+        self._file_metadata_shuffler = None
+        if shuffle == "files":
+            self._file_metadata_shuffler = np.random.default_rng()
+        elif isinstance(shuffle, FileShuffleConfig):
+            # Create a NumPy random generator with a fixed seed if provided
+            self._file_metadata_shuffler = np.random.default_rng(shuffle.seed)
+
+        # Read tasks serialize `FileBasedDatasource` instances, and the list of paths
+        # can be large. To avoid slow serialization speeds, we store a reference to
+        # the paths rather than the paths themselves.
+        self._paths_ref = ray.put(paths)
+        self._file_sizes_ref = ray.put(file_sizes)
+
+    def _paths(self) -> List[str]:
+        return ray.get(self._paths_ref)
+
+    def _file_sizes(self) -> List[float]:
+        return ray.get(self._file_sizes_ref)
+
+    def estimate_inmemory_data_size(self) -> Optional[int]:
+        total_size = 0
+        for sz in self._file_sizes():
+            if sz is not None:
+                total_size += sz
+        return total_size
+
+    def get_read_tasks(self, parallelism: int) -> List[ReadTask]:
         import numpy as np
 
-        paths, filesystem = _resolve_paths_and_filesystem(paths, filesystem)
-        paths, file_infos = _expand_paths(paths, filesystem)
-        file_sizes = [file_info.size for file_info in file_infos]
+        open_stream_args = self._open_stream_args
+        partitioning = self._partitioning
 
-        read_stream = self._read_stream
+        paths = self._paths()
+        file_sizes = self._file_sizes()
 
-        filesystem = _wrap_s3_serialization_workaround(filesystem)
+        if self._file_metadata_shuffler is not None:
+            files_metadata = list(zip(paths, file_sizes))
+            shuffled_files_metadata = [
+                files_metadata[i]
+                for i in self._file_metadata_shuffler.permutation(len(files_metadata))
+            ]
+            paths, file_sizes = list(map(list, zip(*shuffled_files_metadata)))
+
+        filesystem = _wrap_s3_serialization_workaround(self._filesystem)
 
         if open_stream_args is None:
             open_stream_args = {}
 
         def read_files(
-            read_paths: List[str],
-            fs: Union["pyarrow.fs.FileSystem", _S3FileSystemWrapper],
+            read_paths: Iterable[str],
         ) -> Iterable[Block]:
-            logger.debug(f"Reading {len(read_paths)} files.")
-            if isinstance(fs, _S3FileSystemWrapper):
-                fs = fs.unwrap()
-            ctx = DatasetContext.get_current()
-            output_buffer = BlockOutputBuffer(
-                block_udf=_block_udf, target_max_block_size=ctx.target_max_block_size
-            )
+            nonlocal filesystem, open_stream_args, partitioning
+
+            fs = _unwrap_s3_serialization_workaround(filesystem)
+
             for read_path in read_paths:
-                with fs.open_input_stream(read_path, **open_stream_args) as f:
-                    for data in read_stream(f, read_path, **reader_args):
-                        output_buffer.add_block(data)
-                        if output_buffer.has_next():
-                            yield output_buffer.next()
-            output_buffer.finalize()
-            if output_buffer.has_next():
-                yield output_buffer.next()
+                partitions: Dict[str, str] = {}
+                if partitioning is not None:
+                    parse = PathPartitionParser(partitioning)
+                    partitions = parse(read_path)
+
+                with RetryingContextManager(
+                    self._open_input_source(fs, read_path, **open_stream_args),
+                    context=self._data_context,
+                ) as f:
+                    for block in iterate_with_retry(
+                        lambda: self._read_stream(f, read_path),
+                        description="read stream iteratively",
+                        match=self._data_context.retried_io_errors,
+                    ):
+                        if partitions:
+                            block = _add_partitions(block, partitions)
+                        if self._include_paths:
+                            block_accessor = BlockAccessor.for_block(block)
+                            block = block_accessor.append_column(
+                                "path", [read_path] * block_accessor.num_rows()
+                            )
+                        yield block
+
+        def create_read_task_fn(read_paths, num_threads):
+            def read_task_fn():
+                nonlocal num_threads, read_paths
+
+                # TODO: We should refactor the code so that we can get the results in
+                # order even when using multiple threads.
+                if self._data_context.execution_options.preserve_order:
+                    num_threads = 0
+
+                if num_threads > 0:
+                    if len(read_paths) < num_threads:
+                        num_threads = len(read_paths)
+
+                    logger.debug(
+                        f"Reading {len(read_paths)} files with {num_threads} threads."
+                    )
+
+                    yield from make_async_gen(
+                        iter(read_paths),
+                        read_files,
+                        num_workers=num_threads,
+                    )
+                else:
+                    logger.debug(f"Reading {len(read_paths)} files.")
+                    yield from read_files(read_paths)
+
+            return read_task_fn
+
+        # fix https://github.com/ray-project/ray/issues/24296
+        parallelism = min(parallelism, len(paths))
 
         read_tasks = []
-        for read_paths, file_sizes in zip(
-            np.array_split(paths, parallelism), np.array_split(file_sizes, parallelism)
-        ):
+        split_paths = np.array_split(paths, parallelism)
+        split_file_sizes = np.array_split(file_sizes, parallelism)
+
+        for read_paths, file_sizes in zip(split_paths, split_file_sizes):
             if len(read_paths) <= 0:
                 continue
 
-            if self._rows_per_file() is None:
-                num_rows = None
-            else:
-                num_rows = len(read_paths) * self._rows_per_file()
-            meta = BlockMetadata(
-                num_rows=num_rows,
-                size_bytes=sum(file_sizes),
-                schema=schema,
-                input_files=read_paths,
-                exec_stats=None,
-            )  # Exec stats filled in later.
-            read_task = ReadTask(
-                lambda read_paths=read_paths: read_files(read_paths, filesystem), meta
+            meta = self._meta_provider(
+                read_paths,
+                self._schema,
+                rows_per_file=self._rows_per_file(),
+                file_sizes=file_sizes,
             )
+
+            read_task_fn = create_read_task_fn(read_paths, self._NUM_THREADS_PER_TASK)
+
+            read_task = ReadTask(read_task_fn, meta)
+
             read_tasks.append(read_task)
 
         return read_tasks
+
+    def _open_input_source(
+        self,
+        filesystem: "RetryingPyFileSystem",
+        path: str,
+        **open_args,
+    ) -> "pyarrow.NativeFile":
+        """Opens a source path for reading and returns the associated Arrow NativeFile.
+
+        The default implementation opens the source path as a sequential input stream,
+        using self._data_context.streaming_read_buffer_size as the buffer size if none
+        is given by the caller.
+
+        Implementations that do not support streaming reads (e.g. that require random
+        access) should override this method.
+        """
+        import pyarrow as pa
+        from pyarrow.fs import HadoopFileSystem
+
+        compression = open_args.get("compression", None)
+        if compression is None:
+            try:
+                # If no compression manually given, try to detect
+                # compression codec from path.
+                compression = pa.Codec.detect(path).name
+            except (ValueError, TypeError):
+                # Arrow's compression inference on the file path
+                # doesn't work for Snappy, so we double-check ourselves.
+                import pathlib
+
+                suffix = pathlib.Path(path).suffix
+                if suffix and suffix[1:] == "snappy":
+                    compression = "snappy"
+                else:
+                    compression = None
+
+        buffer_size = open_args.pop("buffer_size", None)
+        if buffer_size is None:
+            buffer_size = self._data_context.streaming_read_buffer_size
+
+        if compression == "snappy":
+            # Arrow doesn't support streaming Snappy decompression since the canonical
+            # C++ Snappy library doesn't natively support streaming decompression. We
+            # works around this by manually decompressing the file with python-snappy.
+            open_args["compression"] = None
+        else:
+            open_args["compression"] = compression
+
+        file = filesystem.open_input_stream(path, buffer_size=buffer_size, **open_args)
+
+        if compression == "snappy":
+            import snappy
+
+            stream = io.BytesIO()
+            if isinstance(filesystem.unwrap(), HadoopFileSystem):
+                snappy.hadoop_snappy.stream_decompress(src=file, dst=stream)
+            else:
+                snappy.stream_decompress(src=file, dst=stream)
+            stream.seek(0)
+
+            file = pa.PythonFile(stream, mode="r")
+
+        return file
 
     def _rows_per_file(self):
         """Returns the number of rows per file, or None if unknown."""
         return None
 
-    def _read_stream(
-        self, f: "pyarrow.NativeFile", path: str, **reader_args
-    ) -> Iterator[Block]:
-        """Streaming read a single file, passing all kwargs to the reader.
-
-        By default, delegates to self._read_file().
-        """
-        yield self._read_file(f, path, **reader_args)
-
-    def _read_file(self, f: "pyarrow.NativeFile", path: str, **reader_args) -> Block:
-        """Reads a single file, passing all kwargs to the reader.
+    def _read_stream(self, f: "pyarrow.NativeFile", path: str) -> Iterator[Block]:
+        """Streaming read a single file.
 
         This method should be implemented by subclasses.
         """
         raise NotImplementedError(
-            "Subclasses of FileBasedDatasource must implement _read_file()."
+            "Subclasses of FileBasedDatasource must implement _read_stream()."
         )
 
-    def do_write(
-        self,
-        blocks: List[ObjectRef[Block]],
-        metadata: List[BlockMetadata],
-        path: str,
-        dataset_uuid: str,
-        filesystem: Optional["pyarrow.fs.FileSystem"] = None,
-        try_create_dir: bool = True,
-        open_stream_args: Optional[Dict[str, Any]] = None,
-        block_path_provider: BlockWritePathProvider = DefaultBlockWritePathProvider(),
-        write_args_fn: Callable[[], Dict[str, Any]] = lambda: {},
-        _block_udf: Optional[Callable[[Block], Block]] = None,
-        **write_args,
-    ) -> List[ObjectRef[WriteResult]]:
-        """Creates and returns write tasks for a file-based datasource."""
-        path, filesystem = _resolve_paths_and_filesystem(path, filesystem)
-        path = path[0]
-        if try_create_dir:
-            filesystem.create_dir(path, recursive=True)
-        filesystem = _wrap_s3_serialization_workaround(filesystem)
-
-        _write_block_to_file = self._write_block
-
-        if open_stream_args is None:
-            open_stream_args = {}
-
-        def write_block(write_path: str, block: Block):
-            logger.debug(f"Writing {write_path} file.")
-            fs = filesystem
-            if isinstance(fs, _S3FileSystemWrapper):
-                fs = fs.unwrap()
-            if _block_udf is not None:
-                block = _block_udf(block)
-
-            with fs.open_output_stream(write_path, **open_stream_args) as f:
-                _write_block_to_file(
-                    f,
-                    BlockAccessor.for_block(block),
-                    writer_args_fn=write_args_fn,
-                    **write_args,
-                )
-
-        write_block = cached_remote_fn(write_block)
-
-        file_format = self._file_format()
-        write_tasks = []
-        if not block_path_provider:
-            block_path_provider = DefaultBlockWritePathProvider()
-        for block_idx, block in enumerate(blocks):
-            write_path = block_path_provider(
-                path,
-                filesystem=filesystem,
-                dataset_uuid=dataset_uuid,
-                block=block,
-                block_index=block_idx,
-                file_format=file_format,
-            )
-            write_task = write_block.remote(write_path, block)
-            write_tasks.append(write_task)
-
-        return write_tasks
-
-    def _write_block(
-        self,
-        f: "pyarrow.NativeFile",
-        block: BlockAccessor,
-        writer_args_fn: Callable[[], Dict[str, Any]] = lambda: {},
-        **writer_args,
-    ):
-        """Writes a block to a single file, passing all kwargs to the writer.
-
-        This method should be implemented by subclasses.
-        """
-        raise NotImplementedError(
-            "Subclasses of FileBasedDatasource must implement _write_files()."
-        )
-
-    def _file_format(self):
-        """Returns the file format string, to be used as the file extension
-        when writing files.
-
-        This method should be implemented by subclasses.
-        """
-        raise NotImplementedError(
-            "Subclasses of FileBasedDatasource must implement _file_format()."
-        )
+    @property
+    def supports_distributed_reads(self) -> bool:
+        return self._supports_distributed_reads
 
 
-# TODO(Clark): Add unit test coverage of _resolve_paths_and_filesystem and
-# _expand_paths.
-
-
-def _resolve_paths_and_filesystem(
-    paths: Union[str, List[str]],
-    filesystem: "pyarrow.fs.FileSystem" = None,
-) -> Tuple[List[str], "pyarrow.fs.FileSystem"]:
-    """
-    Resolves and normalizes all provided paths, infers a filesystem from the
-    paths and ensures that all paths use the same filesystem.
-
-    Args:
-        paths: A single file/directory path or a list of file/directory paths.
-            A list of paths can contain both files and directories.
-        filesystem: The filesystem implementation that should be used for
-            reading these files. If None, a filesystem will be inferred. If not
-            None, the provided filesystem will still be validated against all
-            filesystems inferred from the provided paths to ensure
-            compatibility.
-    """
+def _add_partitions(
+    data: Union["pyarrow.Table", "pd.DataFrame"], partitions: Dict[str, Any]
+) -> Union["pyarrow.Table", "pd.DataFrame"]:
+    import pandas as pd
     import pyarrow as pa
-    from pyarrow.fs import (
-        FileSystem,
-        PyFileSystem,
-        FSSpecHandler,
-        _resolve_filesystem_and_path,
-    )
 
-    if isinstance(paths, str):
-        paths = [paths]
-    elif not isinstance(paths, list) or any(not isinstance(p, str) for p in paths):
-        raise ValueError("paths must be a path string or a list of path strings.")
-    elif len(paths) == 0:
-        raise ValueError("Must provide at least one path.")
+    assert isinstance(data, (pa.Table, pd.DataFrame))
+    if isinstance(data, pa.Table):
+        return _add_partitions_to_table(data, partitions)
+    if isinstance(data, pd.DataFrame):
+        return _add_partitions_to_dataframe(data, partitions)
 
-    if filesystem and not isinstance(filesystem, FileSystem):
-        err_msg = (
-            f"The filesystem passed must either conform to "
-            f"pyarrow.fs.FileSystem, or "
-            f"fsspec.spec.AbstractFileSystem. The provided "
-            f"filesystem was: {filesystem}"
-        )
-        try:
-            import fsspec
-        except ModuleNotFoundError:
-            # If filesystem is not a pyarrow filesystem and fsspec isn't
-            # installed, then filesystem is neither a pyarrow filesystem nor
-            # an fsspec filesystem, so we raise a TypeError.
-            raise TypeError(err_msg)
-        if not isinstance(filesystem, fsspec.spec.AbstractFileSystem):
-            raise TypeError(err_msg)
 
-        filesystem = PyFileSystem(FSSpecHandler(filesystem))
+def _add_partitions_to_table(
+    table: "pyarrow.Table", partitions: Dict[str, Any]
+) -> "pyarrow.Table":
+    import pyarrow as pa
+    import pyarrow.compute as pc
 
-    resolved_paths = []
-    for path in paths:
-        try:
-            resolved_filesystem, resolved_path = _resolve_filesystem_and_path(
-                path, filesystem
-            )
-        except pa.lib.ArrowInvalid as e:
-            if "Cannot parse URI" in str(e):
-                resolved_filesystem, resolved_path = _resolve_filesystem_and_path(
-                    _encode_url(path), filesystem
+    column_names = set(table.column_names)
+    for field, value in partitions.items():
+        column = pa.array([value] * len(table))
+        if field in column_names:
+            # TODO: Handle cast error.
+            column_type = table.schema.field(field).type
+            column = column.cast(column_type)
+
+            values_are_equal = pc.all(pc.equal(column, table[field]))
+            values_are_equal = values_are_equal.as_py()
+
+            if not values_are_equal:
+                raise ValueError(
+                    f"Partition column {field} exists in table data, but partition "
+                    f"value '{value}' is different from in-data values: "
+                    f"{table[field].unique().to_pylist()}."
                 )
-                resolved_path = _decode_url(resolved_path)
-            else:
-                raise
-        if filesystem is None:
-            filesystem = resolved_filesystem
+
+            i = table.schema.get_field_index(field)
+            table = table.set_column(i, field, column)
         else:
-            resolved_path = _unwrap_protocol(resolved_path)
-        resolved_path = filesystem.normalize_path(resolved_path)
-        resolved_paths.append(resolved_path)
+            table = table.append_column(field, column)
 
-    return resolved_paths, filesystem
+    return table
 
 
-def _expand_paths(paths: Union[str, List[str]], filesystem: "pyarrow.fs.FileSystem"):
-    """
-    Expands all provided paths into concrete file paths by walking directories.
-    Also returns a sidecar of file infos.
+def _add_partitions_to_dataframe(
+    df: "pd.DataFrame", partitions: Dict[str, Any]
+) -> "pd.DataFrame":
+    import pandas as pd
 
-    This should be used on the output of _resolve_paths_and_filesystem.
+    for field, value in partitions.items():
+        column = pd.Series(data=[value] * len(df), name=field)
 
-    Args:
-        paths: A single file/directory path or a list of file/directory paths.
-            A list of paths can contain both files and directories. These paths
-            should be properly resolved, e.g. the paths returned from
-            _resolve_paths_and_filesystem.
-        filesystem: The filesystem implementation that should be used for
-            reading these files.
-    """
-    from pyarrow.fs import FileType
+        if field in df:
+            column = column.astype(df[field].dtype)
+            mask = df[field].notna()
+            if not df[field][mask].equals(column[mask]):
+                raise ValueError(
+                    f"Partition column {field} exists in table data, but partition "
+                    f"value '{value}' is different from in-data values: "
+                    f"{list(df[field].unique())}."
+                )
 
-    expanded_paths = []
-    file_infos = []
-    for path in paths:
-        file_info = filesystem.get_file_info(path)
-        if file_info.type == FileType.Directory:
-            paths, file_infos_ = _expand_directory(path, filesystem)
-            expanded_paths.extend(paths)
-            file_infos.extend(file_infos_)
-        elif file_info.type == FileType.File:
-            expanded_paths.append(path)
-            file_infos.append(file_info)
-        else:
-            raise FileNotFoundError(path)
-    return expanded_paths, file_infos
+        df[field] = column
 
-
-def _expand_directory(
-    path: str,
-    filesystem: "pyarrow.fs.FileSystem",
-    exclude_prefixes: Optional[List[str]] = None,
-) -> List[str]:
-    """
-    Expand the provided directory path to a list of file paths.
-
-    Args:
-        path: The directory path to expand.
-        filesystem: The filesystem implementation that should be used for
-            reading these files.
-        exclude_prefixes: The file relative path prefixes that should be
-            excluded from the returned file set. Default excluded prefixes are
-            "." and "_".
-
-    Returns:
-        A list of file paths contained in the provided directory.
-    """
-    if exclude_prefixes is None:
-        exclude_prefixes = [".", "_"]
-
-    from pyarrow.fs import FileSelector
-
-    selector = FileSelector(path, recursive=True)
-    files = filesystem.get_file_info(selector)
-    base_path = selector.base_dir
-    filtered_paths = []
-    for file_ in files:
-        if not file_.is_file:
-            continue
-        file_path = file_.path
-        if not file_path.startswith(base_path):
-            continue
-        relative = file_path[len(base_path) :]
-        if any(relative.startswith(prefix) for prefix in exclude_prefixes):
-            continue
-        filtered_paths.append((file_path, file_))
-    # We sort the paths to guarantee a stable order.
-    return zip(*sorted(filtered_paths, key=lambda x: x[0]))
-
-
-def _is_url(path) -> bool:
-    return urllib.parse.urlparse(path).scheme != ""
-
-
-def _encode_url(path):
-    return urllib.parse.quote(path, safe="/:")
-
-
-def _decode_url(path):
-    return urllib.parse.unquote(path)
-
-
-def _unwrap_protocol(path):
-    """
-    Slice off any protocol prefixes on path.
-    """
-    parsed = urllib.parse.urlparse(path)
-    return parsed.netloc + parsed.path
+    return df
 
 
 def _wrap_s3_serialization_workaround(filesystem: "pyarrow.fs.FileSystem"):
@@ -487,14 +473,43 @@ def _wrap_s3_serialization_workaround(filesystem: "pyarrow.fs.FileSystem"):
     import pyarrow as pa
     import pyarrow.fs
 
-    if isinstance(filesystem, pa.fs.S3FileSystem):
-        return _S3FileSystemWrapper(filesystem)
+    wrap_retries = False
+    fs_to_be_wrapped = filesystem  # Only unwrap for S3FileSystemWrapper
+    context = None
+    if isinstance(fs_to_be_wrapped, RetryingPyFileSystem):
+        wrap_retries = True
+        context = fs_to_be_wrapped.data_context
+        fs_to_be_wrapped = fs_to_be_wrapped.unwrap()
+    if isinstance(fs_to_be_wrapped, pa.fs.S3FileSystem):
+        return _S3FileSystemWrapper(
+            fs_to_be_wrapped, wrap_retries=wrap_retries, context=context
+        )
+    return filesystem
+
+
+def _unwrap_s3_serialization_workaround(
+    filesystem: Union["pyarrow.fs.FileSystem", "_S3FileSystemWrapper"],
+    context: Optional[DataContext] = None,
+):
+    if isinstance(filesystem, _S3FileSystemWrapper):
+        wrap_retries = filesystem._wrap_retries
+        context = filesystem._context
+        filesystem = filesystem.unwrap()
+        if wrap_retries:
+            filesystem = RetryingPyFileSystem.wrap(filesystem, context=context)
     return filesystem
 
 
 class _S3FileSystemWrapper:
-    def __init__(self, fs: "pyarrow.fs.S3FileSystem"):
+    def __init__(
+        self,
+        fs: "pyarrow.fs.S3FileSystem",
+        wrap_retries: bool = False,
+        context: Optional[DataContext] = None,
+    ):
         self._fs = fs
+        self._wrap_retries = wrap_retries
+        self._context = context
 
     def unwrap(self):
         return self._fs
@@ -527,8 +542,17 @@ def _unwrap_arrow_serialization_workaround(kwargs: dict) -> dict:
 def _resolve_kwargs(
     kwargs_fn: Callable[[], Dict[str, Any]], **kwargs
 ) -> Dict[str, Any]:
-
     if kwargs_fn:
         kwarg_overrides = kwargs_fn()
         kwargs.update(kwarg_overrides)
     return kwargs
+
+
+def _validate_shuffle_arg(shuffle: Optional[str]) -> None:
+    if not (
+        shuffle is None or shuffle == "files" or isinstance(shuffle, FileShuffleConfig)
+    ):
+        raise ValueError(
+            f"Invalid value for 'shuffle': {shuffle}. "
+            "Valid values are None, 'files', `FileShuffleConfig`."
+        )

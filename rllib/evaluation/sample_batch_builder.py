@@ -1,33 +1,31 @@
 import collections
 import logging
 import numpy as np
-from typing import List, Any, Dict, Optional, TYPE_CHECKING
+from typing import List, Any, Dict, TYPE_CHECKING
 
 from ray.rllib.env.base_env import _DUMMY_AGENT_ID
-from ray.rllib.evaluation.episode import Episode
 from ray.rllib.policy.policy import Policy
 from ray.rllib.policy.sample_batch import SampleBatch, MultiAgentBatch
-from ray.rllib.utils.annotations import DeveloperAPI
-from ray.rllib.utils.deprecation import Deprecated
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.debug import summarize
 from ray.rllib.utils.deprecation import deprecation_warning
 from ray.rllib.utils.typing import PolicyID, AgentID
 from ray.util.debug import log_once
 
 if TYPE_CHECKING:
-    from ray.rllib.agents.callbacks import DefaultCallbacks
+    from ray.rllib.callbacks.callbacks import RLlibCallback
 
 logger = logging.getLogger(__name__)
 
 
-def to_float_array(v: List[Any]) -> np.ndarray:
+def _to_float_array(v: List[Any]) -> np.ndarray:
     arr = np.array(v)
     if arr.dtype == np.float64:
         return arr.astype(np.float32)  # save some memory
     return arr
 
 
-@Deprecated(new="a child class of `SampleCollector`", error=False)
+@OldAPIStack
 class SampleBatchBuilder:
     """Util to build a SampleBatch incrementally.
 
@@ -58,7 +56,7 @@ class SampleBatchBuilder:
     def build_and_reset(self) -> SampleBatch:
         """Returns a sample batch including all previously added values."""
 
-        batch = SampleBatch({k: to_float_array(v) for k, v in self.buffers.items()})
+        batch = SampleBatch({k: _to_float_array(v) for k, v in self.buffers.items()})
         if SampleBatch.UNROLL_ID not in batch:
             batch[SampleBatch.UNROLL_ID] = np.repeat(
                 SampleBatchBuilder._next_unroll_id, batch.count
@@ -69,9 +67,7 @@ class SampleBatchBuilder:
         return batch
 
 
-# Deprecated class: Use a child class of `SampleCollector` instead
-#  (which handles multi-agent setups as well).
-@DeveloperAPI
+@OldAPIStack
 class MultiAgentSampleBatchBuilder:
     """Util to build SampleBatches for each policy in a multi-agent env.
 
@@ -85,7 +81,7 @@ class MultiAgentSampleBatchBuilder:
         self,
         policy_map: Dict[PolicyID, Policy],
         clip_rewards: bool,
-        callbacks: "DefaultCallbacks",
+        callbacks: "RLlibCallback",
     ):
         """Initialize a MultiAgentSampleBatchBuilder.
 
@@ -93,7 +89,7 @@ class MultiAgentSampleBatchBuilder:
             policy_map (Dict[str,Policy]): Maps policy ids to policy instances.
             clip_rewards (Union[bool,float]): Whether to clip rewards before
                 postprocessing (at +/-1.0) or the actual value to +/- clip.
-            callbacks (DefaultCallbacks): RLlib callbacks.
+            callbacks: RLlib callbacks.
         """
         if log_once("MultiAgentSampleBatchBuilder"):
             deprecation_warning(old="MultiAgentSampleBatchBuilder", error=False)
@@ -131,14 +127,13 @@ class MultiAgentSampleBatchBuilder:
 
         return len(self.agent_builders) > 0
 
-    @DeveloperAPI
     def add_values(self, agent_id: AgentID, policy_id: AgentID, **values: Any) -> None:
         """Add the given dictionary (row) of values to this batch.
 
         Args:
-            agent_id (obj): Unique id for the agent we are adding values for.
-            policy_id (obj): Unique id for policy controlling the agent.
-            values (dict): Row of values to add for this agent.
+            agent_id: Unique id for the agent we are adding values for.
+            policy_id: Unique id for policy controlling the agent.
+            values: Row of values to add for this agent.
         """
 
         if agent_id not in self.agent_builders:
@@ -151,7 +146,7 @@ class MultiAgentSampleBatchBuilder:
 
         self.agent_builders[agent_id].add_values(**values)
 
-    def postprocess_batch_so_far(self, episode: Optional[Episode] = None) -> None:
+    def postprocess_batch_so_far(self, episode=None) -> None:
         """Apply policy postprocessors to any unprocessed rows.
 
         This pushes the postprocessed per-agent batches onto the per-policy
@@ -186,7 +181,10 @@ class MultiAgentSampleBatchBuilder:
             other_batches = pre_batches.copy()
             del other_batches[agent_id]
             policy = self.policy_map[self.agent_to_policy[agent_id]]
-            if any(pre_batch["dones"][:-1]) or len(set(pre_batch["eps_id"])) > 1:
+            if (
+                not pre_batch.is_single_trajectory()
+                or len(set(pre_batch[SampleBatch.EPS_ID])) > 1
+            ):
                 raise ValueError(
                     "Batches sent to postprocessing must only contain steps "
                     "from a single trajectory.",
@@ -229,7 +227,7 @@ class MultiAgentSampleBatchBuilder:
 
     def check_missing_dones(self) -> None:
         for agent_id, builder in self.agent_builders.items():
-            if builder.buffers["dones"][-1] is not True:
+            if not builder.buffers.is_terminated_or_truncated():
                 raise ValueError(
                     "The environment terminated for all agents, but we still "
                     "don't have a last observation for "
@@ -237,12 +235,11 @@ class MultiAgentSampleBatchBuilder:
                         agent_id, self.agent_to_policy[agent_id]
                     )
                     + "Please ensure that you include the last observations "
-                    "of all live agents when setting '__all__' done to True. "
-                    "Alternatively, set no_done_at_end=True to allow this."
+                    "of all live agents when setting '__all__' terminated|truncated "
+                    "to True. "
                 )
 
-    @DeveloperAPI
-    def build_and_reset(self, episode: Optional[Episode] = None) -> MultiAgentBatch:
+    def build_and_reset(self, episode=None) -> MultiAgentBatch:
         """Returns the accumulated sample batches for each policy.
 
         Any unprocessed rows will be first postprocessed with a policy

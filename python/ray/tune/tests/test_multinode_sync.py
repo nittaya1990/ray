@@ -3,10 +3,12 @@ import time
 import unittest
 
 import ray
-from ray import tune
+from ray import train, tune
+from ray.air.util.node import _force_on_node
 from ray.autoscaler._private.fake_multi_node.test_utils import DockerCluster
 from ray.tune.callback import Callback
-from ray.tune.trial import Trial
+from ray.tune.experiment import Trial
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 
 @ray.remote
@@ -21,7 +23,7 @@ class MultiNodeSyncTest(unittest.TestCase):
 
     def tearDown(self):
         self.cluster.stop()
-        self.cluster.teardown()
+        self.cluster.teardown(keep_dir=True)
 
     def testClusterAutoscaling(self):
         """Sanity check that multinode tests with autoscaling are working"""
@@ -47,9 +49,13 @@ class MultiNodeSyncTest(unittest.TestCase):
         self.assertEquals(
             5,
             ray.get(
-                remote_task.options(num_cpus=1, num_gpus=1, placement_group=pg).remote(
-                    5
-                )
+                remote_task.options(
+                    num_cpus=1,
+                    num_gpus=1,
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg
+                    ),
+                ).remote(5)
             ),
         )
 
@@ -78,7 +84,7 @@ class MultiNodeSyncTest(unittest.TestCase):
         """Test that newly added nodes from autoscaling are not stale."""
         self.cluster.update_config(
             {
-                "provider": {"head_resources": {"CPU": 4, "GPU": 0}},
+                "provider": {"head_resources": {"CPU": 2, "GPU": 0}},
                 "available_node_types": {
                     "ray.worker.cpu": {
                         "resources": {"CPU": 4},
@@ -97,7 +103,7 @@ class MultiNodeSyncTest(unittest.TestCase):
 
         def autoscaling_train(config):
             time.sleep(120)
-            tune.report(1.0)
+            train.report({"_metric": 1.0})
 
         tune.run(
             autoscaling_train,
@@ -111,10 +117,9 @@ class MultiNodeSyncTest(unittest.TestCase):
 
         When `max_failures` is set to larger than zero.
         """
-
         self.cluster.update_config(
             {
-                "provider": {"head_resources": {"CPU": 4, "GPU": 0}},
+                "provider": {"head_resources": {"CPU": 2, "GPU": 0}},
                 "available_node_types": {
                     "ray.worker.cpu": {
                         "resources": {"CPU": 4},
@@ -130,14 +135,14 @@ class MultiNodeSyncTest(unittest.TestCase):
         )
         self.cluster.start()
         self.cluster.connect(client=True, timeout=120)
+        remote_api = self.cluster.remote_execution_api()
 
-        def train(config):
+        def train_fn(config):
             time.sleep(120)
-            tune.report(1.0)
+            train.report({"_metric": 1.0})
 
         class FailureInjectionCallback(Callback):
-            def __init__(self, cluster):
-                self._cluster = cluster
+            def __init__(self):
                 self._killed = False
 
             def on_step_begin(self, iteration, trials, **info):
@@ -146,20 +151,57 @@ class MultiNodeSyncTest(unittest.TestCase):
                     and len(trials) == 3
                     and all(trial.status == Trial.RUNNING for trial in trials)
                 ):
-                    self._cluster.kill_node(num=2)
+                    remote_api.kill_node(num=2)
                     self._killed = True
 
         tune.run(
-            train,
+            train_fn,
             num_samples=3,
             resources_per_trial={"cpu": 4},
             max_failures=1,
-            callbacks=[FailureInjectionCallback(self.cluster)],
-            # The following two are to be removed once we have proper setup
-            # for killing nodes while in ray client mode.
-            _remote=False,
-            local_dir="/tmp/ray_results/",
+            callbacks=[FailureInjectionCallback()],
         )
+
+    def testForceOnNodeScheduling(self):
+        """Test node scheduling behavior correctly schedules with node affinity."""
+        num_workers = 4
+        num_cpu_per_node = 4
+        self.cluster.update_config(
+            {
+                "provider": {"head_resources": {"CPU": num_cpu_per_node, "GPU": 0}},
+                "available_node_types": {
+                    "ray.worker.cpu": {
+                        "resources": {"CPU": num_cpu_per_node},
+                        "min_workers": num_workers,
+                        "max_workers": num_workers,
+                    },
+                    "ray.worker.gpu": {
+                        "min_workers": 0,
+                        "max_workers": 0,  # No GPU nodes
+                    },
+                },
+            }
+        )
+        self.cluster.start()
+        self.cluster.connect(client=True, timeout=120)
+
+        total_num_cpu = (1 + num_workers) * num_cpu_per_node
+        self.cluster.wait_for_resources({"CPU": total_num_cpu})
+
+        @ray.remote
+        def get_current_node_id():
+            return ray.get_runtime_context().get_node_id()
+
+        node_ids = [node["NodeID"] for node in ray.nodes()]
+        assert len(node_ids) == 1 + num_workers
+
+        remote_tasks = [
+            _force_on_node(node_id, get_current_node_id).remote()
+            for node_id in node_ids
+        ]
+        results = ray.get(remote_tasks)
+        print(results)
+        assert results == node_ids
 
 
 if __name__ == "__main__":

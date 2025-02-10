@@ -1,9 +1,5 @@
 import pathlib
 import tempfile
-import os
-import ray
-from ray import workflow
-from ray.workflow.storage import set_global_storage
 
 _GLOBAL_MARK_PATH = pathlib.Path(tempfile.gettempdir())
 
@@ -25,14 +21,39 @@ def check_global_mark(name="workflow"):
 
 
 def _alter_storage(new_storage):
-    set_global_storage(new_storage)
-    # alter the storage
-    ray.shutdown()
-    os.system("ray stop --force")
-    workflow.init(new_storage)
+    raise Exception("This method is deprecated.")
 
 
 def clear_marks():
     files = _GLOBAL_MARK_PATH.glob("**/workflow-*")
     for file in files:
         file.unlink()
+
+
+def assert_task_checkpoints(wf_storage, task_id, mode: str):
+    """Assert the checkpoint status of a workflow task."""
+    result = wf_storage.inspect_task(task_id)
+    if mode == "all_skipped":
+        assert not result.output_object_valid
+        assert result.output_task_id is None
+        assert not result.args_valid
+        assert not result.func_body_valid
+        assert not result.task_options
+    elif mode == "output_skipped":
+        assert not result.output_object_valid
+        assert result.output_task_id is None
+        assert result.args_valid
+        assert result.func_body_valid
+        assert result.task_options is not None
+    elif mode == "checkpointed":
+        assert result.output_object_valid or result.output_task_id is not None
+    else:
+        raise ValueError("Unknown mode.")
+
+
+def skip_client_mode_test():
+    import pytest
+    from ray._private.client_mode_hook import client_mode_should_convert
+
+    if client_mode_should_convert():
+        pytest.skip("Not for Ray client test")

@@ -1,33 +1,37 @@
-from glob import glob
 import json
 import os
-import pytest
 import random
 import sys
 import time
-from unittest.mock import patch
+from glob import glob
+from unittest.mock import patch, MagicMock
+from itertools import chain
 
 import grpc
+import pytest
 
 import ray
 import ray.core.generated.ray_client_pb2 as ray_client_pb2
+import ray.util.client.server.proxier as proxier
+from ray._private.ray_constants import REDIS_DEFAULT_PASSWORD
+from ray._private.test_utils import run_string_as_driver, wait_for_condition
 from ray.cloudpickle.compat import pickle
 from ray.job_config import JobConfig
-import ray.util.client.server.proxier as proxier
-from ray._private.test_utils import run_string_as_driver
 
 
 def start_ray_and_proxy_manager(n_ports=2):
-    agent_port = random.choice(range(50000, 55000))
-    ray_instance = ray.init(_redis_password="test")
-    agent_port = ray.worker.global_worker.node.metrics_agent_port
+    ray_instance = ray.init(_redis_password=REDIS_DEFAULT_PASSWORD)
+    runtime_env_agent_address = (
+        ray._private.worker.global_worker.node.runtime_env_agent_address
+    )
     pm = proxier.ProxyManager(
         ray_instance["address"],
         session_dir=ray_instance["session_dir"],
-        redis_password="test",
-        runtime_env_agent_port=agent_port,
+        redis_password=REDIS_DEFAULT_PASSWORD,
+        runtime_env_agent_address=runtime_env_agent_address,
     )
-    free_ports = random.choices(range(45000, 45100), k=n_ports)
+    free_ports = random.choices(pm._free_ports, k=n_ports)
+    assert len(free_ports) == n_ports
     pm._free_ports = free_ports.copy()
 
     return pm, free_ports
@@ -75,25 +79,33 @@ def test_proxy_manager_lifecycle(shutdown_only):
 @pytest.mark.skipif(
     sys.platform == "win32", reason="PSUtil does not work the same on windows."
 )
+@patch("ray.util.client.server.proxier.CHECK_PROCESS_INTERVAL_S", 1)
+@patch("ray.util.client.server.proxier.CHECK_CHANNEL_TIMEOUT_S", 1)
 def test_proxy_manager_bad_startup(shutdown_only):
     """
     Test that when a SpecificServer fails to start (because of a bad JobConfig)
     that it is properly GC'd.
     """
-    proxier.CHECK_PROCESS_INTERVAL_S = 1
-    proxier.CHECK_CHANNEL_TIMEOUT_S = 1
     pm, free_ports = start_ray_and_proxy_manager(n_ports=2)
     client = "client1"
+    ctx = ray.init(ignore_reinit_error=True)
+    port_to_conflict = ctx.dashboard_url.split(":")[1]
 
     pm.create_specific_server(client)
-    assert not pm.start_specific_server(
-        client, JobConfig(runtime_env={"conda": "conda-env-that-sadly-does-not-exist"})
+    # Intentionally bind to the wrong port so that the
+    # server will crash.
+    pm._get_server_for_client(client).port = port_to_conflict
+    pm.start_specific_server(
+        client,
+        JobConfig(),
     )
-    # Wait for reconcile loop
-    time.sleep(2)
-    assert pm.get_channel(client) is None
 
-    assert len(pm._free_ports) == 2
+    def verify():
+        assert pm.get_channel(client) is None
+        assert len(pm._free_ports) == 2
+        return True
+
+    wait_for_condition(verify)
 
 
 @pytest.mark.skipif(
@@ -109,10 +121,10 @@ def test_multiple_clients_use_different_drivers(call_ray_start):
     Test that each client uses a separate JobIDs and namespaces.
     """
     with ray.client("localhost:25001").connect():
-        job_id_one = ray.get_runtime_context().job_id
+        job_id_one = ray.get_runtime_context().get_job_id()
         namespace_one = ray.get_runtime_context().namespace
     with ray.client("localhost:25001").connect():
-        job_id_two = ray.get_runtime_context().job_id
+        job_id_two = ray.get_runtime_context().get_job_id()
         namespace_two = ray.get_runtime_context().namespace
 
     assert job_id_one != job_id_two
@@ -160,13 +172,13 @@ assert ray.util.client.ray.worker.log_client.log_thread.is_alive()
     sys.platform != "linux",
     reason="PSUtil does not work the same on windows & MacOS if flaky.",
 )
+@patch("ray.util.client.server.proxier.LOGSTREAM_RETRIES", 3)
+@patch("ray.util.client.server.proxier.LOGSTREAM_RETRY_INTERVAL_SEC", 1)
 def test_delay_in_rewriting_environment(shutdown_only):
     """
     Check that a delay in `ray_client_server_env_prep` does not break
     a Client connecting.
     """
-    proxier.LOGSTREAM_RETRIES = 3
-    proxier.LOGSTREAM_RETRY_INTERVAL_SEC = 1
     ray_instance = ray.init()
     server = proxier.serve_proxier(
         "localhost:25010",
@@ -270,9 +282,9 @@ def test_prepare_runtime_init_req_no_modification():
         ),
     )
     req, new_config = proxier.prepare_runtime_init_req(init_req)
-    assert new_config.serialize() == job_config.serialize()
+    assert new_config._serialize() == job_config._serialize()
     assert isinstance(req, ray_client_pb2.DataRequest)
-    assert pickle.loads(req.init.job_config).serialize() == new_config.serialize()
+    assert pickle.loads(req.init.job_config)._serialize() == new_config._serialize()
     assert json.loads(req.init.ray_init_kwargs) == {"log_to_driver": False}
 
 
@@ -299,7 +311,7 @@ def test_prepare_runtime_init_req_modified_job():
         req, new_config = proxier.prepare_runtime_init_req(init_req)
 
     assert new_config.ray_namespace == "test_value"
-    assert pickle.loads(req.init.job_config).serialize() == new_config.serialize()
+    assert pickle.loads(req.init.job_config)._serialize() == new_config._serialize()
     assert json.loads(req.init.ray_init_kwargs) == {"log_to_driver": False}
 
 
@@ -323,18 +335,15 @@ def test_match_running_client_server(test_case):
 @pytest.mark.skipif(
     sys.platform == "win32", reason="PSUtil does not work the same on windows."
 )
-def test_proxy_manager_internal_kv(shutdown_only, with_specific_server):
+@patch("ray.util.client.server.proxier.CHECK_PROCESS_INTERVAL_S", 1)
+@patch("ray.util.client.server.proxier.CHECK_CHANNEL_TIMEOUT_S", 5)
+def test_proxy_manager_internal_kv(shutdown_only, with_specific_server, monkeypatch):
     """
     Test that proxy manager can use internal kv with and without a
     SpecificServer and that once a SpecificServer is started up, it
     goes through it.
     """
-
-    proxier.CHECK_PROCESS_INTERVAL_S = 1
-    # The timeout has likely been set to 1 in an earlier test. Increase timeout
-    # to wait for the channel to become ready.
-    proxier.CHECK_CHANNEL_TIMEOUT_S = 5
-    os.environ["TIMEOUT_FOR_SPECIFIC_SERVER_S"] = "5"
+    monkeypatch.setenv("TIMEOUT_FOR_SPECIFIC_SERVER_S", "5")
     pm, free_ports = start_ray_and_proxy_manager(n_ports=2)
     client = "client1"
 
@@ -400,7 +409,84 @@ def test_proxy_manager_internal_kv(shutdown_only, with_specific_server):
             make_internal_kv_calls()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="PSUtil does not work the same on windows."
+)
+def test_proxy_cancelled_grpc_request_stream():
+    """
+    Test that DataServicerProxy and LogstreamServicerProxy should gracefully
+    close grpc stream when the request stream is cancelled.
+    """
+
+    proxier.CHECK_PROCESS_INTERVAL_S = 1
+    # The timeout has likely been set to 1 in an earlier test. Increase timeout
+    # to wait for the channel to become ready.
+    proxier.CHECK_CHANNEL_TIMEOUT_S = 5
+    os.environ["TIMEOUT_FOR_SPECIFIC_SERVER_S"] = "5"
+    pm, free_ports = start_ray_and_proxy_manager(n_ports=2)
+
+    data_servicer = proxier.DataServicerProxy(pm)
+    logstream_servicer = proxier.LogstreamServicerProxy(pm)
+
+    # simulate cancelled grpc request stream
+    # https://github.com/grpc/grpc/blob/v1.43.0/src/python/grpcio/grpc/_server.py#L353-L354
+    class Cancelled:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise grpc.RpcError()
+
+    context = MagicMock()
+    context.set_code = MagicMock()
+    context.set_details = MagicMock()
+    context.invocation_metadata = MagicMock(
+        return_value=[
+            ("client_id", "client1"),
+            ("reconnecting", "False"),
+        ]
+    )
+
+    init = ray_client_pb2.DataRequest(
+        req_id=1,
+        init=ray_client_pb2.InitRequest(job_config=pickle.dumps(JobConfig())),
+    )
+
+    for _ in data_servicer.Datapath(chain([init], Cancelled()), context):
+        pass
+    for _ in logstream_servicer.Logstream(Cancelled(), context):
+        pass
+
+    assert not context.set_code.called, "grpc error should not be set"
+    assert not context.set_details.called, "grpc error should not be set"
+
+    class Rendezvous:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise grpc._Rendezvous()
+
+    context.invocation_metadata = MagicMock(
+        return_value=[
+            ("client_id", "client2"),
+            ("reconnecting", "False"),
+        ]
+    )
+
+    for _ in data_servicer.Datapath(chain([init], Rendezvous()), context):
+        pass
+    for _ in logstream_servicer.Logstream(Rendezvous(), context):
+        pass
+
+    assert context.set_code.called, "grpc error should be set"
+    assert context.set_details.called, "grpc error should be set"
+
+
 if __name__ == "__main__":
     import sys
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

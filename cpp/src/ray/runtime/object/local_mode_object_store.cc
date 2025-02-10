@@ -26,13 +26,15 @@
 namespace ray {
 namespace internal {
 LocalModeObjectStore::LocalModeObjectStore(LocalModeRayRuntime &local_mode_ray_tuntime)
-    : local_mode_ray_tuntime_(local_mode_ray_tuntime) {
-  memory_store_ = std::make_unique<CoreWorkerMemoryStore>();
+    : io_context_("LocalModeObjectStore"),
+      local_mode_ray_tuntime_(local_mode_ray_tuntime) {
+  memory_store_ = std::make_unique<CoreWorkerMemoryStore>(io_context_.GetIoService());
 }
 
 void LocalModeObjectStore::PutRaw(std::shared_ptr<msgpack::sbuffer> data,
                                   ObjectID *object_id) {
-  PutRaw(data, (const ObjectID)(*object_id));
+  *object_id = ObjectID::FromRandom();
+  PutRaw(data, *object_id);
 }
 
 void LocalModeObjectStore::PutRaw(std::shared_ptr<msgpack::sbuffer> data,
@@ -58,9 +60,12 @@ std::shared_ptr<msgpack::sbuffer> LocalModeObjectStore::GetRaw(const ObjectID &o
 std::vector<std::shared_ptr<msgpack::sbuffer>> LocalModeObjectStore::GetRaw(
     const std::vector<ObjectID> &ids, int timeout_ms) {
   std::vector<std::shared_ptr<::ray::RayObject>> results;
-  ::ray::Status status =
-      memory_store_->Get(ids, (int)ids.size(), timeout_ms,
-                         local_mode_ray_tuntime_.GetWorkerContext(), false, &results);
+  ::ray::Status status = memory_store_->Get(ids,
+                                            (int)ids.size(),
+                                            timeout_ms,
+                                            local_mode_ray_tuntime_.GetWorkerContext(),
+                                            false,
+                                            &results);
   if (!status.ok()) {
     throw RayException("Get object error: " + status.ToString());
   }
@@ -78,15 +83,18 @@ std::vector<std::shared_ptr<msgpack::sbuffer>> LocalModeObjectStore::GetRaw(
 }
 
 std::vector<bool> LocalModeObjectStore::Wait(const std::vector<ObjectID> &ids,
-                                             int num_objects, int timeout_ms) {
+                                             int num_objects,
+                                             int timeout_ms) {
   absl::flat_hash_set<ObjectID> memory_object_ids;
   for (const auto &object_id : ids) {
     memory_object_ids.insert(object_id);
   }
   absl::flat_hash_set<ObjectID> ready;
-  ::ray::Status status =
-      memory_store_->Wait(memory_object_ids, num_objects, timeout_ms,
-                          local_mode_ray_tuntime_.GetWorkerContext(), &ready);
+  ::ray::Status status = memory_store_->Wait(memory_object_ids,
+                                             num_objects,
+                                             timeout_ms,
+                                             local_mode_ray_tuntime_.GetWorkerContext(),
+                                             &ready);
   if (!status.ok()) {
     throw RayException("Wait object error: " + status.ToString());
   }

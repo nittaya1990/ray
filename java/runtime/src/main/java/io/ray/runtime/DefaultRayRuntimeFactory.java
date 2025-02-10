@@ -6,6 +6,7 @@ import io.ray.runtime.config.RayConfig;
 import io.ray.runtime.config.RunMode;
 import io.ray.runtime.generated.Common.WorkerType;
 import io.ray.runtime.util.LoggingUtil;
+import io.ray.runtime.util.SystemConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -16,6 +17,7 @@ public class DefaultRayRuntimeFactory implements RayRuntimeFactory {
   public RayRuntime createRayRuntime() {
     RayConfig rayConfig = RayConfig.create();
     LoggingUtil.setupLogging(rayConfig);
+    SystemConfig.setup(rayConfig);
     Logger logger = LoggerFactory.getLogger(DefaultRayRuntimeFactory.class);
 
     if (rayConfig.workerMode == WorkerType.WORKER) {
@@ -28,14 +30,10 @@ public class DefaultRayRuntimeFactory implements RayRuntimeFactory {
 
     try {
       logger.debug("Initializing runtime with config: {}", rayConfig);
-      AbstractRayRuntime innerRuntime =
-          rayConfig.runMode == RunMode.SINGLE_PROCESS
+      AbstractRayRuntime runtime =
+          rayConfig.runMode == RunMode.LOCAL
               ? new RayDevRuntime(rayConfig)
               : new RayNativeRuntime(rayConfig);
-      RayRuntimeInternal runtime =
-          rayConfig.numWorkersPerProcess > 1
-              ? RayRuntimeProxy.newInstance(innerRuntime)
-              : innerRuntime;
       runtime.start();
       return runtime;
     } catch (Exception e) {

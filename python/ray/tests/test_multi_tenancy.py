@@ -235,9 +235,12 @@ ray.shutdown()
         info["address"]
     )
 
-    before = len(get_workers())
-    assert before == 1
+    def worker_registered():
+        return len(get_workers()) == 1
 
+    wait_for_condition(worker_registered)
+
+    before = 1
     run_string_as_driver(driver_code)
 
     # wait for a while to let workers register
@@ -323,4 +326,7 @@ def test_kill_idle_workers_that_are_behind_owned_workers(shutdown_only):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

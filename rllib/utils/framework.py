@@ -2,14 +2,107 @@ import logging
 import numpy as np
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
+import tree  # pip install dm_tree
+
+import ray
+from ray.rllib.utils.annotations import DeveloperAPI, PublicAPI
 from ray.rllib.utils.deprecation import Deprecated
-from ray.rllib.utils.typing import TensorShape, TensorType
+from ray.rllib.utils.typing import (
+    TensorShape,
+    TensorStructType,
+    TensorType,
+)
+
+if TYPE_CHECKING:
+    from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
 
 logger = logging.getLogger(__name__)
 
 
+@PublicAPI
+def convert_to_tensor(
+    data: TensorStructType,
+    framework: str,
+    device: Optional[str] = None,
+):
+    """Converts any nested numpy struct into framework-specific tensors.
+
+    Args:
+        data: The input data (numpy) to convert to framework-specific tensors.
+        framework: The framework to convert to. Only "torch" and "tf2" allowed.
+        device: An optional device name (for torch only).
+
+    Returns:
+        The converted tensor struct matching the input data.
+    """
+    if framework == "torch":
+        from ray.rllib.utils.torch_utils import convert_to_torch_tensor
+
+        return convert_to_torch_tensor(data, device=device)
+    elif framework == "tf2":
+        _, tf, _ = try_import_tf()
+
+        return tree.map_structure(lambda s: tf.convert_to_tensor(s), data)
+    raise NotImplementedError(
+        f"framework={framework} not supported in `convert_to_tensor()`!"
+    )
+
+
+@PublicAPI
+def get_device(config: "AlgorithmConfig", num_gpus_requested: int = 1):
+    """Returns a single device (CPU or some GPU) depending on a config.
+
+    Args:
+        config: An AlgorithmConfig to extract information from about the device to use.
+        num_gpus_requested: The number of GPUs actually requested. This may be the value
+            of `config.num_gpus_per_env_runner` when for example calling this function
+            from an EnvRunner.
+
+    Returns:
+        A single device (or name) given `config` and `num_gpus_requested`.
+    """
+    if config.framework_str == "torch":
+        torch, _ = try_import_torch()
+
+        # TODO (Kourosh): How do we handle model parallelism?
+        # TODO (Kourosh): Instead of using _TorchAccelerator, we should use the public
+        #  API in ray.train but allow for session to be None without any errors raised.
+        if num_gpus_requested > 0:
+            from ray.air._internal.torch_utils import get_devices
+
+            # `get_devices()` returns a list that contains the 0th device if
+            # it is called from outside a Ray Train session. It's necessary to give
+            # the user the option to run on the gpu of their choice, so we enable that
+            # option here through `config.local_gpu_idx`.
+            devices = get_devices()
+            # Note, if we have a single learner and we do not run on Ray Tune, the local
+            # learner is not an Ray actor and Ray does not manage devices for it.
+            if (
+                len(devices) == 1
+                and ray._private.worker._mode() == ray._private.worker.WORKER_MODE
+            ):
+                return devices[0]
+            else:
+                assert config.local_gpu_idx < torch.cuda.device_count(), (
+                    f"local_gpu_idx {config.local_gpu_idx} is not a valid GPU ID "
+                    "or is not available."
+                )
+                # This is an index into the available CUDA devices. For example, if
+                # `os.environ["CUDA_VISIBLE_DEVICES"] = "1"` then
+                # `torch.cuda.device_count() = 1` and torch.device(0) maps to that GPU
+                # with ID=1 on the node.
+                return torch.device(config.local_gpu_idx)
+        else:
+            return torch.device("cpu")
+    else:
+        raise NotImplementedError(
+            f"`framework_str` {config.framework_str} not supported!"
+        )
+
+
+@PublicAPI
 def try_import_jax(error: bool = False):
     """Tries importing JAX and FLAX and returns both modules (or Nones).
 
@@ -24,7 +117,7 @@ def try_import_jax(error: bool = False):
     """
     if "RLLIB_TEST_NO_JAX_IMPORT" in os.environ:
         logger.warning("Not importing JAX for test purposes.")
-        return None
+        return None, None
 
     try:
         import jax
@@ -41,6 +134,7 @@ def try_import_jax(error: bool = False):
     return jax, flax
 
 
+@PublicAPI
 def try_import_tf(error: bool = False):
     """Tries importing tf and returns the module (or None).
 
@@ -56,11 +150,12 @@ def try_import_tf(error: bool = False):
     Raises:
         ImportError: If error=True and tf is not installed.
     """
+    tf_stub = _TFStub()
     # Make sure, these are reset after each test case
     # that uses them: del os.environ["RLLIB_TEST_NO_TF_IMPORT"]
     if "RLLIB_TEST_NO_TF_IMPORT" in os.environ:
         logger.warning("Not importing TensorFlow for test purposes")
-        return None, None, None
+        return None, tf_stub, None
 
     if "TF_CPP_MIN_LOG_LEVEL" not in os.environ:
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -83,7 +178,7 @@ def try_import_tf(error: bool = False):
                     "install at least one deep-learning framework: "
                     "`pip install [torch|tensorflow|jax]`."
                 )
-            return None, None, None
+            return None, tf_stub, None
 
     # Try "reducing" tf to tf.compat.v1.
     try:
@@ -105,6 +200,29 @@ def try_import_tf(error: bool = False):
     return tf1_module, tf_module, version
 
 
+# Fake module for tf.
+class _TFStub:
+    def __init__(self) -> None:
+        self.keras = _KerasStub()
+
+    def __bool__(self):
+        # if tf should return False
+        return False
+
+
+# Fake module for tf.keras.
+class _KerasStub:
+    def __init__(self) -> None:
+        self.Model = _FakeTfClassStub
+
+
+# Fake classes under keras (e.g for tf.keras.Model)
+class _FakeTfClassStub:
+    def __init__(self, *a, **kw):
+        raise ImportError("Could not import `tensorflow`. Try pip install tensorflow.")
+
+
+@DeveloperAPI
 def tf_function(tf_module):
     """Conditional decorator for @tf.function.
 
@@ -121,6 +239,7 @@ def tf_function(tf_module):
     return decorator
 
 
+@PublicAPI
 def try_import_tfp(error: bool = False):
     """Tries importing tfp and returns the module (or None).
 
@@ -134,7 +253,7 @@ def try_import_tfp(error: bool = False):
         ImportError: If error=True and tfp is not installed.
     """
     if "RLLIB_TEST_NO_TF_IMPORT" in os.environ:
-        logger.warning("Not importing TensorFlow Probability for test " "purposes.")
+        logger.warning("Not importing TensorFlow Probability for test purposes.")
         return None
 
     try:
@@ -148,19 +267,27 @@ def try_import_tfp(error: bool = False):
 
 
 # Fake module for torch.nn.
-class NNStub:
+class _NNStub:
     def __init__(self, *a, **kw):
         # Fake nn.functional module within torch.nn.
         self.functional = None
-        self.Module = ModuleStub
+        self.Module = _FakeTorchClassStub
+        self.parallel = _ParallelStub()
 
 
-# Fake class for torch.nn.Module to allow it to be inherited from.
-class ModuleStub:
+# Fake class for e.g. torch.nn.Module to allow it to be inherited from.
+class _FakeTorchClassStub:
     def __init__(self, *a, **kw):
-        raise ImportError("Could not import `torch`.")
+        raise ImportError("Could not import `torch`. Try pip install torch.")
 
 
+class _ParallelStub:
+    def __init__(self, *a, **kw):
+        self.DataParallel = _FakeTorchClassStub
+        self.DistributedDataParallel = _FakeTorchClassStub
+
+
+@PublicAPI
 def try_import_torch(error: bool = False):
     """Tries importing torch and returns the module (or None).
 
@@ -193,10 +320,11 @@ def try_import_torch(error: bool = False):
 
 
 def _torch_stubs():
-    nn = NNStub()
+    nn = _NNStub()
     return None, nn
 
 
+@DeveloperAPI
 def get_variable(
     value: Any,
     framework: str = "tf",
@@ -232,7 +360,7 @@ def get_variable(
         A framework-specific variable (tf.Variable, torch.tensor, or
         python primitive).
     """
-    if framework in ["tf2", "tf", "tfe"]:
+    if framework in ["tf2", "tf"]:
         import tensorflow as tf
 
         dtype = dtype or getattr(
@@ -249,10 +377,12 @@ def get_variable(
             initializer=value,
             dtype=dtype,
             trainable=trainable,
-            **({} if shape is None else {"shape": shape})
+            **({} if shape is None else {"shape": shape}),
         )
     elif framework == "torch" and torch_tensor is True:
         torch, _ = try_import_torch()
+        if not isinstance(value, np.ndarray):
+            value = np.array(value)
         var_ = torch.from_numpy(value)
         if dtype in [torch.float32, np.float32]:
             var_ = var_.float()
@@ -272,55 +402,7 @@ def get_variable(
 @Deprecated(
     old="rllib/utils/framework.py::get_activation_fn",
     new="rllib/models/utils.py::get_activation_fn",
-    error=False,
+    error=True,
 )
 def get_activation_fn(name: Optional[str] = None, framework: str = "tf"):
-    """Returns a framework specific activation function, given a name string.
-
-    Args:
-        name (Optional[str]): One of "relu" (default), "tanh", "swish", or
-            "linear" or None.
-        framework (str): One of "tf" or "torch".
-
-    Returns:
-        A framework-specific activtion function. e.g. tf.nn.tanh or
-            torch.nn.ReLU. None if name in ["linear", None].
-
-    Raises:
-        ValueError: If name is an unknown activation function.
-    """
-    if framework == "torch":
-        if name in ["linear", None]:
-            return None
-        if name in ["swish", "silu"]:
-            from ray.rllib.utils.torch_utils import Swish
-
-            return Swish
-        _, nn = try_import_torch()
-        if name == "relu":
-            return nn.ReLU
-        elif name == "tanh":
-            return nn.Tanh
-    elif framework == "jax":
-        if name in ["linear", None]:
-            return None
-        jax, flax = try_import_jax()
-        if name == "swish":
-            return jax.nn.swish
-        if name == "relu":
-            return jax.nn.relu
-        elif name == "tanh":
-            return jax.nn.hard_tanh
-    else:
-        if name in ["linear", None]:
-            return None
-        if name == "swish":
-            name = "silu"
-        tf1, tf, tfv = try_import_tf()
-        fn = getattr(tf.nn, name, None)
-        if fn is not None:
-            return fn
-
-    raise ValueError(
-        "Unknown activation ({}) for framework={}!".format(name, framework)
-    )
+    pass

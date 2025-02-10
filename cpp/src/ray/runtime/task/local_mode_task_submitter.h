@@ -38,7 +38,7 @@ class LocalModeTaskSubmitter : public TaskSubmitter {
 
   ObjectID SubmitActorTask(InvocationSpec &invocation, const CallOptions &call_options);
 
-  ActorID GetActor(const std::string &actor_name) const;
+  ActorID GetActor(const std::string &actor_name, const std::string &ray_namespace) const;
 
   ray::PlacementGroup CreatePlacementGroup(
       const ray::PlacementGroupCreationOptions &create_options);
@@ -54,7 +54,8 @@ class LocalModeTaskSubmitter : public TaskSubmitter {
 
   absl::Mutex actor_contexts_mutex_;
 
-  std::unordered_map<std::string, ActorID> named_actors_ GUARDED_BY(named_actors_mutex_);
+  std::unordered_map<std::string, ActorID> named_actors_
+      ABSL_GUARDED_BY(named_actors_mutex_);
   mutable absl::Mutex named_actors_mutex_;
 
   std::unique_ptr<boost::asio::thread_pool> thread_pool_;

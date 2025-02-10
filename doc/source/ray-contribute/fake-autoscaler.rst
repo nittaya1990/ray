@@ -158,6 +158,16 @@ some limitations still remain:
 
 3. In docker-in-docker setups, a careful setup has to be followed to make the fake multinode docker provider work (see below).
 
+Shared directories within the docker environment
+------------------------------------------------
+The containers will mount two locations to host storage:
+
+- ``/cluster/node``: This location (in the container) will point to ``cluster_dir/nodes/<node_id>`` (on the host).
+  This location is individual per node, but it can be used so that the host can examine contents stored in this directory.
+- ``/cluster/shared``: This location (in the container) will point to ``cluster_dir/shared`` (on the host). This location
+  is shared across nodes and effectively acts as a shared filesystem (comparable to NFS).
+
+
 Setting up in a Docker-in-Docker (dind) environment
 ---------------------------------------------------
 When setting up in a Docker-in-Docker (dind) environment (e.g. the Ray OSS Buildkite environment), some
@@ -195,12 +205,12 @@ For the Ray OSS Buildkite environment, we thus set some environment variables:
 
 Lastly, docker-compose obviously requires a docker image. The default docker image is ``rayproject/ray:nightly``.
 The docker image requires ``openssh-server`` to be installed and enabled. In Buildkite we build a new image from
-``rayproject/ray:nightly-py37-cpu`` to avoid installing this on the fly for every node (which is the default way).
+``rayproject/ray:nightly-py38-cpu`` to avoid installing this on the fly for every node (which is the default way).
 This base image is built in one of the previous build steps.
 
 Thus, we set
 
-* ``RAY_DOCKER_IMAGE="rayproject/ray:multinode-py37"``
+* ``RAY_DOCKER_IMAGE="rayproject/ray:multinode-py38"``
 
 * ``RAY_HAS_SSH=1``
 
@@ -215,3 +225,10 @@ If you're doing local development on the fake multi node docker module, you can 
 
 this will mount the ``ray/python/ray/autoscaler`` directory to the started nodes. Please note that
 this is will probably not work in your docker-in-docker setup.
+
+If you want to to specify which top-level Ray directories to mount, you can use e.g.
+
+* ``FAKE_CLUSTER_DEV_MODULES="autoscaler,tune"``
+
+This will mount both ``ray/python/ray/autoscaler`` and ``ray/python/ray/tune`` within the node containers. The
+list of modules should be comma separated and without spaces.

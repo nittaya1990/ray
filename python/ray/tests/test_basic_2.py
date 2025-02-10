@@ -1,23 +1,22 @@
 # coding: utf-8
-import os
+import array
 import logging
+import os
+import random
+import subprocess
 import sys
+import tempfile
 import threading
 import time
-import tempfile
-import subprocess
-
-import numpy as np
-import pytest
-
 from unittest.mock import MagicMock, patch
 
-from ray.cluster_utils import Cluster, cluster_not_supported
+import pytest
+
+from ray._private.ray_constants import KV_NAMESPACE_FUNCTION_TABLE
 from ray._private.test_utils import client_test_enabled
+from ray.cluster_utils import Cluster, cluster_not_supported
+from ray.exceptions import GetTimeoutError, RayTaskError
 from ray.tests.client_test_utils import create_remote_signal_actor
-from ray.exceptions import GetTimeoutError
-from ray.exceptions import RayTaskError
-from ray.ray_constants import KV_NAMESPACE_FUNCTION_TABLE
 
 if client_test_enabled():
     from ray.util.client import ray
@@ -77,11 +76,10 @@ def test_defining_remote_functions(shutdown_only):
 
     # Test that we can close over plain old data.
     data = [
-        np.zeros([3, 5]),
         (1, 2, "a"),
         [0.0, 1.0, 1 << 62],
         1 << 60,
-        {"a": np.zeros(3)},
+        {"a": bytes(3)},
     ]
 
     @ray.remote
@@ -93,9 +91,9 @@ def test_defining_remote_functions(shutdown_only):
     # Test that we can close over modules.
     @ray.remote
     def h():
-        return np.zeros([3, 5])
+        return array.array("d", [1.0, 2.0, 3.0])
 
-    assert np.alltrue(ray.get(h.remote()) == np.zeros([3, 5]))
+    assert ray.get(h.remote()) == array.array("d", [1.0, 2.0, 3.0])
 
     @ray.remote
     def j():
@@ -187,7 +185,7 @@ def test_call_matrix(shutdown_only):
             return 0
 
         def large_value(self):
-            return np.zeros(10 * 1024 * 1024)
+            return bytes(80 * 1024 * 1024)
 
         def echo(self, x):
             if isinstance(x, list):
@@ -200,7 +198,7 @@ def test_call_matrix(shutdown_only):
 
     @ray.remote
     def large_value():
-        return np.zeros(10 * 1024 * 1024)
+        return bytes(80 * 1024 * 1024)
 
     @ray.remote
     def echo(x):
@@ -236,7 +234,7 @@ def test_call_matrix(shutdown_only):
         else:
             x = ray.get(echo.remote(x_id))
         if is_large:
-            assert isinstance(x, np.ndarray)
+            assert isinstance(x, bytes)
         else:
             assert isinstance(x, int)
 
@@ -252,7 +250,7 @@ def test_actor_call_order(shutdown_only):
 
     @ray.remote
     def small_value():
-        time.sleep(0.01 * np.random.randint(0, 10))
+        time.sleep(0.01 * random.randint(0, 10))
         return 0
 
     @ray.remote
@@ -347,10 +345,10 @@ def test_system_config_when_connecting(ray_start_cluster):
 
     # Check that the config was picked up (object pinning is disabled).
     ray.init(address=cluster.address)
-    obj_ref = ray.put(np.zeros(40 * 1024 * 1024, dtype=np.uint8))
+    obj_ref = ray.put(bytes(40 * 1024 * 1024))
 
     for _ in range(5):
-        put_ref = ray.put(np.zeros(40 * 1024 * 1024, dtype=np.uint8))
+        put_ref = ray.put(bytes(40 * 1024 * 1024))
     del put_ref
 
     ray.get(obj_ref)
@@ -361,7 +359,7 @@ def test_get_multiple(ray_start_regular_shared):
     assert ray.get(object_refs) == list(range(10))
 
     # Get a random choice of object refs with duplicates.
-    indices = list(np.random.choice(range(10), 5))
+    indices = [random.choice(range(10)) for i in range(5)]
     indices += indices
     results = ray.get([object_refs[i] for i in indices])
     assert results == indices
@@ -381,6 +379,14 @@ def test_get_with_timeout(ray_start_regular_shared):
     result_id = signal.wait.remote()
     with pytest.raises(GetTimeoutError):
         ray.get(result_id, timeout=0.1)
+
+    assert issubclass(GetTimeoutError, TimeoutError)
+    with pytest.raises(TimeoutError):
+        ray.get(result_id, timeout=0.1)
+
+    # timeout of 0 should raise an error
+    with pytest.raises(GetTimeoutError):
+        ray.get(result_id, timeout=0)
 
     # Check that a subsequent get() returns early.
     ray.get(signal.send.remote())
@@ -422,7 +428,7 @@ def test_call_actors_indirect_through_tasks(ray_start_regular_shared):
 def test_inline_arg_memory_corruption(ray_start_regular_shared):
     @ray.remote
     def f():
-        return np.zeros(1000, dtype=np.uint8)
+        return bytes(1000)
 
     @ray.remote
     class Actor:
@@ -432,7 +438,7 @@ def test_inline_arg_memory_corruption(ray_start_regular_shared):
         def add(self, x):
             self.z.append(x)
             for prev in self.z:
-                assert np.sum(prev) == 0, ("memory corruption detected", prev)
+                assert sum(prev) == 0, ("memory corruption detected", prev)
 
     a = Actor.remote()
     for i in range(100):
@@ -452,7 +458,7 @@ def test_skip_plasma(ray_start_regular_shared):
     a = Actor.remote()
     obj_ref = a.f.remote(1)
     # it is not stored in plasma
-    assert not ray.worker.global_worker.core_worker.object_exists(obj_ref)
+    assert not ray._private.worker.global_worker.core_worker.object_exists(obj_ref)
     assert ray.get(obj_ref) == 2
 
 
@@ -465,15 +471,15 @@ def test_actor_large_objects(ray_start_regular_shared):
 
         def f(self):
             time.sleep(1)
-            return np.zeros(10000000)
+            return bytes(80000000)
 
     a = Actor.remote()
     obj_ref = a.f.remote()
-    assert not ray.worker.global_worker.core_worker.object_exists(obj_ref)
+    assert not ray._private.worker.global_worker.core_worker.object_exists(obj_ref)
     done, _ = ray.wait([obj_ref])
     assert len(done) == 1
-    assert ray.worker.global_worker.core_worker.object_exists(obj_ref)
-    assert isinstance(ray.get(obj_ref), np.ndarray)
+    assert ray._private.worker.global_worker.core_worker.object_exists(obj_ref)
+    assert isinstance(ray.get(obj_ref), bytes)
 
 
 def test_actor_pass_by_ref(ray_start_regular_shared):
@@ -651,10 +657,35 @@ def test_duplicate_args(ray_start_regular_shared):
     arg2 = ray.put([2])
     ray.get(f.remote(arg1, arg2, arg1, kwarg1=arg1, kwarg2=arg2, kwarg1_duplicate=arg1))
 
+    # Test by-reference arguments on an actor task.
+    @ray.remote
+    class Actor:
+        def f(
+            self,
+            arg1,
+            arg2,
+            arg1_duplicate,
+            kwarg1=None,
+            kwarg2=None,
+            kwarg1_duplicate=None,
+        ):
+            assert arg1 == kwarg1
+            assert arg1 != arg2
+            assert arg1 == arg1_duplicate
+            assert kwarg1 != kwarg2
+            assert kwarg1 == kwarg1_duplicate
+
+    actor = Actor.remote()
+    ray.get(
+        actor.f.remote(
+            arg1, arg2, arg1, kwarg1=arg1, kwarg2=arg2, kwarg1_duplicate=arg1
+        )
+    )
+
 
 @pytest.mark.skipif(client_test_enabled(), reason="internal api")
 def test_get_correct_node_ip():
-    with patch("ray.worker") as worker_mock:
+    with patch("ray._private.worker") as worker_mock:
         node_mock = MagicMock()
         node_mock.node_ip_address = "10.0.0.111"
         worker_mock._global_node = node_mock
@@ -696,8 +727,47 @@ if __name__ == "__main__":
         test_driver = os.path.join(tmpdir, "test_load_code_from_local.py")
         with open(test_driver, "w") as f:
             f.write(code_test.format(repr(ray_start_regular_shared["address"])))
-        output = subprocess.check_output([sys.executable, test_driver])
-        assert b"OK" in output
+
+        # Ray's handling of sys.path does not work with PYTHONSAFEPATH.
+        env = os.environ.copy()
+        if env.get("PYTHONSAFEPATH", "") != "":
+            env["PYTHONSAFEPATH"] = ""  # Set to empty string to disable.
+        output = subprocess.check_output([sys.executable, test_driver], env=env)
+        assert b"OK" in output, f"Output has no 'OK': {output.decode()}"
+
+
+def test_load_from_local_function(ray_start_regular_shared):
+    code_test = """
+import ray
+import os
+
+@ray.remote
+def wrapped_func():
+    return "OK"
+def normal_func():
+    return "OK"
+if __name__ == "__main__":
+    current_path = os.path.dirname(__file__)
+    job_config = ray.job_config.JobConfig(code_search_path=[current_path])
+    ray.init({}, job_config=job_config)
+    res1 = wrapped_func.remote()
+    wrapped_normal_func = ray.remote(normal_func)
+    res2 = wrapped_normal_func.remote()
+    s1 = ray.get(res1)
+    s2 = ray.get(res2)
+    print(s1+"+"+s2)
+"""
+
+    # Test code search path contains space.
+    with tempfile.TemporaryDirectory(suffix="a b") as tmpdir:
+        test_driver = os.path.join(tmpdir, "test_load_code_from_local.py")
+        with open(test_driver, "w") as f:
+            f.write(code_test.format(repr(ray_start_regular_shared["address"])))
+        env = os.environ.copy()
+        if env.get("PYTHONSAFEPATH", "") != "":
+            env["PYTHONSAFEPATH"] = ""  # Set to empty string to disable.
+        output = subprocess.check_output([sys.executable, test_driver], env=env)
+        assert b"OK+OK" in output, f"Output has no 'OK+OK': {output.decode()}"
 
 
 @pytest.mark.skipif(
@@ -732,11 +802,11 @@ def test_use_dynamic_function_and_class():
     # the same as in `FunctionActorManager.export`.
     key_func = (
         b"RemoteFunction:"
-        + ray.worker.global_worker.current_job_id.hex().encode()
+        + ray._private.worker.global_worker.current_job_id.hex().encode()
         + b":"
         + f._function_descriptor.function_id.binary()
     )
-    assert ray.worker.global_worker.gcs_client.internal_kv_exists(
+    assert ray._private.worker.global_worker.gcs_client.internal_kv_exists(
         key_func, KV_NAMESPACE_FUNCTION_TABLE
     )
     foo_actor = Foo.remote()
@@ -747,11 +817,11 @@ def test_use_dynamic_function_and_class():
     # the same as in `FunctionActorManager.export_actor_class`.
     key_cls = (
         b"ActorClass:"
-        + ray.worker.global_worker.current_job_id.hex().encode()
+        + ray._private.worker.global_worker.current_job_id.hex().encode()
         + b":"
         + foo_actor._ray_actor_creation_function_descriptor.function_id.binary()
     )
-    assert ray.worker.global_worker.gcs_client.internal_kv_exists(
+    assert ray._private.worker.global_worker.gcs_client.internal_kv_exists(
         key_cls, namespace=KV_NAMESPACE_FUNCTION_TABLE
     )
 
@@ -760,4 +830,7 @@ if __name__ == "__main__":
     import pytest
 
     # Skip test_basic_2_client_mode for now- the test suite is breaking.
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

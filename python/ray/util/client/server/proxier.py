@@ -1,43 +1,44 @@
 import atexit
-from concurrent import futures
-from dataclasses import dataclass
-import grpc
-import logging
-from itertools import chain
 import json
+import logging
 import socket
 import sys
-from threading import Event, Lock, Thread, RLock
 import time
 import traceback
+from concurrent import futures
+from dataclasses import dataclass
+from itertools import chain
+import urllib
+from threading import Event, Lock, RLock, Thread
 from typing import Callable, Dict, List, Optional, Tuple
 
+import grpc
+
+# Import psutil after ray so the packaged version is used.
+import psutil
+
 import ray
-from ray.cloudpickle.compat import pickle
-from ray.job_config import JobConfig
 import ray.core.generated.agent_manager_pb2 as agent_manager_pb2
 import ray.core.generated.ray_client_pb2 as ray_client_pb2
 import ray.core.generated.ray_client_pb2_grpc as ray_client_pb2_grpc
 import ray.core.generated.runtime_env_agent_pb2 as runtime_env_agent_pb2
-import ray.core.generated.runtime_env_agent_pb2_grpc as runtime_env_agent_pb2_grpc  # noqa: E501
-from ray.util.client.common import (
-    _get_client_id_from_context,
-    ClientServerHandle,
-    CLIENT_SERVER_MAX_THREADS,
-    GRPC_OPTIONS,
-    _propagate_error_in_context,
-)
-from ray.util.client.server.dataservicer import _get_reconnecting_from_context
 from ray._private.client_mode_hook import disable_client_hook
+from ray._raylet import GcsClient
 from ray._private.parameter import RayParams
 from ray._private.runtime_env.context import RuntimeEnvContext
 from ray._private.services import ProcessInfo, start_ray_client_server
 from ray._private.tls_utils import add_port_to_grpc_server
-from ray._private.gcs_utils import GcsClient, use_gcs_for_bootstrap
 from ray._private.utils import detect_fate_sharing_support
-
-# Import psutil after ray so the packaged version is used.
-import psutil
+from ray.cloudpickle.compat import pickle
+from ray.job_config import JobConfig
+from ray.util.client.common import (
+    CLIENT_SERVER_MAX_THREADS,
+    GRPC_OPTIONS,
+    ClientServerHandle,
+    _get_client_id_from_context,
+    _propagate_error_in_context,
+)
+from ray.util.client.server.dataservicer import _get_reconnecting_from_context
 
 logger = logging.getLogger(__name__)
 
@@ -113,33 +114,29 @@ class ProxyManager:
     def __init__(
         self,
         address: Optional[str],
+        runtime_env_agent_address: str,
         *,
         session_dir: Optional[str] = None,
+        redis_username: Optional[str] = None,
         redis_password: Optional[str] = None,
         runtime_env_agent_port: int = 0,
     ):
         self.servers: Dict[str, SpecificServer] = dict()
         self.server_lock = RLock()
         self._address = address
+        self._redis_username = redis_username
         self._redis_password = redis_password
         self._free_ports: List[int] = list(
             range(MIN_SPECIFIC_SERVER_PORT, MAX_SPECIFIC_SERVER_PORT)
         )
 
-        self._runtime_env_channel = ray._private.utils.init_grpc_channel(
-            f"127.0.0.1:{runtime_env_agent_port}"
-        )
-        self._runtime_env_stub = (
-            runtime_env_agent_pb2_grpc.RuntimeEnvServiceStub(  # noqa: E501
-                self._runtime_env_channel
-            )
-        )
+        self._runtime_env_agent_address = runtime_env_agent_address
 
         self._check_thread = Thread(target=self._check_processes, daemon=True)
         self._check_thread.start()
 
         self.fate_share = bool(detect_fate_sharing_support())
-        self._node: Optional[ray.node.Node] = None
+        self._node: Optional[ray._private.node.Node] = None
         atexit.register(self._cleanup)
 
     def _get_unused_port(self) -> int:
@@ -175,21 +172,16 @@ class ProxyManager:
         return self._address
 
     @property
-    def node(self) -> ray.node.Node:
+    def node(self) -> ray._private.node.Node:
         """Gets a 'ray.Node' object for this node (the head node).
         If it does not already exist, one is created using the bootstrap
         address.
         """
         if self._node:
             return self._node
-        if use_gcs_for_bootstrap():
-            ray_params = RayParams(gcs_address=self.address)
-        else:
-            ray_params = RayParams(redis_address=self.address)
-            if self._redis_password:
-                ray_params.redis_password = self._redis_password
+        ray_params = RayParams(gcs_address=self.address)
 
-        self._node = ray.node.Node(
+        self._node = ray._private.node.Node(
             ray_params,
             head=False,
             shutdown_at_exit=False,
@@ -220,24 +212,50 @@ class ProxyManager:
             return server
 
     def _create_runtime_env(
-        self, serialized_runtime_env: str, specific_server: SpecificServer
+        self,
+        serialized_runtime_env: str,
+        runtime_env_config: str,
+        specific_server: SpecificServer,
     ):
-        """Creates the runtime_env by sending an RPC to the agent.
+        """Increase the runtime_env reference by sending an RPC to the agent.
 
         Includes retry logic to handle the case when the agent is
         temporarily unreachable (e.g., hasn't been started up yet).
         """
-        create_env_request = runtime_env_agent_pb2.CreateRuntimeEnvRequest(
+        logger.info(
+            f"Increasing runtime env reference for "
+            f"ray_client_server_{specific_server.port}."
+            f"Serialized runtime env is {serialized_runtime_env}."
+        )
+
+        assert (
+            len(self._runtime_env_agent_address) > 0
+        ), "runtime_env_agent_address not set"
+
+        create_env_request = runtime_env_agent_pb2.GetOrCreateRuntimeEnvRequest(
             serialized_runtime_env=serialized_runtime_env,
+            runtime_env_config=runtime_env_config,
             job_id=f"ray_client_server_{specific_server.port}".encode("utf-8"),
+            source_process="client_server",
         )
 
         retries = 0
         max_retries = 5
         wait_time_s = 0.5
+        last_exception = None
         while retries <= max_retries:
             try:
-                r = self._runtime_env_stub.CreateRuntimeEnv(create_env_request)
+                url = urllib.parse.urljoin(
+                    self._runtime_env_agent_address, "/get_or_create_runtime_env"
+                )
+                data = create_env_request.SerializeToString()
+                req = urllib.request.Request(url, data=data, method="POST")
+                req.add_header("Content-Type", "application/octet-stream")
+                response = urllib.request.urlopen(req, timeout=None)
+                response_data = response.read()
+                r = runtime_env_agent_pb2.GetOrCreateRuntimeEnvReply()
+                r.ParseFromString(response_data)
+
                 if r.status == agent_manager_pb2.AgentRpcStatus.AGENT_RPC_STATUS_OK:
                     return r.serialized_runtime_env_context
                 elif (
@@ -249,19 +267,10 @@ class ProxyManager:
                     )
                 else:
                     assert False, f"Unknown status: {r.status}."
-            except grpc.RpcError as e:
-                # Whitelist of errors we consider transient.
-                # NOTE(edoakes): we can get UNIMPLEMENTED while the server
-                # starts up because the agent runs multiple gRPC services
-                # on the same port.
-                if e.code() not in [
-                    grpc.StatusCode.UNAVAILABLE,
-                    grpc.StatusCode.UNIMPLEMENTED,
-                ]:
-                    raise e
-
+            except urllib.error.URLError as e:
+                last_exception = e
                 logger.warning(
-                    f"CreateRuntimeEnv request failed: {e}. "
+                    f"GetOrCreateRuntimeEnv request failed: {e}. "
                     f"Retrying after {wait_time_s}s. "
                     f"{max_retries-retries} retries remaining."
                 )
@@ -272,7 +281,8 @@ class ProxyManager:
             wait_time_s *= 2
 
         raise TimeoutError(
-            f"CreateRuntimeEnv request failed after {max_retries} attempts."
+            f"GetOrCreateRuntimeEnv request failed after {max_retries} attempts."
+            f" Last exception: {last_exception}"
         )
 
     def start_specific_server(self, client_id: str, job_config: JobConfig) -> bool:
@@ -287,7 +297,8 @@ class ProxyManager:
             f"ray_client_server_{specific_server.port}", unique=True
         )
 
-        serialized_runtime_env = job_config.get_serialized_runtime_env()
+        serialized_runtime_env = job_config._get_serialized_runtime_env()
+        runtime_env_config = job_config._get_proto_runtime_env_config()
         if not serialized_runtime_env or serialized_runtime_env == "{}":
             # TODO(edoakes): can we just remove this case and always send it
             # to the agent?
@@ -295,6 +306,7 @@ class ProxyManager:
         else:
             serialized_runtime_env_context = self._create_runtime_env(
                 serialized_runtime_env=serialized_runtime_env,
+                runtime_env_config=runtime_env_config,
                 specific_server=specific_server,
             )
 
@@ -307,6 +319,7 @@ class ProxyManager:
             fate_share=self.fate_share,
             server_type="specific-server",
             serialized_runtime_env_context=serialized_runtime_env_context,
+            redis_username=self._redis_username,
             redis_password=self._redis_password,
         )
 
@@ -474,7 +487,7 @@ class RayletServicerProxy(ray_client_pb2_grpc.RayletDriverServicer):
         Otherwise, we proxy the call to the downstream server as usual.
         """
         if self._has_channel_for_request(context):
-            return self._call_inner_function(request, context, "KVGet")
+            return self._call_inner_function(request, context, "KVDel")
 
         with disable_client_hook():
             ray.experimental.internal_kv._internal_kv_del(request.key)
@@ -512,6 +525,26 @@ class RayletServicerProxy(ray_client_pb2_grpc.RayletDriverServicer):
             exists = ray.experimental.internal_kv._internal_kv_exists(request.key)
         return ray_client_pb2.KVExistsResponse(exists=exists)
 
+    def PinRuntimeEnvURI(
+        self, request, context=None
+    ) -> ray_client_pb2.ClientPinRuntimeEnvURIResponse:
+        """Proxies internal_kv.pin_runtime_env_uri.
+
+        This is used by the working_dir code to upload to the GCS before
+        ray.init is called. In that case (if we don't have a server yet)
+        we directly make the internal KV call from the proxier.
+
+        Otherwise, we proxy the call to the downstream server as usual.
+        """
+        if self._has_channel_for_request(context):
+            return self._call_inner_function(request, context, "PinRuntimeEnvURI")
+
+        with disable_client_hook():
+            ray.experimental.internal_kv._pin_runtime_env_uri(
+                request.uri, expiration_s=request.expiration_s
+            )
+        return ray_client_pb2.ClientPinRuntimeEnvURIResponse()
+
     def ListNamedActors(
         self, request, context=None
     ) -> ray_client_pb2.ClientListNamedActorsResponse:
@@ -530,7 +563,12 @@ class RayletServicerProxy(ray_client_pb2_grpc.RayletDriverServicer):
         return self._call_inner_function(req, context, "Terminate")
 
     def GetObject(self, request, context=None):
-        return self._call_inner_function(request, context, "GetObject")
+        try:
+            yield from self._call_inner_function(request, context, "GetObject")
+        except Exception as e:
+            # Error while iterating over response from GetObject stream
+            logger.exception("Proxying call to GetObject failed!")
+            _propagate_error_in_context(e, context)
 
     def PutObject(
         self, request: ray_client_pb2.PutRequest, context=None
@@ -574,6 +612,30 @@ def prepare_runtime_init_req(
     return (init_request, new_job_config)
 
 
+class RequestIteratorProxy:
+    def __init__(self, request_iterator):
+        self.request_iterator = request_iterator
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self.request_iterator)
+        except grpc.RpcError as e:
+            # To stop proxying already CANCLLED request stream gracefully,
+            # we only translate the exact grpc.RpcError to StopIteration,
+            # not its subsclasses. ex: grpc._Rendezvous
+            # https://github.com/grpc/grpc/blob/v1.43.0/src/python/grpcio/grpc/_server.py#L353-L354
+            # This fixes the https://github.com/ray-project/ray/issues/23865
+            if type(e) is not grpc.RpcError:
+                raise e  # re-raise other grpc exceptions
+            logger.exception(
+                "Stop iterating cancelled request stream with the following exception:"
+            )
+            raise StopIteration
+
+
 class DataServicerProxy(ray_client_pb2_grpc.RayletDataStreamerServicer):
     def __init__(self, proxy_manager: ProxyManager):
         self.num_clients = 0
@@ -601,6 +663,7 @@ class DataServicerProxy(ray_client_pb2_grpc.RayletDataStreamerServicer):
         return modified_resp
 
     def Datapath(self, request_iterator, context):
+        request_iterator = RequestIteratorProxy(request_iterator)
         cleanup_requested = False
         start_time = time.time()
         client_id = _get_client_id_from_context(context)
@@ -727,6 +790,7 @@ class LogstreamServicerProxy(ray_client_pb2_grpc.RayletLogStreamerServicer):
         self.proxy_manager = proxy_manager
 
     def Logstream(self, request_iterator, context):
+        request_iterator = RequestIteratorProxy(request_iterator)
         client_id = _get_client_id_from_context(context)
         if client_id == "":
             return
@@ -767,22 +831,18 @@ def serve_proxier(
     connection_str: str,
     address: Optional[str],
     *,
+    redis_username: Optional[str] = None,
     redis_password: Optional[str] = None,
     session_dir: Optional[str] = None,
-    runtime_env_agent_port: int = 0,
+    runtime_env_agent_address: Optional[str] = None,
 ):
     # Initialize internal KV to be used to upload and download working_dir
     # before calling ray.init within the RayletServicers.
     # NOTE(edoakes): redis_address and redis_password should only be None in
     # tests.
-    if use_gcs_for_bootstrap():
-        if address is not None:
-            gcs_cli = GcsClient(address=address)
-            ray.experimental.internal_kv._initialize_internal_kv(gcs_cli)
-    else:
-        if address is not None and redis_password is not None:
-            gcs_cli = GcsClient.connect_to_gcs_by_redis_address(address, redis_password)
-            ray.experimental.internal_kv._initialize_internal_kv(gcs_cli)
+    if address is not None:
+        gcs_cli = GcsClient(address=address)
+        ray.experimental.internal_kv._initialize_internal_kv(gcs_cli)
 
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=CLIENT_SERVER_MAX_THREADS),
@@ -791,8 +851,9 @@ def serve_proxier(
     proxy_manager = ProxyManager(
         address,
         session_dir=session_dir,
+        redis_username=redis_username,
         redis_password=redis_password,
-        runtime_env_agent_port=runtime_env_agent_port,
+        runtime_env_agent_address=runtime_env_agent_address,
     )
     task_servicer = RayletServicerProxy(None, proxy_manager)
     data_servicer = DataServicerProxy(proxy_manager)

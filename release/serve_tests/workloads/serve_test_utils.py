@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import logging
 import os
 import random
 import ray
@@ -8,9 +9,17 @@ import subprocess
 from collections import defaultdict
 
 from serve_test_cluster_utils import NUM_CPU_PER_NODE
-from ray.serve.utils import logger
 from subprocess import PIPE
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
+
+logger = logging.getLogger(__file__)
+
+
+DEFAULT_RELEASE_OUTPUT_PATH = "/tmp/release_test_out.json"
+
+
+def is_smoke_test():
+    return os.environ.get("IS_SMOKE_TEST", "0") == "1"
 
 
 def parse_time_to_ms(time_string: str) -> float:
@@ -255,6 +264,9 @@ def run_wrk_on_all_nodes(
     http_host: str,
     http_port: str,
     all_endpoints: List[str] = None,
+    ignore_output: bool = False,
+    exclude_head: bool = False,
+    debug: bool = False,
 ):
     """
     Use ray task to run one wrk trial on each node alive, picked randomly
@@ -270,6 +282,9 @@ def run_wrk_on_all_nodes(
     all_wrk_stdout = []
     rst_ray_refs = []
     for node in ray.nodes():
+        if exclude_head and node["Resources"].get("node:__internal_head__") == 1.0:
+            continue
+
         if node["Alive"]:
             node_resource = f"node:{node['NodeManagerAddress']}"
             # Randomly pick one from all available endpoints in ray cluster
@@ -279,7 +294,17 @@ def run_wrk_on_all_nodes(
                     num_cpus=0, resources={node_resource: 0.01}
                 ).remote(trial_length, num_connections, http_host, http_port, endpoint)
             )
-    for decoded_output in ray.get(rst_ray_refs):
+
+    print("Waiting for wrk trials to finish...")
+    ray.wait(rst_ray_refs, num_returns=len(rst_ray_refs))
+    print("Trials finished!")
+
+    if ignore_output:
+        return
+
+    for i, decoded_output in enumerate(ray.get(rst_ray_refs)):
+        if debug:
+            print(f"decoded_output {i}: {decoded_output}")
         all_wrk_stdout.append(decoded_output)
         parsed_metrics = parse_wrk_decoded_stdout(decoded_output)
 
@@ -317,7 +342,12 @@ def run_wrk_on_all_nodes(
     return all_metrics, all_wrk_stdout
 
 
-def save_test_results(final_result, default_output_file="/tmp/release_test_out.json"):
-    test_output_json = os.environ.get("TEST_OUTPUT_JSON", default_output_file)
-    with open(test_output_json, "wt") as f:
-        json.dump(final_result, f)
+def save_test_results(
+    test_results: Dict,
+    output_path: Optional[str] = None,
+):
+    results_file_path = output_path or os.environ.get(
+        "TEST_OUTPUT_JSON", DEFAULT_RELEASE_OUTPUT_PATH
+    )
+    with open(results_file_path, "wt") as f:
+        json.dump(test_results, f)

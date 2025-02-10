@@ -50,7 +50,7 @@ class TestGC:
         for i in range(5):
             assert not check_local_files_gced(cluster)
             ray.kill(actors[i])
-        wait_for_condition(lambda: check_local_files_gced(cluster))
+        wait_for_condition(lambda: check_local_files_gced(cluster), timeout=30)
 
     @pytest.mark.skipif(
         os.environ.get("CI") and sys.platform != "linux",
@@ -162,7 +162,7 @@ def skip_local_gc():
 class TestSkipLocalGC:
     @pytest.mark.skipif(
         os.environ.get("CI") and sys.platform != "linux",
-        reason="Requires PR wheels built in CI, so only run on linux CI " "machines.",
+        reason="Requires PR wheels built in CI, so only run on linux CI machines.",
     )
     @pytest.mark.parametrize("field", ["conda", "pip"])
     def test_skip_local_gc_env_var(self, skip_local_gc, start_cluster, field, tmp_path):
@@ -188,4 +188,7 @@ class TestSkipLocalGC:
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-sv", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

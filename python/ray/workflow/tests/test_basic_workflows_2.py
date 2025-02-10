@@ -1,35 +1,10 @@
-import os
 import pytest
 import ray
-import re
 from filelock import FileLock
-from ray._private.test_utils import run_string_as_driver, SignalActor
+from ray._private.test_utils import SignalActor
 from ray import workflow
 from ray.tests.conftest import *  # noqa
-from unittest.mock import patch
-
-
-def test_init_twice(call_ray_start, reset_workflow, tmp_path):
-    workflow.init()
-    with pytest.raises(RuntimeError):
-        workflow.init(str(tmp_path))
-
-
-driver_script = """
-from ray import workflow
-
-if __name__ == "__main__":
-    workflow.init()
-"""
-
-
-def test_init_twice_2(call_ray_start, reset_workflow, tmp_path):
-    with patch.dict(os.environ, {"RAY_ADDRESS": call_ray_start}):
-        run_string_as_driver(driver_script)
-        with pytest.raises(
-            RuntimeError, match=".*different from the workflow manager.*"
-        ):
-            workflow.init(str(tmp_path))
+from ray._private.test_utils import skip_flaky_core_test_premerge
 
 
 @pytest.mark.parametrize(
@@ -41,14 +16,14 @@ def test_init_twice_2(call_ray_start, reset_workflow, tmp_path):
     ],
     indirect=True,
 )
-def test_step_resources(workflow_start_regular, tmp_path):
+def test_task_resources(workflow_start_regular, tmp_path):
     lock_path = str(tmp_path / "lock")
     # We use signal actor here because we can't guarantee the order of tasks
     # sent from worker to raylet.
     signal_actor = SignalActor.remote()
 
-    @workflow.step
-    def step_run():
+    @ray.remote
+    def task_run():
         ray.wait([signal_actor.send.remote()])
         with FileLock(lock_path):
             return None
@@ -59,7 +34,7 @@ def test_step_resources(workflow_start_regular, tmp_path):
 
     lock = FileLock(lock_path)
     lock.acquire()
-    ret = step_run.options(num_cpus=2).step().run_async()
+    ret = workflow.run_async(task_run.options(num_cpus=2).bind())
     ray.wait([signal_actor.wait.remote()])
     obj = remote_run.remote()
     with pytest.raises(ray.exceptions.GetTimeoutError):
@@ -70,26 +45,26 @@ def test_step_resources(workflow_start_regular, tmp_path):
 
 
 def test_get_output_1(workflow_start_regular, tmp_path):
-    @workflow.step
+    @ray.remote
     def simple(v):
         return v
 
-    assert 0 == simple.step(0).run("simple")
-    assert 0 == ray.get(workflow.get_output("simple"))
+    assert 0 == workflow.run(simple.bind(0), workflow_id="simple")
+    assert 0 == workflow.get_output("simple")
 
 
 def test_get_output_2(workflow_start_regular, tmp_path):
     lock_path = str(tmp_path / "lock")
     lock = FileLock(lock_path)
 
-    @workflow.step
+    @ray.remote
     def simple(v):
         with FileLock(lock_path):
             return v
 
     lock.acquire()
-    obj = simple.step(0).run_async("simple")
-    obj2 = workflow.get_output("simple")
+    obj = workflow.run_async(simple.bind(0), workflow_id="simple")
+    obj2 = workflow.get_output_async("simple")
     lock.release()
     assert ray.get([obj, obj2]) == [0, 0]
 
@@ -100,7 +75,7 @@ def test_get_output_3(workflow_start_regular, tmp_path):
     error_flag = tmp_path / "error"
     error_flag.touch()
 
-    @workflow.step
+    @ray.remote
     def incr():
         v = int(cnt_file.read_text())
         cnt_file.write_text(str(v + 1))
@@ -108,36 +83,153 @@ def test_get_output_3(workflow_start_regular, tmp_path):
             raise ValueError()
         return 10
 
-    with pytest.raises(ray.exceptions.RaySystemError):
-        incr.options(max_retries=1).step().run("incr")
+    with pytest.raises(workflow.WorkflowExecutionError):
+        workflow.run(incr.options(max_retries=0).bind(), workflow_id="incr")
 
     assert cnt_file.read_text() == "1"
 
-    with pytest.raises(ray.exceptions.RaySystemError):
-        ray.get(workflow.get_output("incr"))
+    from ray.exceptions import RaySystemError
+
+    # TODO(suquark): We should prevent Ray from raising "RaySystemError",
+    #   in workflow, because "RaySystemError" does not inherit the underlying
+    #   error, so users and developers cannot catch the expected error.
+    #   I feel this issue is a very annoying.
+    with pytest.raises((RaySystemError, ValueError)):
+        workflow.get_output("incr")
 
     assert cnt_file.read_text() == "1"
     error_flag.unlink()
-    with pytest.raises(ray.exceptions.RaySystemError):
-        ray.get(workflow.get_output("incr"))
-    assert ray.get(workflow.resume("incr")) == 10
+    with pytest.raises((RaySystemError, ValueError)):
+        workflow.get_output("incr")
+    assert workflow.resume("incr") == 10
 
 
-def test_get_named_step_output_finished(workflow_start_regular, tmp_path):
-    @workflow.step
+def test_get_output_4(workflow_start_regular, tmp_path):
+    """Test getting output of a workflow tasks that are dynamically generated."""
+    lock_path = str(tmp_path / "lock")
+    lock = FileLock(lock_path)
+
+    @ray.remote
+    def recursive(n):
+        if n <= 0:
+            with FileLock(lock_path):
+                return 42
+        return workflow.continuation(
+            recursive.options(**workflow.options(task_id=str(n - 1))).bind(n - 1)
+        )
+
+    workflow_id = "test_get_output_4"
+    lock.acquire()
+    obj = workflow.run_async(
+        recursive.options(**workflow.options(task_id="10")).bind(10),
+        workflow_id=workflow_id,
+    )
+
+    outputs = [
+        workflow.get_output_async(workflow_id, task_id=str(i)) for i in range(11)
+    ]
+    outputs.append(obj)
+
+    import time
+
+    # wait so that 'get_output' is scheduled before executing the workflow
+    time.sleep(3)
+    lock.release()
+    assert ray.get(outputs) == [42] * len(outputs)
+
+
+def test_get_output_5(workflow_start_regular, tmp_path):
+    """Test getting output of a workflow task immediately after executing it
+    asynchronously."""
+
+    @ray.remote
+    def simple():
+        return 314
+
+    workflow_id = "test_get_output_5_{}"
+
+    outputs = []
+    for i in range(20):
+        workflow.run_async(simple.bind(), workflow_id=workflow_id.format(i))
+        outputs.append(workflow.get_output_async(workflow_id.format(i)))
+
+    assert ray.get(outputs) == [314] * len(outputs)
+
+
+@skip_flaky_core_test_premerge("https://github.com/ray-project/ray/issues/41511")
+def test_output_with_name(workflow_start_regular):
+    @ray.remote
     def double(v):
         return 2 * v
 
-    # Get the result from named step after workflow finished
-    assert 4 == double.options(name="outer").step(
-        double.options(name="inner").step(1)
-    ).run("double")
-    assert ray.get(workflow.get_output("double", name="inner")) == 2
-    assert ray.get(workflow.get_output("double", name="outer")) == 4
+    inner_task = double.options(**workflow.options(task_id="inner")).bind(1)
+    outer_task = double.options(**workflow.options(task_id="outer")).bind(inner_task)
+    result = workflow.run_async(outer_task, workflow_id="double")
+    inner = workflow.get_output_async("double", task_id="inner")
+    outer = workflow.get_output_async("double", task_id="outer")
+
+    assert ray.get(inner) == 2
+    assert ray.get(outer) == 4
+    assert ray.get(result) == 4
+
+    @workflow.options(task_id="double")
+    @ray.remote
+    def double_2(s):
+        return s * 2
+
+    inner_task = double_2.bind(1)
+    outer_task = double_2.bind(inner_task)
+    workflow_id = "double_2"
+    result = workflow.run_async(outer_task, workflow_id=workflow_id)
+
+    inner = workflow.get_output_async(workflow_id, task_id="double")
+    outer = workflow.get_output_async(workflow_id, task_id="double_1")
+
+    assert ray.get(inner) == 2
+    assert ray.get(outer) == 4
+    assert ray.get(result) == 4
 
 
-def test_get_named_step_output_running(workflow_start_regular, tmp_path):
-    @workflow.step
+def test_get_non_exist_output(workflow_start_regular, tmp_path):
+    lock_path = str(tmp_path / "lock")
+
+    @ray.remote
+    def simple():
+        with FileLock(lock_path):
+            return "hello"
+
+    workflow_id = "test_get_non_exist_output"
+
+    with FileLock(lock_path):
+        dag = simple.options(**workflow.options(task_id="simple")).bind()
+        ret = workflow.run_async(dag, workflow_id=workflow_id)
+        exist = workflow.get_output_async(workflow_id, task_id="simple")
+        non_exist = workflow.get_output_async(workflow_id, task_id="non_exist")
+
+    assert ray.get(ret) == "hello"
+    assert ray.get(exist) == "hello"
+    with pytest.raises(ValueError, match="non_exist"):
+        ray.get(non_exist)
+
+
+def test_get_named_task_output_finished(workflow_start_regular, tmp_path):
+    @ray.remote
+    def double(v):
+        return 2 * v
+
+    # Get the result from named task after workflow finished
+    assert 4 == workflow.run(
+        double.options(**workflow.options(task_id="outer")).bind(
+            double.options(**workflow.options(task_id="inner")).bind(1)
+        ),
+        workflow_id="double",
+    )
+    assert workflow.get_output("double", task_id="inner") == 2
+    assert workflow.get_output("double", task_id="outer") == 4
+
+
+def test_get_named_task_output_running(workflow_start_regular, tmp_path):
+    @ray.remote
     def double(v, lock=None):
         if lock is not None:
             with FileLock(lock_path):
@@ -145,18 +237,20 @@ def test_get_named_step_output_running(workflow_start_regular, tmp_path):
         else:
             return 2 * v
 
-    # Get the result from named step after workflow before it's finished
+    # Get the result from named task after workflow before it's finished
     lock_path = str(tmp_path / "lock")
     lock = FileLock(lock_path)
     lock.acquire()
-    output = (
-        double.options(name="outer")
-        .step(double.options(name="inner").step(1, lock_path), lock_path)
-        .run_async("double-2")
+    output = workflow.run_async(
+        double.options(**workflow.options(task_id="outer")).bind(
+            double.options(**workflow.options(task_id="inner")).bind(1, lock_path),
+            lock_path,
+        ),
+        workflow_id="double-2",
     )
 
-    inner = workflow.get_output("double-2", name="inner")
-    outer = workflow.get_output("double-2", name="outer")
+    inner = workflow.get_output_async("double-2", task_id="inner")
+    outer = workflow.get_output_async("double-2", task_id="outer")
 
     @ray.remote
     def wait(obj_ref):
@@ -171,100 +265,71 @@ def test_get_named_step_output_running(workflow_start_regular, tmp_path):
 
     # Once job finished, we'll be able to get the result.
     lock.release()
-    assert 4 == ray.get(output)
+    assert [4, 2, 4] == ray.get([output, inner, outer])
 
-    # Here sometimes inner will not be generated when we call
-    # run_async. So there is a race condition here.
-    try:
-        v = ray.get(inner)
-    except Exception:
-        v = None
-    if v is not None:
-        assert 2 == v
-    assert 4 == ray.get(outer)
-
-    inner = workflow.get_output("double-2", name="inner")
-    outer = workflow.get_output("double-2", name="outer")
-    assert 2 == ray.get(inner)
-    assert 4 == ray.get(outer)
+    inner = workflow.get_output_async("double-2", task_id="inner")
+    outer = workflow.get_output_async("double-2", task_id="outer")
+    assert [2, 4] == ray.get([inner, outer])
 
 
-def test_get_named_step_output_error(workflow_start_regular, tmp_path):
-    @workflow.step
+def test_get_named_task_output_error(workflow_start_regular, tmp_path):
+    @ray.remote
     def double(v, error):
         if error:
             raise Exception()
         return v + v
 
-    # Force it to fail for the outer step
+    # Force it to fail for the outer task
     with pytest.raises(Exception):
-        double.options(name="outer").step(
-            double.options(name="inner").step(1, False), True
-        ).run("double")
+        workflow.run(
+            double.options(**workflow.options(task_id="outer")).bind(
+                double.options(**workflow.options(task_id="inner")).bind(1, False), True
+            ),
+            workflow_id="double",
+        )
 
-    # For the inner step, it should have already been executed.
-    assert 2 == ray.get(workflow.get_output("double", name="inner"))
-    outer = workflow.get_output("double", name="outer")
+    # For the inner task, it should have already been executed.
+    assert 2 == workflow.get_output("double", task_id="inner")
     with pytest.raises(Exception):
-        ray.get(outer)
+        workflow.get_output("double", task_id="outer")
 
 
-def test_get_named_step_default(workflow_start_regular, tmp_path):
-    @workflow.step
+def test_get_named_task_default(workflow_start_regular, tmp_path):
+    @ray.remote
     def factorial(n, r=1):
         if n == 1:
             return r
-        return factorial.step(n - 1, r * n)
+        return workflow.continuation(factorial.bind(n - 1, r * n))
 
     import math
 
-    assert math.factorial(5) == factorial.step(5).run("factorial")
+    assert math.factorial(5) == workflow.run(factorial.bind(5), workflow_id="factorial")
     for i in range(5):
-        step_name = (
-            "test_basic_workflows_2." "test_get_named_step_default.locals.factorial"
+        task_name = (
+            "python.ray.workflow.tests.test_basic_workflows_2."
+            "test_get_named_task_default.locals.factorial"
         )
+
         if i != 0:
-            step_name += "_" + str(i)
+            task_name += "_" + str(i)
         # All outputs will be 120
-        assert math.factorial(5) == ray.get(
-            workflow.get_output("factorial", name=step_name)
-        )
+        assert math.factorial(5) == workflow.get_output("factorial", task_id=task_name)
 
 
-def test_get_named_step_duplicate(workflow_start_regular):
-    @workflow.step(name="f")
+def test_get_named_task_duplicate(workflow_start_regular):
+    @workflow.options(task_id="f")
+    @ray.remote
     def f(n, dep):
         return n
 
-    inner = f.step(10, None)
-    outer = f.step(20, inner)
-    assert 20 == outer.run("duplicate")
+    inner = f.bind(10, None)
+    outer = f.bind(20, inner)
+    assert 20 == workflow.run(outer, workflow_id="duplicate")
     # The outer will be checkpointed first. So there is no suffix for the name
-    assert ray.get(workflow.get_output("duplicate", name="f")) == 20
+    assert workflow.get_output("duplicate", task_id="f") == 10
     # The inner will be checkpointed after the outer. And there is a duplicate
     # for the name. suffix _1 is added automatically
-    assert ray.get(workflow.get_output("duplicate", name="f_1")) == 10
-
-
-def test_no_init(shutdown_only):
-    @workflow.step
-    def f():
-        pass
-
-    fail_wf_init_error_msg = re.escape(
-        "`workflow.init()` must be called prior to using " "the workflows API."
-    )
-
-    with pytest.raises(RuntimeError, match=fail_wf_init_error_msg):
-        f.step().run()
-    with pytest.raises(RuntimeError, match=fail_wf_init_error_msg):
-        workflow.list_all()
-    with pytest.raises(RuntimeError, match=fail_wf_init_error_msg):
-        workflow.resume_all()
-    with pytest.raises(RuntimeError, match=fail_wf_init_error_msg):
-        workflow.cancel("wf")
-    with pytest.raises(RuntimeError, match=fail_wf_init_error_msg):
-        workflow.get_actor("wf")
+    assert workflow.get_output("duplicate", task_id="f_1") == 20
 
 
 if __name__ == "__main__":

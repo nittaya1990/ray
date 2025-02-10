@@ -1,14 +1,12 @@
 cloud_id: cld_HSrCZdMCYDe1NmMCJhYRgQ4p
 region: us-west-2
 
-aws:
+advanced_configurations_json:
   TagSpecifications:
     - ResourceType: "instance"
       Tags:
-        - Key: anyscale-user
-          Value: '{{env["ANYSCALE_USER"]}}'
-        - Key: anyscale-expiration
-          Value: '{{env["EXPIRATION_1D"]}}'
+        - Key: ttl-hours
+          Value: '24'
   BlockDeviceMappings:
     - DeviceName: /dev/sda1
       Ebs:

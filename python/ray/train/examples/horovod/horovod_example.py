@@ -2,14 +2,17 @@ import argparse
 import os
 
 import horovod.torch as hvd
-import ray
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data.distributed
 from filelock import FileLock
-from ray.train import Trainer
 from torchvision import datasets, transforms
+
+import ray
+from ray import train
+from ray.train import ScalingConfig
+from ray.train.horovod import HorovodTrainer
 
 
 def metric_average(val, name):
@@ -140,26 +143,23 @@ def train_func(config):
     log_interval = config.get("log_interval", 10)
     use_cuda = config.get("use_cuda", False)
 
-    if use_cuda:
-        torch.cuda.set_device(hvd.local_rank())
-
     model, optimizer, train_loader, train_sampler = setup(config)
 
-    results = []
     for epoch in range(num_epochs):
         loss = train_epoch(
             model, optimizer, train_sampler, train_loader, epoch, log_interval, use_cuda
         )
-        results.append(loss)
-    return results
+        train.report(dict(loss=loss))
 
 
 def main(num_workers, use_gpu, kwargs):
-    trainer = Trainer("horovod", use_gpu=use_gpu, num_workers=num_workers)
-    trainer.start()
-    loss_per_epoch = trainer.run(train_func, config=kwargs)
-    trainer.shutdown()
-    print(loss_per_epoch)
+    trainer = HorovodTrainer(
+        train_func,
+        train_loop_config=kwargs,
+        scaling_config=ScalingConfig(use_gpu=use_gpu, num_workers=num_workers),
+    )
+    results = trainer.fit()
+    print(results.metrics)
 
 
 # Horovod Class API.

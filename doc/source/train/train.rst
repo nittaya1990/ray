@@ -1,157 +1,197 @@
 .. _train-docs:
 
-Ray Train: Distributed Deep Learning
-====================================
+Ray Train: Scalable Model Training
+==================================
 
-.. _`issue on GitHub`: https://github.com/ray-project/ray/issues
+.. toctree::
+    :hidden:
 
-.. tip:: Get in touch with us if you're using or considering using `Ray Train <https://forms.gle/PXFcJmHwszCwQhqX7>`_!
-
-Ray Train is a lightweight library for distributed deep learning, allowing you
-to scale up and speed up training for your deep learning models.
-
-The main features are:
-
-- **Ease of use**: Scale your single process training code to a cluster in just a couple lines of code.
-- **Composability**: Ray Train interoperates with :ref:`Ray Tune <tune-main>` to tune your distributed model and :ref:`Ray Datasets <datasets>` to train on large amounts of data.
-- **Interactivity**: Ray Train fits in your workflow with support to run from any environment, including seamless Jupyter notebook support.
-
-.. note::
-
-  This API is in its Beta release (as of Ray 1.9) and may be revised in
-  future Ray releases. If you encounter any bugs, please file an
-  `issue on GitHub`_.
-  If you are looking for the previous API documentation, see :ref:`sgd-index`.
-
-Intro to Ray Train
-------------------
-
-Ray Train is a library that aims to simplify distributed deep learning.
-
-**Frameworks**: Ray Train is built to abstract away the coordination/configuration setup of distributed deep learning frameworks such as Pytorch Distributed and Tensorflow Distributed, allowing users to only focus on implementing training logic.
-
-* For Pytorch, Ray Train automatically handles the construction of the distributed process group.
-* For Tensorflow, Ray Train automatically handles the coordination of the ``TF_CONFIG``. The current implementation assumes that the user will use a MultiWorkerMirroredStrategy, but this will change in the near future.
-* For Horovod, Ray Train automatically handles the construction of the Horovod runtime and Rendezvous server.
-
-**Built for data scientists/ML practitioners**: Ray Train has support for standard ML tools and features that practitioners love:
-
-* Callbacks for early stopping
-* Checkpointing
-* Integration with TensorBoard, Weights/Biases, and MLflow
-* Jupyter notebooks
-
-**Integration with Ray Ecosystem**: Distributed deep learning often comes with a lot of complexity.
+    Overview <overview>
+    PyTorch Guide <getting-started-pytorch>
+    PyTorch Lightning Guide <getting-started-pytorch-lightning>
+    Hugging Face Transformers Guide <getting-started-transformers>
+    more-frameworks
+    User Guides <user-guides>
+    Examples <examples>
+    Benchmarks <benchmarks>
+    api/api
 
 
-* Use :ref:`Ray Datasets <datasets>` with Ray Train to handle and train on large amounts of data.
-* Use :ref:`Ray Tune <tune-main>` with Ray Train to leverage cutting edge hyperparameter techniques and distribute both your training and tuning.
-* You can leverage the :ref:`Ray cluster launcher <cluster-cloud>` to launch autoscaling or spot instance clusters to train your model at scale on any cloud.
+.. div:: sd-d-flex-row sd-align-major-center sd-align-minor-center
+
+    .. div:: sd-w-50
+
+        .. raw:: html
+           :file: images/logo.svg
 
 
-Quick Start
+Ray Train is a scalable machine learning library for distributed training and fine-tuning.
+
+Ray Train allows you to scale model training code from a single machine to a cluster of machines in the cloud, and abstracts away the complexities of distributed computing.
+Whether you have large models or large datasets, Ray Train is the simplest solution for distributed training.
+
+Ray Train provides support for many frameworks:
+
+.. list-table::
+   :widths: 1 1
+   :header-rows: 1
+
+   * - PyTorch Ecosystem
+     - More Frameworks
+   * - PyTorch
+     - TensorFlow
+   * - PyTorch Lightning
+     - Keras
+   * - Hugging Face Transformers
+     - Horovod
+   * - Hugging Face Accelerate
+     - XGBoost
+   * - DeepSpeed
+     - LightGBM
+
+Install Ray Train
+-----------------
+
+To install Ray Train, run:
+
+.. code-block:: console
+
+    $ pip install -U "ray[train]"
+
+To learn more about installing Ray and its libraries, see
+:ref:`Installing Ray <installation>`.
+
+Get started
 -----------
 
-Ray Train abstracts away the complexity of setting up a distributed training
-system. Let's take following simple examples:
+.. grid:: 1 2 2 2
+    :gutter: 1
+    :class-container: container pb-6
 
-.. tabbed:: PyTorch
+    .. grid-item-card::
 
-    This example shows how you can use Ray Train with PyTorch.
+        **Overview**
+        ^^^
 
-    First, set up your dataset and model.
+        Understand the key concepts for distributed training with Ray Train.
 
-    .. literalinclude:: /../../python/ray/train/examples/torch_quick_start.py
-       :language: python
-       :start-after: __torch_setup_begin__
-       :end-before: __torch_setup_end__
+        +++
+        .. button-ref:: train-overview
+            :color: primary
+            :outline:
+            :expand:
 
+            Learn the basics
 
-    Now define your single-worker PyTorch training function.
+    .. grid-item-card::
 
-    .. literalinclude:: /../../python/ray/train/examples/torch_quick_start.py
-       :language: python
-       :start-after: __torch_single_begin__
-       :end-before: __torch_single_end__
+        **PyTorch**
+        ^^^
 
-    This training function can be executed with:
+        Get started on distributed model training with Ray Train and PyTorch.
 
-    .. literalinclude:: /../../python/ray/train/examples/torch_quick_start.py
-       :language: python
-       :start-after: __torch_single_run_begin__
-       :end-before: __torch_single_run_end__
+        +++
+        .. button-ref:: train-pytorch
+            :color: primary
+            :outline:
+            :expand:
 
-    Now let's convert this to a distributed multi-worker training function!
+            Try Ray Train with PyTorch
 
-    All you have to do is use the ``ray.train.torch.prepare_model`` and
-    ``ray.train.torch.prepare_data_loader`` utility functions to
-    easily setup your model & data for distributed training.
-    This will automatically wrap your model with ``DistributedDataParallel``
-    and place it on the right device, and add ``DistributedSampler`` to your DataLoaders.
+    .. grid-item-card::
 
-    .. literalinclude:: /../../python/ray/train/examples/torch_quick_start.py
-       :language: python
-       :start-after: __torch_distributed_begin__
-       :end-before: __torch_distributed_end__
+        **PyTorch Lightning**
+        ^^^
 
-    Then, instantiate a ``Trainer`` that uses a ``"torch"`` backend
-    with 4 workers, and use it to run the new training function!
+        Get started on distributed model training with Ray Train and Lightning.
 
-    .. literalinclude:: /../../python/ray/train/examples/torch_quick_start.py
-       :language: python
-       :start-after: __torch_trainer_begin__
-       :end-before: __torch_trainer_end__
+        +++
+        .. button-ref:: train-pytorch-lightning
+            :color: primary
+            :outline:
+            :expand:
 
-    See :ref:`train-porting-code` for a more comprehensive example.
+            Try Ray Train with Lightning
 
-.. tabbed:: TensorFlow
+    .. grid-item-card::
 
-    This example shows how you can use Ray Train to set up `Multi-worker training
-    with Keras <https://www.tensorflow.org/tutorials/distribute/multi_worker_with_keras>`_.
+        **Hugging Face Transformers**
+        ^^^
 
-    First, set up your dataset and model.
+        Get started on distributed model training with Ray Train and Transformers.
 
-    .. literalinclude:: /../../python/ray/train/examples/tensorflow_quick_start.py
-       :language: python
-       :start-after: __tf_setup_begin__
-       :end-before: __tf_setup_end__
+        +++
+        .. button-ref:: train-pytorch-transformers
+            :color: primary
+            :outline:
+            :expand:
 
-    Now define your single-worker TensorFlow training function.
+            Try Ray Train with Transformers
 
-    .. literalinclude:: /../../python/ray/train/examples/tensorflow_quick_start.py
-           :language: python
-           :start-after: __tf_single_begin__
-           :end-before: __tf_single_end__
+Learn more
+----------
 
-    This training function can be executed with:
+.. grid:: 1 2 2 2
+    :gutter: 1
+    :class-container: container pb-6
 
-    .. literalinclude:: /../../python/ray/train/examples/tensorflow_quick_start.py
-       :language: python
-       :start-after: __tf_single_run_begin__
-       :end-before: __tf_single_run_end__
+    .. grid-item-card::
 
-    Now let's convert this to a distributed multi-worker training function!
-    All you need to do is:
+        **More Frameworks**
+        ^^^
 
-    1. Set the *global* batch size - each worker will process the same size
-       batch as in the single-worker code.
-    2. Choose your TensorFlow distributed training strategy. In this example
-       we use the ``MultiWorkerMirroredStrategy``.
+        Don't see your framework? See these guides.
 
-    .. literalinclude:: /../../python/ray/train/examples/tensorflow_quick_start.py
-       :language: python
-       :start-after: __tf_distributed_begin__
-       :end-before: __tf_distributed_end__
+        +++
+        .. button-ref:: train-more-frameworks
+            :color: primary
+            :outline:
+            :expand:
 
-    Then, instantiate a ``Trainer`` that uses a ``"tensorflow"`` backend
-    with 4 workers, and use it to run the new training function!
+            Try Ray Train with other frameworks
 
-    .. literalinclude:: /../../python/ray/train/examples/tensorflow_quick_start.py
-       :language: python
-       :start-after: __tf_trainer_begin__
-       :end-before: __tf_trainer_end__
+    .. grid-item-card::
 
-    See :ref:`train-porting-code` for a more comprehensive example.
+        **User Guides**
+        ^^^
 
+        Get how-to instructions for common training tasks with Ray Train.
 
-**Next steps:** Check out the :ref:`User Guide <train-user-guide>`!
+        +++
+        .. button-ref:: train-user-guides
+            :color: primary
+            :outline:
+            :expand:
+
+            Read how-to guides
+
+    .. grid-item-card::
+
+        **Examples**
+        ^^^
+
+        Browse end-to-end code examples for different use cases.
+
+        +++
+        .. button-ref:: examples
+            :color: primary
+            :outline:
+            :expand:
+            :ref-type: doc
+
+            Learn through examples
+
+    .. grid-item-card::
+
+        **API**
+        ^^^
+
+        Consult the API Reference for full descriptions of the Ray Train API.
+
+        +++
+        .. button-ref:: train-api
+            :color: primary
+            :outline:
+            :expand:
+
+            Read the API Reference

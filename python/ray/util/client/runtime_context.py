@@ -1,13 +1,13 @@
 from typing import TYPE_CHECKING
+from types import SimpleNamespace
 
 if TYPE_CHECKING:
+    from ray import JobID, NodeID
     from ray.runtime_context import RuntimeContext
-    from ray import JobID
-    from ray import NodeID
 
 
-class ClientWorkerPropertyAPI:
-    """Emulates the properties of the ray.worker object for the client"""
+class _ClientWorkerPropertyAPI:
+    """Emulates the properties of the ray._private.worker object for the client"""
 
     def __init__(self, worker):
         assert worker is not None
@@ -29,7 +29,7 @@ class ClientWorkerPropertyAPI:
 
     @property
     def mode(self):
-        from ray.worker import SCRIPT_MODE
+        from ray._private.worker import SCRIPT_MODE
 
         return SCRIPT_MODE
 
@@ -56,3 +56,10 @@ class ClientWorkerPropertyAPI:
     @property
     def runtime_env(self) -> str:
         return self._fetch_runtime_context().runtime_env
+
+    def check_connected(self) -> bool:
+        return self.worker.ping_server()
+
+    @property
+    def gcs_client(self) -> str:
+        return SimpleNamespace(address=self._fetch_runtime_context().gcs_address)

@@ -34,7 +34,8 @@ void NativeObjectStore::PutRaw(std::shared_ptr<msgpack::sbuffer> data,
   auto buffer = std::make_shared<::ray::LocalMemoryBuffer>(
       reinterpret_cast<uint8_t *>(data->data()), data->size(), true);
   auto status = core_worker.Put(
-      ::ray::RayObject(buffer, nullptr, std::vector<rpc::ObjectReference>()), {},
+      ::ray::RayObject(buffer, nullptr, std::vector<rpc::ObjectReference>()),
+      {},
       object_id);
   if (!status.ok()) {
     throw RayException("Put object error");
@@ -48,7 +49,8 @@ void NativeObjectStore::PutRaw(std::shared_ptr<msgpack::sbuffer> data,
   auto buffer = std::make_shared<::ray::LocalMemoryBuffer>(
       reinterpret_cast<uint8_t *>(data->data()), data->size(), true);
   auto status = core_worker.Put(
-      ::ray::RayObject(buffer, nullptr, std::vector<rpc::ObjectReference>()), {},
+      ::ray::RayObject(buffer, nullptr, std::vector<rpc::ObjectReference>()),
+      {},
       object_id);
   if (!status.ok()) {
     throw RayException("Put object error");
@@ -89,8 +91,11 @@ std::vector<std::shared_ptr<msgpack::sbuffer>> NativeObjectStore::GetRaw(
     const std::vector<ObjectID> &ids, int timeout_ms) {
   auto &core_worker = CoreWorkerProcess::GetCoreWorker();
   std::vector<std::shared_ptr<::ray::RayObject>> results;
-  ::ray::Status status = core_worker.Get(ids, timeout_ms, &results);
+  ::ray::Status status = core_worker.Get(ids, timeout_ms, results);
   if (!status.ok()) {
+    if (status.IsTimedOut()) {
+      throw RayTimeoutException("Get object error:" + status.message());
+    }
     throw RayException("Get object error: " + status.ToString());
   }
   RAY_CHECK(results.size() == ids.size());
@@ -99,21 +104,38 @@ std::vector<std::shared_ptr<msgpack::sbuffer>> NativeObjectStore::GetRaw(
   for (size_t i = 0; i < results.size(); i++) {
     const auto &meta = results[i]->GetMetadata();
     const auto &data_buffer = results[i]->GetData();
+    std::string meta_str = "";
     if (meta != nullptr) {
-      std::string meta_str((char *)meta->Data(), meta->Size());
+      meta_str = std::string((char *)meta->Data(), meta->Size());
       CheckException(meta_str, data_buffer);
     }
 
-    auto sbuffer = std::make_shared<msgpack::sbuffer>(data_buffer->Size());
-    sbuffer->write(reinterpret_cast<const char *>(data_buffer->Data()),
-                   data_buffer->Size());
-    result_sbuffers.push_back(sbuffer);
+    const char *data = nullptr;
+    size_t data_size = 0;
+    if (data_buffer) {
+      data = reinterpret_cast<const char *>(data_buffer->Data());
+      data_size = data_buffer->Size();
+    }
+    if (meta_str == METADATA_STR_RAW) {
+      // TODO(LarryLian) In order to minimize the modification,
+      // there is an extra serialization here, but the performance will be a little worse.
+      // This code can be optimized later to improve performance
+      auto raw_buffer = Serializer::Serialize(data, data_size);
+      auto sbuffer = std::make_shared<msgpack::sbuffer>(raw_buffer.size());
+      sbuffer->write(raw_buffer.data(), raw_buffer.size());
+      result_sbuffers.push_back(sbuffer);
+    } else {
+      auto sbuffer = std::make_shared<msgpack::sbuffer>(data_size);
+      sbuffer->write(data, data_size);
+      result_sbuffers.push_back(sbuffer);
+    }
   }
   return result_sbuffers;
 }
 
 std::vector<bool> NativeObjectStore::Wait(const std::vector<ObjectID> &ids,
-                                          int num_objects, int timeout_ms) {
+                                          int num_objects,
+                                          int timeout_ms) {
   std::vector<bool> results;
   auto &core_worker = CoreWorkerProcess::GetCoreWorker();
   // TODO(SongGuyang): Support `fetch_local` option in API.

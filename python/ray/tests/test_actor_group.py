@@ -1,5 +1,7 @@
-import pytest
 import time
+import warnings
+
+import pytest
 
 import ray
 from ray.util.actor_group import ActorGroup
@@ -13,9 +15,15 @@ class DummyActor:
         return "metadata"
 
 
+# Use default filterwarnings behavior for this test
+@pytest.mark.filterwarnings("default")
 def test_actor_creation(ray_start_2_cpus):
     assert ray.available_resources()["CPU"] == 2
-    ag = ActorGroup(actor_cls=DummyActor, num_actors=2)
+    with warnings.catch_warnings(record=True) as w:
+        ag = ActorGroup(actor_cls=DummyActor, num_actors=2)
+        assert any(
+            "use ray.util.multiprocessing" in str(warning.message) for warning in w
+        )
     assert len(ag) == 2
     time.sleep(1)
     # Make sure both CPUs are being used by the actors.
@@ -38,7 +46,7 @@ def test_actor_shutdown(ray_start_2_cpus):
     ag = ActorGroup(actor_cls=DummyActor, num_actors=2)
     time.sleep(1)
     assert "CPU" not in ray.available_resources()
-    assert len(ray.state.actors()) == 2
+    assert len(ray._private.state.actors()) == 2
     ag.shutdown()
     time.sleep(1)
     assert ray.available_resources()["CPU"] == 2
@@ -90,6 +98,10 @@ def test_bad_resources(ray_start_2_cpus):
 
 
 if __name__ == "__main__":
+    import os
     import sys
 
-    sys.exit(pytest.main(["-v", "-x", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

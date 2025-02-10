@@ -1,13 +1,20 @@
 import argparse
 import os
+import sys
 
 from filelock import FileLock
-from tensorflow.keras.datasets import mnist
 
 import ray
-from ray import tune
+from ray import train, tune
 from ray.tune.schedulers import AsyncHyperBandScheduler
-from ray.tune.integration.keras import TuneReportCallback
+
+if sys.version_info >= (3, 12):
+    # Tensorflow is not installed for Python 3.12 because of keras compatibility.
+    sys.exit(0)
+else:
+    from tensorflow.keras.datasets import mnist
+
+    from ray.air.integrations.keras import ReportCheckpointCallback
 
 
 def train_mnist(config):
@@ -43,7 +50,11 @@ def train_mnist(config):
         epochs=epochs,
         verbose=0,
         validation_data=(x_test, y_test),
-        callbacks=[TuneReportCallback({"mean_accuracy": "accuracy"})],
+        callbacks=[
+            ReportCheckpointCallback(
+                checkpoint_on=[], metrics={"mean_accuracy": "accuracy"}
+            )
+        ],
     )
 
 
@@ -52,23 +63,27 @@ def tune_mnist(num_training_iterations):
         time_attr="training_iteration", max_t=400, grace_period=20
     )
 
-    analysis = tune.run(
-        train_mnist,
-        name="exp",
-        scheduler=sched,
-        metric="mean_accuracy",
-        mode="max",
-        stop={"mean_accuracy": 0.99, "training_iteration": num_training_iterations},
-        num_samples=10,
-        resources_per_trial={"cpu": 2, "gpu": 0},
-        config={
+    tuner = tune.Tuner(
+        tune.with_resources(train_mnist, resources={"cpu": 2, "gpu": 0}),
+        run_config=train.RunConfig(
+            name="exp",
+            stop={"mean_accuracy": 0.99, "training_iteration": num_training_iterations},
+        ),
+        tune_config=tune.TuneConfig(
+            scheduler=sched,
+            metric="mean_accuracy",
+            mode="max",
+            num_samples=10,
+        ),
+        param_space={
             "threads": 2,
             "lr": tune.uniform(0.001, 0.1),
             "momentum": tune.uniform(0.1, 0.9),
             "hidden": tune.randint(32, 512),
         },
     )
-    print("Best hyperparameters found were: ", analysis.best_config)
+    results = tuner.fit()
+    print("Best hyperparameters found were: ", results.get_best_result().config)
 
 
 if __name__ == "__main__":
@@ -76,17 +91,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--smoke-test", action="store_true", help="Finish quickly for testing"
     )
-    parser.add_argument(
-        "--server-address",
-        type=str,
-        default=None,
-        required=False,
-        help="The address of server to connect to if using " "Ray Client.",
-    )
     args, _ = parser.parse_known_args()
+
     if args.smoke_test:
         ray.init(num_cpus=4)
-    elif args.server_address:
-        ray.init(f"ray://{args.server_address}")
 
-    tune_mnist(num_training_iterations=5 if args.smoke_test else 300)
+    tune_mnist(num_training_iterations=2 if args.smoke_test else 300)

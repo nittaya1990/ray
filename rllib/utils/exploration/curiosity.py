@@ -1,4 +1,4 @@
-from gym.spaces import Discrete, MultiDiscrete, Space
+from gymnasium.spaces import Discrete, MultiDiscrete, Space
 import numpy as np
 from typing import Optional, Tuple, Union
 
@@ -14,7 +14,7 @@ from ray.rllib.models.torch.torch_action_dist import (
 from ray.rllib.models.utils import get_activation_fn
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.utils import NullContextManager
-from ray.rllib.utils.annotations import override
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.exploration.exploration import Exploration
 from ray.rllib.utils.framework import try_import_tf, try_import_torch
 from ray.rllib.utils.from_config import from_config
@@ -29,6 +29,7 @@ if nn is not None:
     F = nn.functional
 
 
+@OldAPIStack
 class Curiosity(Exploration):
     """Implementation of:
     [1] Curiosity-driven Exploration by Self-supervised Prediction
@@ -102,12 +103,12 @@ class Curiosity(Exploration):
         """
         if not isinstance(action_space, (Discrete, MultiDiscrete)):
             raise ValueError(
-                "Only (Multi)Discrete action spaces supported for Curiosity " "so far!"
+                "Only (Multi)Discrete action spaces supported for Curiosity so far!"
             )
 
         super().__init__(action_space, model=model, framework=framework, **kwargs)
 
-        if self.policy_config["num_workers"] != 0:
+        if self.policy_config["num_env_runners"] != 0:
             raise ValueError(
                 "Curiosity exploration currently does not support parallelism."
                 " `num_workers` must be 0!"
@@ -131,7 +132,7 @@ class Curiosity(Exploration):
         self.beta = beta
         self.eta = eta
         self.lr = lr
-        # TODO: (sven) if sub_exploration is None, use Trainer's default
+        # TODO: (sven) if sub_exploration is None, use Algorithm's default
         #  Exploration config.
         if sub_exploration is None:
             raise NotImplementedError
@@ -341,8 +342,12 @@ class Curiosity(Exploration):
             {
                 SampleBatch.OBS: torch.cat(
                     [
-                        torch.from_numpy(sample_batch[SampleBatch.OBS]),
-                        torch.from_numpy(sample_batch[SampleBatch.NEXT_OBS]),
+                        torch.from_numpy(sample_batch[SampleBatch.OBS]).to(
+                            policy.device
+                        ),
+                        torch.from_numpy(sample_batch[SampleBatch.NEXT_OBS]).to(
+                            policy.device
+                        ),
                     ]
                 )
             }
@@ -400,7 +405,7 @@ class Curiosity(Exploration):
         Args:
             layer_dims (Tuple[int]): Tuple of layer dims, including the input
                 dimension.
-            activation (str): An activation specifier string (e.g. "relu").
+            activation: An activation specifier string (e.g. "relu").
 
         Examples:
             If layer_dims is [4,8,6] we'll have a two layer net: 4->8 (8 nodes)

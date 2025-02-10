@@ -1,11 +1,11 @@
 import contextlib
-import gym
+import gymnasium as gym
 import re
 from typing import Dict, List, Union
 
 from ray.util import log_once
 from ray.rllib.models.modelv2 import ModelV2
-from ray.rllib.utils.annotations import override, PublicAPI
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.deprecation import deprecation_warning
 from ray.rllib.utils.framework import try_import_tf
 from ray.rllib.utils.typing import ModelConfigDict, TensorType
@@ -13,7 +13,7 @@ from ray.rllib.utils.typing import ModelConfigDict, TensorType
 tf1, tf, tfv = try_import_tf()
 
 
-@PublicAPI
+@OldAPIStack
 class TFModelV2(ModelV2):
     """TF version of ModelV2, which should contain a tf keras Model.
 
@@ -105,7 +105,7 @@ class TFModelV2(ModelV2):
     @staticmethod
     def _find_sub_modules(current_key, struct):
         # Keras Model: key=k + "." + var-name (replace '/' by '.').
-        if isinstance(struct, tf.keras.models.Model):
+        if isinstance(struct, tf.keras.models.Model) or isinstance(struct, tf.Module):
             ret = {}
             for var in struct.variables:
                 name = re.sub("/", ".", var.name)

@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 import numpy as np
 import tree  # pip install dm_tree
 import random
@@ -6,7 +6,7 @@ from typing import Union, Optional
 
 from ray.rllib.models.torch.torch_action_dist import TorchMultiActionDistribution
 from ray.rllib.models.action_dist import ActionDistribution
-from ray.rllib.utils.annotations import override
+from ray.rllib.utils.annotations import override, OldAPIStack
 from ray.rllib.utils.exploration.exploration import Exploration, TensorType
 from ray.rllib.utils.framework import try_import_tf, try_import_torch, get_variable
 from ray.rllib.utils.from_config import from_config
@@ -18,6 +18,7 @@ tf1, tf, tfv = try_import_tf()
 torch, _ = try_import_torch()
 
 
+@OldAPIStack
 class EpsilonGreedy(Exploration):
     """Epsilon-greedy Exploration class that produces exploration actions.
 
@@ -90,7 +91,7 @@ class EpsilonGreedy(Exploration):
         explore: Optional[Union[bool, TensorType]] = True,
     ):
 
-        if self.framework in ["tf2", "tf", "tfe"]:
+        if self.framework in ["tf2", "tf"]:
             return self._get_tf_exploration_action_op(
                 action_distribution, explore, timestep
             )
@@ -150,7 +151,7 @@ class EpsilonGreedy(Exploration):
             false_fn=lambda: exploit_action,
         )
 
-        if self.framework in ["tf2", "tfe"] and not self.policy_config["eager_tracing"]:
+        if self.framework == "tf2" and not self.policy_config["eager_tracing"]:
             self.last_timestep = timestep
             return action, tf.zeros_like(action, dtype=tf.float32)
         else:
@@ -167,7 +168,7 @@ class EpsilonGreedy(Exploration):
         """Torch method to produce an epsilon exploration action.
 
         Args:
-            action_distribution (ActionDistribution): The instantiated
+            action_distribution: The instantiated
                 ActionDistribution object to work with when creating
                 exploration actions.
 

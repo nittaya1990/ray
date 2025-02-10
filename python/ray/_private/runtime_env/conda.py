@@ -1,37 +1,42 @@
-import os
-import sys
+import hashlib
 import json
 import logging
-import yaml
-import hashlib
-import subprocess
+import os
 import platform
 import runpy
 import shutil
-import asyncio
-
-from filelock import FileLock
-from typing import Optional, List, Dict, Any
+import subprocess
+import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+from filelock import FileLock
 
 import ray
-
 from ray._private.runtime_env.conda_utils import (
-    get_conda_activate_commands,
     create_conda_env_if_needed,
     delete_conda_env,
+    get_conda_activate_commands,
+    get_conda_info_json,
+    get_conda_envs,
 )
 from ray._private.runtime_env.context import RuntimeEnvContext
+from ray._private.runtime_env.packaging import Protocol, parse_uri
+from ray._private.runtime_env.plugin import RuntimeEnvPlugin
+from ray._private.runtime_env.validation import parse_and_validate_conda
 from ray._private.utils import (
     get_directory_size_bytes,
-    get_wheel_filename,
     get_master_wheel_url,
+    get_or_create_event_loop,
     get_release_wheel_url,
+    get_wheel_filename,
     try_to_create_directory,
 )
-from ray._private.runtime_env.packaging import Protocol, parse_uri
 
 default_logger = logging.getLogger(__name__)
+
+_WIN32 = os.name == "nt"
 
 
 def _resolve_current_ray_path() -> str:
@@ -56,21 +61,28 @@ def _get_ray_setup_spec():
 
 def _resolve_install_from_source_ray_dependencies():
     """Find the Ray dependencies when Ray is installed from source."""
-    return _get_ray_setup_spec().install_requires
-
-
-def _resolve_install_from_source_ray_extras() -> Dict[str, List[str]]:
-    return _get_ray_setup_spec().extras
+    deps = (
+        _get_ray_setup_spec().install_requires + _get_ray_setup_spec().extras["default"]
+    )
+    # Remove duplicates
+    return list(set(deps))
 
 
 def _inject_ray_to_conda_site(
     conda_path, logger: Optional[logging.Logger] = default_logger
 ):
     """Write the current Ray site package directory to a new site"""
-    python_binary = os.path.join(conda_path, "bin/python")
+    if _WIN32:
+        python_binary = os.path.join(conda_path, "python")
+    else:
+        python_binary = os.path.join(conda_path, "bin/python")
     site_packages_path = (
         subprocess.check_output(
-            [python_binary, "-c", "import site; print(site.getsitepackages()[0])"]
+            [
+                python_binary,
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+            ]
         )
         .decode()
         .strip()
@@ -78,7 +90,7 @@ def _inject_ray_to_conda_site(
 
     ray_path = _resolve_current_ray_path()
     logger.warning(
-        f"Injecting {ray_path} to environment {conda_path} "
+        f"Injecting {ray_path} to environment site-packages {site_packages_path} "
         "because _inject_current_ray flag is on."
     )
 
@@ -89,7 +101,7 @@ def _inject_ray_to_conda_site(
 
     # See usage of *.pth file at
     # https://docs.python.org/3/library/site.html
-    with open(os.path.join(site_packages_path, "ray.pth"), "w") as f:
+    with open(os.path.join(site_packages_path, "ray_shared.pth"), "w") as f:
         f.write(ray_path)
 
 
@@ -155,9 +167,9 @@ def inject_dependencies(
     """Add Ray, Python and (optionally) extra pip dependencies to a conda dict.
 
     Args:
-        conda_dict (dict): A dict representing the JSON-serialized conda
+        conda_dict: A dict representing the JSON-serialized conda
             environment YAML file.  This dict will be modified and returned.
-        py_version (str): A string representing a Python version to inject
+        py_version: A string representing a Python version to inject
             into the conda dependencies, e.g. "3.7.7"
         pip_dependencies (List[str]): A list of pip dependencies that
             will be prepended to the list of pip dependencies in
@@ -213,7 +225,7 @@ def get_uri(runtime_env: Dict) -> Optional[str]:
             # we don't track them with URIs.
             uri = None
         elif isinstance(conda, dict):
-            uri = "conda://" + _get_conda_env_hash(conda_dict=conda)
+            uri = f"conda://{_get_conda_env_hash(conda_dict=conda)}"
         else:
             raise TypeError(
                 "conda field received by RuntimeEnvAgent must be "
@@ -235,7 +247,7 @@ def _get_conda_dict_with_ray_inserted(
     ray_pip = current_ray_pip_specifier(logger=logger)
     if ray_pip:
         extra_pip_dependencies = [ray_pip, "ray[default]"]
-    elif runtime_env.get_extension("_inject_current_ray") == "True":
+    elif runtime_env.get_extension("_inject_current_ray"):
         extra_pip_dependencies = _resolve_install_from_source_ray_dependencies()
     else:
         extra_pip_dependencies = []
@@ -245,7 +257,10 @@ def _get_conda_dict_with_ray_inserted(
     return conda_dict
 
 
-class CondaManager:
+class CondaPlugin(RuntimeEnvPlugin):
+
+    name = "conda"
+
     def __init__(self, resources_dir: str):
         self._resources_dir = os.path.join(resources_dir, "conda")
         try_to_create_directory(self._resources_dir)
@@ -257,6 +272,12 @@ class CondaManager:
         self._installs_and_deletions_file_lock = os.path.join(
             self._resources_dir, "ray-conda-installs-and-deletions.lock"
         )
+        # A set of named conda environments (instead of yaml or dict)
+        # that are validated to exist.
+        # NOTE: It has to be only used within the same thread, which
+        # is an event loop.
+        # Also, we don't need to GC this field because it is pretty small.
+        self._validated_named_conda_env = set()
 
     def _get_path_from_hash(self, hash: str) -> str:
         """Generate a path from the hash of a conda or pip spec.
@@ -270,12 +291,12 @@ class CondaManager:
         """
         return os.path.join(self._resources_dir, hash)
 
-    def get_uri(self, runtime_env: "RuntimeEnv") -> Optional[str]:  # noqa: F821
-        """Return the conda URI from the RuntimeEnv if it exists, else None."""
+    def get_uris(self, runtime_env: "RuntimeEnv") -> List[str]:  # noqa: F821
+        """Return the conda URI from the RuntimeEnv if it exists, else return []."""
         conda_uri = runtime_env.conda_uri()
-        if conda_uri != "":
-            return conda_uri
-        return None
+        if conda_uri:
+            return [conda_uri]
+        return []
 
     def delete_uri(
         self, uri: str, logger: Optional[logging.Logger] = default_logger
@@ -285,7 +306,7 @@ class CondaManager:
         protocol, hash = parse_uri(uri)
         if protocol != Protocol.CONDA:
             raise ValueError(
-                "CondaManager can only delete URIs with protocol "
+                "CondaPlugin can only delete URIs with protocol "
                 f"conda.  Received protocol {protocol}, URI {uri}"
             )
 
@@ -305,13 +326,38 @@ class CondaManager:
         uri: Optional[str],
         runtime_env: "RuntimeEnv",  # noqa: F821
         context: RuntimeEnvContext,
-        logger: Optional[logging.Logger] = default_logger,
+        logger: logging.Logger = default_logger,
     ) -> int:
-        # Currently create method is still a sync process, to avoid blocking
-        # the loop, need to run this function in another thread.
-        # TODO(Catch-Bull): Refactor method create into an async process, and
-        # make this method running in current loop.
+        if not runtime_env.has_conda():
+            return 0
+
         def _create():
+            result = parse_and_validate_conda(runtime_env.get("conda"))
+
+            if isinstance(result, str):
+                # The conda env name is given.
+                # In this case, we only verify if the given
+                # conda env exists.
+
+                # If the env is already validated, do nothing.
+                if result in self._validated_named_conda_env:
+                    return 0
+
+                conda_info = get_conda_info_json()
+                envs = get_conda_envs(conda_info)
+
+                # We accept `result` as a conda name or full path.
+                if not any(result == env[0] or result == env[1] for env in envs):
+                    raise ValueError(
+                        f"The given conda environment '{result}' "
+                        f"from the runtime env {runtime_env} doesn't "
+                        "exist from the output of `conda info --json`. "
+                        "You can only specify an env that already exists. "
+                        f"Please make sure to create an env {result} "
+                    )
+                self._validated_named_conda_env.add(result)
+                return 0
+
             logger.debug(
                 "Setting up conda for runtime_env: " f"{runtime_env.serialize()}"
             )
@@ -334,17 +380,17 @@ class CondaManager:
                 finally:
                     os.remove(conda_yaml_file)
 
-                if runtime_env.get_extension("_inject_current_ray") == "True":
+                if runtime_env.get_extension("_inject_current_ray"):
                     _inject_ray_to_conda_site(conda_path=conda_env_name, logger=logger)
             logger.info(f"Finished creating conda environment at {conda_env_name}")
             return get_directory_size_bytes(conda_env_name)
 
-        loop = asyncio.get_event_loop()
+        loop = get_or_create_event_loop()
         return await loop.run_in_executor(None, _create)
 
     def modify_context(
         self,
-        uri: str,
+        uris: List[str],
         runtime_env: "RuntimeEnv",  # noqa: F821
         context: RuntimeEnvContext,
         logger: Optional[logging.Logger] = default_logger,

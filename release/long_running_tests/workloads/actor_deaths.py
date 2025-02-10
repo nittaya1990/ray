@@ -1,27 +1,21 @@
 # This workload tests repeatedly killing actors and submitting tasks to them.
-
-import json
 import numpy as np
-import os
 import sys
 import time
 
 import ray
 from ray.cluster_utils import Cluster
+from ray._private.test_utils import monitor_memory_usage, safe_write_to_results_json
 
 
 def update_progress(result):
     result["last_update"] = time.time()
-    test_output_json = os.environ.get(
-        "TEST_OUTPUT_JSON", "/tmp/release_test_output.json"
-    )
-    with open(test_output_json, "wt") as f:
-        json.dump(result, f)
+    safe_write_to_results_json(result)
 
 
 num_redis_shards = 1
-redis_max_memory = 10 ** 8
-object_store_memory = 10 ** 8
+redis_max_memory = 10**8
+object_store_memory = 10**8
 num_nodes = 2
 
 message = (
@@ -48,6 +42,7 @@ for i in range(num_nodes):
         dashboard_host="0.0.0.0",
     )
 ray.init(address=cluster.address)
+monitor_actor = monitor_memory_usage()
 
 # Run the workload.
 
@@ -86,7 +81,14 @@ class Parent(object):
 
     def kill(self):
         # Clean up children.
-        ray.get([child.__ray_terminate__.remote() for child in self.children])
+        try:
+            ray.get([child.__ray_terminate__.remote() for child in self.children])
+        except ray.exceptions.RayActorError as e:
+            # Sleep for 30 more seconds so that drivers will get more
+            # information from GCS when actors are unexpectedly failed.
+            print("Failed to kill a children actor. Error: ", e)
+            time.sleep(30)
+            raise e
 
 
 parents = [Parent.remote(num_children, death_probability) for _ in range(num_parents)]

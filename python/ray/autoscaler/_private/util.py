@@ -1,32 +1,32 @@
 import collections
 import copy
-from dataclasses import dataclass
-from datetime import datetime
-import logging
 import hashlib
 import json
-from numbers import Number, Real
+import logging
 import os
-import re
 import threading
-from typing import Any, Dict, Optional, Tuple, List, Union
+from dataclasses import dataclass
+from datetime import datetime
+from io import StringIO
+from numbers import Number, Real
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ray
-import ray.ray_constants
+import ray._private.ray_constants as ray_constants
 import ray._private.services as services
+from ray._private.utils import (
+    PLACEMENT_GROUP_INDEXED_BUNDLED_RESOURCE_PATTERN,
+    PLACEMENT_GROUP_WILDCARD_RESOURCE_PATTERN,
+)
 from ray.autoscaler._private import constants
+from ray.autoscaler._private.cli_logger import cli_logger
+from ray.autoscaler._private.docker import validate_docker_config
 from ray.autoscaler._private.local.config import prepare_local
 from ray.autoscaler._private.providers import _get_default_config
-from ray.autoscaler._private.docker import validate_docker_config
-from ray.autoscaler._private.cli_logger import cli_logger
-from ray.autoscaler.tags import NODE_TYPE_LEGACY_WORKER, NODE_TYPE_LEGACY_HEAD
+from ray.autoscaler.tags import NODE_TYPE_LEGACY_HEAD, NODE_TYPE_LEGACY_WORKER
 
 REQUIRED, OPTIONAL = True, False
 
-PLACEMENT_GROUP_RESOURCE_BUNDLED_PATTERN = re.compile(
-    r"(.+)_group_(\d+)_([0-9a-zA-Z]+)"
-)
-PLACEMENT_GROUP_RESOURCE_PATTERN = re.compile(r"(.+)_group_([0-9a-zA-Z]+)")
 
 HEAD_TYPE_MAX_WORKERS_WARN_TEMPLATE = (
     "Setting `max_workers` for node type"
@@ -50,8 +50,11 @@ DictCount = Tuple[Dict, Number]
 # e.g., cpu_4_ondemand.
 NodeType = str
 
+# e.g., head, worker, unmanaged
+NodeKind = str
+
 # e.g., {"resources": ..., "max_workers": ...}.
-NodeTypeConfigDict = str
+NodeTypeConfigDict = Dict[str, Any]
 
 # e.g., {"GPU": 1}.
 ResourceDict = Dict[str, Real]
@@ -62,6 +65,16 @@ NodeID = str
 # e.g., "127.0.0.1".
 NodeIP = str
 
+# Number of nodes to launch
+NodeCount = int
+
+# e.g. "up-to-date", "update-failed"
+# See autoscaler/tags.py for other status
+# values used by the autoscaler.
+NodeStatus = str
+
+Usage = Dict[str, Tuple[Number, Number]]
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,15 +83,15 @@ def is_placement_group_resource(resource_name: str) -> bool:
     Check if a resource name is structured like a placement group.
     """
     return bool(
-        PLACEMENT_GROUP_RESOURCE_PATTERN.match(resource_name)
-        or PLACEMENT_GROUP_RESOURCE_BUNDLED_PATTERN.match(resource_name)
+        PLACEMENT_GROUP_WILDCARD_RESOURCE_PATTERN.match(resource_name)
+        or PLACEMENT_GROUP_INDEXED_BUNDLED_RESOURCE_PATTERN.match(resource_name)
     )
 
 
 @dataclass
 class LoadMetricsSummary:
     # Map of resource name (e.g. "memory") to pair of (Used, Available) numbers
-    usage: Dict[str, Tuple[Number, Number]]
+    usage: Usage
     # Counts of demand bundles from task/actor demand.
     # e.g. [({"CPU": 1}, 5), ({"GPU":1}, 2)]
     resource_demand: List[DictCount]
@@ -87,8 +100,17 @@ class LoadMetricsSummary:
     # Counts of demand bundles requested by autoscaler.sdk.request_resources
     request_demand: List[DictCount]
     node_types: List[DictCount]
-    # Optionally included for backwards compatibility: IP of the head node.
+    # Optionally included for backwards compatibility: IP of the head node. See
+    # https://github.com/ray-project/ray/pull/20623 for details.
     head_ip: Optional[NodeIP] = None
+    # Optionally included for backwards compatibility: Resource breakdown by
+    # node. Mapping from node id to resource usage.
+    usage_by_node: Optional[Dict[str, Usage]] = None
+    # A mapping from node name (the same key as `usage_by_node`) to node type.
+    # Optional for deployment modes which have the concept of node types and
+    # backwards compatibility.
+    node_type_mapping: Optional[Dict[str, str]] = None
+    idle_time_map: Optional[Dict[str, int]] = None
 
 
 class ConcurrentCounter:
@@ -156,7 +178,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if "available_node_types" in config:
         if "head_node_type" not in config:
             raise ValueError(
-                "You must specify `head_node_type` if `available_node_types " "is set."
+                "You must specify `head_node_type` if `available_node_types is set."
             )
         if config["head_node_type"] not in config["available_node_types"]:
             raise ValueError("`head_node_type` must be one of `available_node_types`.")
@@ -209,14 +231,37 @@ def prepare_config(config: Dict[str, Any]) -> Dict[str, Any]:
     - Has max_worker set for each node type.
     """
     is_local = config.get("provider", {}).get("type") == "local"
+    is_kuberay = config.get("provider", {}).get("type") == "kuberay"
     if is_local:
         config = prepare_local(config)
+    elif is_kuberay:
+        # With KubeRay, we don't need to do anything here since KubeRay
+        # generate the autoscaler config from the RayCluster CR instead
+        # of loading from the files.
+        return config
 
     with_defaults = fillout_defaults(config)
     merge_setup_commands(with_defaults)
     validate_docker_config(with_defaults)
     fill_node_type_min_max_workers(with_defaults)
     return with_defaults
+
+
+def translate_trivial_legacy_config(config: Dict[str, Any]):
+    """
+    Drop empty deprecated fields ("head_node" and "worker_node").
+    """
+
+    REMOVABLE_FIELDS = ["head_node", "worker_nodes"]
+
+    for field in REMOVABLE_FIELDS:
+        if field in config and not config[field]:
+            logger.warning(
+                f"Dropping the empty legacy field {field}. {field}"
+                "is not supported for ray>=2.0.0. It is recommended to remove"
+                f"{field} from the cluster config."
+            )
+            del config[field]
 
 
 def fillout_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -243,6 +288,8 @@ def fillout_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
     # Take care of this here, in case a config does not specify any of head,
     # workers, node types, but does specify min workers:
     merged_config.pop("min_workers", None)
+
+    translate_trivial_legacy_config(merged_config)
 
     return merged_config
 
@@ -343,13 +390,37 @@ def fill_node_type_min_max_workers(config):
                 node_type_data.setdefault("max_workers", global_max_workers)
 
 
+def with_envs(cmds: List[str], kv: Dict[str, str]) -> str:
+    """
+    Returns a list of commands with the given environment variables set.
+
+    Args:
+        cmds (List[str]): List of commands to set environment variables for.
+        kv (Dict[str, str]): Dictionary of environment variables to set.
+
+    Returns:
+        List[str]: List of commands with the given environment variables set.
+
+    Example:
+        with_envs(["echo $FOO"], {"FOO": "BAR"})
+            -> ["export FOO=BAR; echo $FOO"]
+    """
+    out_cmds = []
+    for cmd in cmds:
+        kv_str = ""
+        for k, v in kv.items():
+            # We will need to do export here so that it works correctly with
+            # shell if the cmd args uses the argument.
+            kv_str += f"export {k}={v}; "
+
+        out_cmds.append(f"{kv_str}{cmd}")
+    return out_cmds
+
+
 def with_head_node_ip(cmds, head_ip=None):
     if head_ip is None:
         head_ip = services.get_node_ip_address()
-    out = []
-    for cmd in cmds:
-        out.append("export RAY_HEAD_IP={}; {}".format(head_ip, cmd))
-    return out
+    return with_envs(cmds, {"RAY_HEAD_IP": head_ip})
 
 
 def hash_launch_conf(node_conf, auth):
@@ -395,7 +466,7 @@ def hash_runtime_conf(
     def add_content_hashes(path, allow_non_existing_paths: bool = False):
         def add_hash_of_file(fpath):
             with open(fpath, "rb") as f:
-                for chunk in iter(lambda: f.read(2 ** 20), b""):
+                for chunk in iter(lambda: f.read(2**20), b""):
                     contents_hasher.update(chunk)
 
         path = os.path.expanduser(path)
@@ -473,7 +544,7 @@ def format_pg(pg):
 
 def parse_placement_group_resource_str(
     placement_group_resource_str: str,
-) -> Tuple[str, Optional[str]]:
+) -> Tuple[str, Optional[str], bool]:
     """Parse placement group resource in the form of following 3 cases:
     {resource_name}_group_{bundle_id}_{group_name};
     -> This case is ignored as it is duplicated to the case below.
@@ -489,22 +560,45 @@ def parse_placement_group_resource_str(
         have duplicated resource information as
         wildcard resources (resource name without bundle index).
     """
-    result = PLACEMENT_GROUP_RESOURCE_BUNDLED_PATTERN.match(
+    result = PLACEMENT_GROUP_INDEXED_BUNDLED_RESOURCE_PATTERN.match(
         placement_group_resource_str
     )
     if result:
         return (result.group(1), result.group(3), False)
-    result = PLACEMENT_GROUP_RESOURCE_PATTERN.match(placement_group_resource_str)
+    result = PLACEMENT_GROUP_WILDCARD_RESOURCE_PATTERN.match(
+        placement_group_resource_str
+    )
     if result:
         return (result.group(1), result.group(2), True)
     return (placement_group_resource_str, None, True)
 
 
-def get_usage_report(lm_summary: LoadMetricsSummary) -> str:
+MEMORY_SUFFIXES = [
+    ("TiB", 2**40),
+    ("GiB", 2**30),
+    ("MiB", 2**20),
+    ("KiB", 2**10),
+]
+
+
+def format_memory(mem_bytes: Number) -> str:
+    """Formats memory in bytes in friendly unit. E.g. (2**30 + 1) bytes should
+    be displayed as 1GiB but 1 byte should be displayed as 1B, (as opposed to
+    rounding it to 0GiB).
+    """
+    for suffix, bytes_per_unit in MEMORY_SUFFIXES:
+        if mem_bytes >= bytes_per_unit:
+            mem_in_unit = mem_bytes / bytes_per_unit
+            return f"{mem_in_unit:.2f}{suffix}"
+
+    return f"{int(mem_bytes)}B"
+
+
+def parse_usage(usage: Usage, verbose: bool) -> List[str]:
     # first collect resources used in placement groups
     placement_group_resource_usage = {}
     placement_group_resource_total = collections.defaultdict(float)
-    for resource, (used, total) in lm_summary.usage.items():
+    for resource, (used, total) in usage.items():
         (pg_resource_name, pg_name, is_countable) = parse_placement_group_resource_str(
             resource
         )
@@ -515,9 +609,8 @@ def get_usage_report(lm_summary: LoadMetricsSummary) -> str:
                 placement_group_resource_usage[pg_resource_name] += used
                 placement_group_resource_total[pg_resource_name] += total
             continue
-
     usage_lines = []
-    for resource, (used, total) in sorted(lm_summary.usage.items()):
+    for resource, (used, total) in sorted(usage.items()):
         if "node:" in resource:
             continue  # Skip the auto-added per-node "node:<ip>" resource.
 
@@ -538,23 +631,38 @@ def get_usage_report(lm_summary: LoadMetricsSummary) -> str:
             used = used - pg_total + pg_used
 
         if resource in ["memory", "object_store_memory"]:
-            to_GiB = 1 / 2 ** 30
-            line = f" {(used * to_GiB):.2f}/" f"{(total * to_GiB):.3f} GiB {resource}"
+            formatted_used = format_memory(used)
+            formatted_total = format_memory(total)
+            line = f"{formatted_used}/{formatted_total} {resource}"
             if used_in_pg:
+                formatted_pg_used = format_memory(pg_used)
+                formatted_pg_total = format_memory(pg_total)
                 line = line + (
-                    f" ({(pg_used * to_GiB):.2f} used of "
-                    f"{(pg_total * to_GiB):.2f} GiB " + "reserved in placement groups)"
+                    f" ({formatted_pg_used} used of "
+                    f"{formatted_pg_total} " + "reserved in placement groups)"
                 )
             usage_lines.append(line)
+        elif resource.startswith("accelerator_type:") and not verbose:
+            # We made a judgement call not to show this.
+            # https://github.com/ray-project/ray/issues/33272
+            pass
         else:
-            line = f" {used}/{total} {resource}"
+            line = f"{used}/{total} {resource}"
             if used_in_pg:
                 line += (
                     f" ({pg_used} used of " f"{pg_total} reserved in placement groups)"
                 )
             usage_lines.append(line)
-    usage_report = "\n".join(usage_lines)
-    return usage_report
+    return usage_lines
+
+
+def get_usage_report(lm_summary: LoadMetricsSummary, verbose: bool) -> str:
+    usage_lines = parse_usage(lm_summary.usage, verbose)
+
+    sio = StringIO()
+    for line in usage_lines:
+        print(f" {line}", file=sio)
+    return sio.getvalue()
 
 
 def format_resource_demand_summary(
@@ -588,9 +696,19 @@ def format_resource_demand_summary(
             using_placement_group,
         ) = filter_placement_group_from_bundle(bundle)
 
-        # bundle is a special keyword for placement group ready tasks
-        # do not report the demand for this.
-        if "bundle" in pg_filtered_bundle.keys():
+        # bundle is a special keyword for placement group scheduling
+        # but it doesn't need to be exposed to users. Remove it from
+        # the demand report.
+        if (
+            using_placement_group
+            and ray_constants.PLACEMENT_GROUP_BUNDLE_RESOURCE_NAME
+            in pg_filtered_bundle.keys()
+        ):
+            del pg_filtered_bundle[ray_constants.PLACEMENT_GROUP_BUNDLE_RESOURCE_NAME]
+
+        # No need to report empty request to demand (e.g.,
+        # placement group ready task).
+        if len(pg_filtered_bundle.keys()) == 0:
             continue
 
         bundle_demand[tuple(sorted(pg_filtered_bundle.items()))] += count
@@ -625,16 +743,106 @@ def get_demand_report(lm_summary: LoadMetricsSummary):
     return demand_report
 
 
-def format_info_string(lm_summary, autoscaler_summary, time=None):
+def get_per_node_breakdown_as_dict(
+    lm_summary: LoadMetricsSummary,
+) -> dict:
+    per_node_breakdown = {}
+
+    for node_id, usage in lm_summary.usage_by_node.items():
+        usage_string = ""
+        for line in parse_usage(usage, verbose=True):
+            usage_string += f"{line}\n"
+        per_node_breakdown[node_id] = usage_string.strip()
+
+    return per_node_breakdown
+
+
+def get_per_node_breakdown(
+    lm_summary: LoadMetricsSummary,
+    node_type_mapping: Optional[Dict[str, float]],
+    node_activities: Optional[Dict[str, List[str]]],
+    verbose: bool,
+) -> str:
+    sio = StringIO()
+
+    if node_type_mapping is None:
+        node_type_mapping = {}
+
+    print(file=sio)
+    for node_id, usage in lm_summary.usage_by_node.items():
+        print(file=sio)  # Print a newline.
+        node_string = f"Node: {node_id}"
+        if node_id in node_type_mapping:
+            node_type = node_type_mapping[node_id]
+            node_string += f" ({node_type})"
+        print(node_string, file=sio)
+        if (
+            lm_summary.idle_time_map
+            and node_id in lm_summary.idle_time_map
+            and lm_summary.idle_time_map[node_id] > 0
+        ):
+            print(f" Idle: {lm_summary.idle_time_map[node_id]} ms", file=sio)
+
+        print(" Usage:", file=sio)
+        for line in parse_usage(usage, verbose):
+            print(f"  {line}", file=sio)
+        # Don't print anything if not provided.
+        if not node_activities:
+            continue
+        print(" Activity:", file=sio)
+        if node_id not in node_activities:
+            print("  (no activity)", file=sio)
+        else:
+            # Note: We have node IP here.
+            _, reasons = node_activities[node_id]
+            for reason in reasons:
+                print(f"  {reason}", file=sio)
+
+    return sio.getvalue()
+
+
+def format_info_string(
+    lm_summary,
+    autoscaler_summary,
+    time=None,
+    gcs_request_time: Optional[float] = None,
+    non_terminated_nodes_time: Optional[float] = None,
+    autoscaler_update_time: Optional[float] = None,
+    verbose: bool = False,
+):
     if time is None:
         time = datetime.now()
     header = "=" * 8 + f" Autoscaler status: {time} " + "=" * 8
     separator = "-" * len(header)
+    if verbose:
+        header += "\n"
+        if gcs_request_time:
+            header += f"GCS request time: {gcs_request_time:3f}s\n"
+        if non_terminated_nodes_time:
+            header += (
+                "Node Provider non_terminated_nodes time: "
+                f"{non_terminated_nodes_time:3f}s\n"
+            )
+        if autoscaler_update_time:
+            header += "Autoscaler iteration time: " f"{autoscaler_update_time:3f}s\n"
+
     available_node_report_lines = []
-    for node_type, count in autoscaler_summary.active_nodes.items():
-        line = f" {count} {node_type}"
-        available_node_report_lines.append(line)
-    available_node_report = "\n".join(available_node_report_lines)
+    if not autoscaler_summary.active_nodes:
+        available_node_report = " (no active nodes)"
+    else:
+        for node_type, count in autoscaler_summary.active_nodes.items():
+            line = f" {count} {node_type}"
+            available_node_report_lines.append(line)
+        available_node_report = "\n".join(available_node_report_lines)
+
+    if not autoscaler_summary.idle_nodes:
+        idle_node_report = " (no idle nodes)"
+    else:
+        idle_node_report_lines = []
+        for node_type, count in autoscaler_summary.idle_nodes.items():
+            line = f" {count} {node_type}"
+            idle_node_report_lines.append(line)
+        idle_node_report = "\n".join(idle_node_report_lines)
 
     pending_lines = []
     for node_type, count in autoscaler_summary.pending_launches.items():
@@ -650,8 +858,33 @@ def format_info_string(lm_summary, autoscaler_summary, time=None):
 
     failure_lines = []
     for ip, node_type in autoscaler_summary.failed_nodes:
-        line = f" {ip}: {node_type}"
+        line = f" {node_type}: NodeTerminated (ip: {ip})"
         failure_lines.append(line)
+    if autoscaler_summary.node_availability_summary:
+        records = sorted(
+            autoscaler_summary.node_availability_summary.node_availabilities.values(),
+            key=lambda record: record.last_checked_timestamp,
+        )
+        for record in records:
+            if record.is_available:
+                continue
+            assert record.unavailable_node_information is not None
+            node_type = record.node_type
+            category = record.unavailable_node_information.category
+            description = record.unavailable_node_information.description
+            attempted_time = datetime.fromtimestamp(record.last_checked_timestamp)
+            formatted_time = (
+                # This `:02d` funny business is python syntax for printing a 2
+                # digit number with a leading zero as padding if needed.
+                f"{attempted_time.hour:02d}:"
+                f"{attempted_time.minute:02d}:"
+                f"{attempted_time.second:02d}"
+            )
+            line = f" {node_type}: {category} (latest_attempt: {formatted_time})"
+            if verbose:
+                line += f" - {description}"
+            failure_lines.append(line)
+
     failure_lines = failure_lines[: -constants.AUTOSCALER_MAX_FAILURES_DISPLAYED : -1]
     failure_report = "Recent failures:\n"
     if failure_lines:
@@ -659,26 +892,43 @@ def format_info_string(lm_summary, autoscaler_summary, time=None):
     else:
         failure_report += " (no failures)"
 
-    usage_report = get_usage_report(lm_summary)
+    usage_report = get_usage_report(lm_summary, verbose)
     demand_report = get_demand_report(lm_summary)
-
     formatted_output = f"""{header}
 Node status
 {separator}
-Healthy:
-{available_node_report}
+Active:
+{available_node_report}"""
+
+    if not autoscaler_summary.legacy:
+        formatted_output += f"""
+Idle:
+{idle_node_report}"""
+
+    formatted_output += f"""
 Pending:
 {pending_report}
 {failure_report}
 
 Resources
 {separator}
-Usage:
+{"Total " if verbose else ""}Usage:
 {usage_report}
-
-Demands:
+{"Total " if verbose else ""}Demands:
 {demand_report}"""
-    return formatted_output
+
+    if verbose:
+        if lm_summary.usage_by_node:
+            formatted_output += get_per_node_breakdown(
+                lm_summary,
+                autoscaler_summary.node_type_mapping,
+                autoscaler_summary.node_activities,
+                verbose,
+            )
+        else:
+            formatted_output += "\n"
+
+    return formatted_output.strip()
 
 
 def format_readonly_node_type(node_id: str):

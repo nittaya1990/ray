@@ -6,6 +6,7 @@ import io.ray.api.id.ActorId;
 import io.ray.api.id.JobId;
 import io.ray.api.id.TaskId;
 import io.ray.api.id.UniqueId;
+import io.ray.api.runtimeenv.RuntimeEnv;
 import io.ray.runtime.generated.Common.Address;
 import io.ray.runtime.generated.Common.TaskSpec;
 import io.ray.runtime.generated.Common.TaskType;
@@ -48,31 +49,21 @@ public class LocalModeWorkerContext implements WorkerContext {
   @Override
   public ActorId getCurrentActorId() {
     TaskSpec taskSpec = currentTask.get();
-    if (taskSpec == null) {
-      return ActorId.NIL;
-    }
+    checkTaskSpecNotNull(taskSpec);
     return LocalModeTaskSubmitter.getActorId(taskSpec);
   }
 
   @Override
-  public ClassLoader getCurrentClassLoader() {
-    return null;
-  }
-
-  @Override
-  public void setCurrentClassLoader(ClassLoader currentClassLoader) {}
-
-  @Override
   public TaskType getCurrentTaskType() {
     TaskSpec taskSpec = currentTask.get();
-    Preconditions.checkNotNull(taskSpec, "Current task is not set.");
+    checkTaskSpecNotNull(taskSpec);
     return taskSpec.getType();
   }
 
   @Override
   public TaskId getCurrentTaskId() {
     TaskSpec taskSpec = currentTask.get();
-    Preconditions.checkState(taskSpec != null);
+    checkTaskSpecNotNull(taskSpec);
     return TaskId.fromBytes(taskSpec.getTaskId().toByteArray());
   }
 
@@ -81,11 +72,18 @@ public class LocalModeWorkerContext implements WorkerContext {
     return Address.getDefaultInstance();
   }
 
+  @Override
+  public RuntimeEnv getCurrentRuntimeEnv() {
+    throw new RuntimeException("Not implemented.");
+  }
+
   public void setCurrentTask(TaskSpec taskSpec) {
     currentTask.set(taskSpec);
   }
 
-  public TaskSpec getCurrentTask() {
-    return currentTask.get();
+  private static void checkTaskSpecNotNull(TaskSpec taskSpec) {
+    Preconditions.checkNotNull(
+        taskSpec,
+        "Current task is not set. Maybe you invoked this API in a user-created thread not managed by Ray. Invoking this API in a user-created thread is not supported yet in local mode. You can switch to cluster mode.");
   }
 }

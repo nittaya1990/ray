@@ -1,83 +1,90 @@
-.. _offline-reference-docs:
+.. include:: /_includes/rllib/we_are_hiring.rst
 
-Offline RL
-==========
+.. _new-api-offline-reference-docs:
 
+Offline RL API
+==============
 
-InputReaders
-------------
+.. include:: /_includes/rllib/new_api_stack.rst
 
-The InputReader API is used by an individual :py:class:`~ray.rllib.evaluation.rollout_worker.RolloutWorker`
-to produce batches of experiences either from an simulator/environment or from an
-offline source (e.g. a file).
+Configuring Offline RL
+----------------------
 
-Here, we introduce the generic API and its child classes used for reading offline data (for offline RL).
-For details on RLlib's :py:class:`~ray.rllib.evaluation.sampler.Sampler` implementations
-for collecting data from simulators/environments, see the :ref:`Sampler docs here<sampler-docs>`.
+.. currentmodule:: ray.rllib.algorithms.algorithm_config
 
-.. autoclass:: ray.rllib.offline.input_reader.InputReader
-    :members:
+.. autosummary::
+    :nosignatures:
+    :toctree: doc/
 
+    AlgorithmConfig.offline_data
+    AlgorithmConfig.learners
 
-JsonReader (ray.rllib.offline.json_reader.JsonReader)
-+++++++++++++++++++++++++++++++++++++++++++++++++++++
+Configuring Offline Recording EnvRunners
+----------------------------------------
 
-For reading data from offline files (for example when no simulator/environment is available),
-you can use the built-in :py:class:`~ray.rllib.offline.json_reader.JsonReader` class.
+.. autosummary::
+    :nosignatures:
+    :toctree: doc/
 
-You will have to change the ``input`` config value from "sampler" (default) to a
-JSON file name (str), a list of JSON files, or a path name (str) that contains JSON files.
-Alternatively, you can specify a callable that takes a :py:class:`~ray.rllib.offline.io_context.IOContext` object as only
-arg and returns a new :py:class:`~ray.rllib.offline.input_reader.InputReader` instance, for example:
+    AlgorithmConfig.env_runners
 
-.. code-block:: python
+Constructing a Recording EnvRunner
+----------------------------------
 
-    config = {
-        "input": lambda io_ctx: MyReader([arg1], [arg2], [io_ctx]),
-    }
+.. currentmodule:: ray.rllib.offline.offline_env_runner
 
-For details on the :py:class:`~ray.rllib.offline.io_context.IOContext` class, see below.
+.. autosummary::
+    :nosignatures:
+    :toctree: doc/
 
-.. autoclass:: ray.rllib.offline.json_reader.JsonReader
-    :special-members: __init__
-    :members:
+    OfflineSingleAgentEnvRunner
 
-MixedInput  (ray.rllib.offline.mixed_input.MixedInput)
-++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Constructing OfflineData
+------------------------
 
-In order to mix different input readers with each other in different custom ratios, you can use
-the :py:class:`~ray.rllib.offline.mixed_input.MixedInput` reader. This reader is chosen
-automatically by RLlib when you provide a dict under
-the ``input`` config key that maps input reader specifiers to probabilities, e.g.:
+.. currentmodule:: ray.rllib.offline.offline_data
 
-.. code-block:: python
+.. autosummary::
+    :nosignatures:
+    :toctree: doc/
 
-    "input": {
-       "sampler": 0.4,  # 40% of samples will come from environment
-       "/tmp/experiences/*.json": 0.4,  # the rest from different JSON files
-       "s3://bucket/expert.json": 0.2,
-    }
+    OfflineData
+    OfflineData.__init__
 
-.. autoclass:: ray.rllib.offline.mixed_input.MixedInput
-    :special-members: __init__
-    :members:
+Sampling from Offline Data
+--------------------------
 
+.. autosummary::
+    :nosignatures:
+    :toctree: doc/
 
-D4RLReader (ray.rllib.offline.d4rl_reader.D4RLReader)
-+++++++++++++++++++++++++++++++++++++++++++++++++++++
+    OfflineData.sample
+    OfflineData.default_map_batches_kwargs
+    OfflineData.default_iter_batches_kwargs
 
-.. autoclass:: ray.rllib.offline.d4rl_reader.D4RLReader
-    :special-members: __init__
-    :members:
+Constructing an OfflinePreLearner
+---------------------------------
 
+.. currentmodule:: ray.rllib.offline.offline_prelearner
 
+.. autosummary::
+    :nosignatures:
+    :toctree: doc/
 
-IOContext
----------
+    OfflinePreLearner
+    OfflinePreLearner.__init__
 
-IOContext instances are used in every InputReader and OutputWriter class. They serve as
-simple containers for the properties: ``log_dir``, ``config``, and ``worker_index``.
+Transforming Data with an OfflinePreLearner
+-------------------------------------------
 
-.. autoclass:: ray.rllib.offline.io_context.IOContext
-    :special-members: __init__
-    :members:
+.. autosummary::
+    :nosignatures:
+    :toctree: doc/
+
+    SCHEMA
+    OfflinePreLearner.__call__
+    OfflinePreLearner._map_to_episodes
+    OfflinePreLearner._map_sample_batch_to_episode
+    OfflinePreLearner._should_module_be_updated
+    OfflinePreLearner.default_prelearner_buffer_class
+    OfflinePreLearner.default_prelearner_buffer_kwargs

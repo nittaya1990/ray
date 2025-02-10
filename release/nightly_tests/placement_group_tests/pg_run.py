@@ -4,6 +4,7 @@ import json
 
 import ray
 from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 # Tests are supposed to run for 10 minutes.
 RUNTIME = 600
@@ -41,10 +42,15 @@ def main():
     ray.get(pg.ready())
 
     workers = [
-        Worker.options(placement_group=pg).remote(i) for i in range(NUM_CPU_BUNDLES)
+        Worker.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg)
+        ).remote(i)
+        for i in range(NUM_CPU_BUNDLES)
     ]
 
-    trainer = Trainer.options(placement_group=pg).remote(0)
+    trainer = Trainer.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg)
+    ).remote(0)
 
     start = time.time()
     while True:
@@ -55,9 +61,9 @@ def main():
             break
 
     if "TEST_OUTPUT_JSON" in os.environ:
-        out_file = open(os.environ["TEST_OUTPUT_JSON"], "w")
-        results = {}
-        json.dump(results, out_file)
+        with open(os.environ["TEST_OUTPUT_JSON"], "w") as out_file:
+            results = {}
+            json.dump(results, out_file)
 
 
 if __name__ == "__main__":

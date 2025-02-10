@@ -1,10 +1,12 @@
-from gym.spaces import Space
+from gymnasium.spaces import Space
 from typing import Optional
 
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.exploration.gaussian_noise import GaussianNoise
 from ray.rllib.utils.schedules import ConstantSchedule
 
 
+@OldAPIStack
 class PerWorkerGaussianNoise(GaussianNoise):
     """A per-worker Gaussian noise class for distributed algorithms.
 
@@ -36,7 +38,7 @@ class PerWorkerGaussianNoise(GaussianNoise):
             if worker_index > 0:
                 num_workers_minus_1 = float(num_workers - 1) if num_workers > 1 else 1.0
                 exponent = 1 + (worker_index / num_workers_minus_1) * 7
-                scale_schedule = ConstantSchedule(0.4 ** exponent, framework=framework)
+                scale_schedule = ConstantSchedule(0.4**exponent, framework=framework)
             # Local worker should have zero exploration so that eval
             # rollouts run properly.
             else:

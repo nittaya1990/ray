@@ -1,23 +1,29 @@
 import logging
 import os
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, List, Optional
-from pathlib import Path
-import asyncio
 
-from ray.experimental.internal_kv import _internal_kv_initialized
 from ray._private.runtime_env.context import RuntimeEnvContext
 from ray._private.runtime_env.packaging import (
-    download_and_unpack_package,
-    delete_package,
-    get_local_dir_from_uri,
-    get_uri_for_directory,
-    parse_uri,
     Protocol,
+    delete_package,
+    download_and_unpack_package,
+    get_local_dir_from_uri,
+    get_uri_for_file,
+    get_uri_for_directory,
+    get_uri_for_package,
+    install_wheel_package,
+    is_whl_uri,
+    package_exists,
+    parse_uri,
     upload_package_if_needed,
+    upload_package_to_gcs,
 )
-from ray._private.utils import get_directory_size_bytes
-from ray._private.utils import try_to_create_directory
+from ray._private.runtime_env.plugin import RuntimeEnvPlugin
+from ray._private.runtime_env.working_dir import set_pythonpath_in_context
+from ray._private.utils import get_directory_size_bytes, try_to_create_directory
+from ray.exceptions import RuntimeEnvSetupError
 
 default_logger = logging.getLogger(__name__)
 
@@ -28,16 +34,21 @@ def _check_is_uri(s: str) -> bool:
     except ValueError:
         protocol, path = None, None
 
-    if protocol in Protocol.remote_protocols() and not path.endswith(".zip"):
-        raise ValueError("Only .zip files supported for remote URIs.")
+    if (
+        protocol in Protocol.remote_protocols()
+        and not path.endswith(".zip")
+        and not path.endswith(".whl")
+    ):
+        raise ValueError("Only .zip or .whl files supported for remote URIs.")
 
     return protocol is not None
 
 
 def upload_py_modules_if_needed(
     runtime_env: Dict[str, Any],
-    scratch_dir: str,
+    scratch_dir: Optional[str] = os.getcwd(),
     logger: Optional[logging.Logger] = default_logger,
+    upload_fn=None,
 ) -> Dict[str, Any]:
     """Uploads the entries in py_modules and replaces them with a list of URIs.
 
@@ -61,15 +72,20 @@ def upload_py_modules_if_needed(
         elif isinstance(module, Path):
             module_path = str(module)
         elif isinstance(module, ModuleType):
-            # NOTE(edoakes): Python allows some installed Python packages to
-            # be split into multiple directories. We could probably handle
-            # this, but it seems tricky & uncommon. If it's a problem for
-            # users, we can add this support on demand.
-            if len(module.__path__) > 1:
-                raise ValueError(
-                    "py_modules only supports modules whose " "__path__ has length 1."
-                )
-            [module_path] = module.__path__
+            if not hasattr(module, "__path__"):
+                # This is a single-file module.
+                module_path = module.__file__
+            else:
+                # NOTE(edoakes): Python allows some installed Python packages to
+                # be split into multiple directories. We could probably handle
+                # this, but it seems tricky & uncommon. If it's a problem for
+                # users, we can add this support on demand.
+                if len(module.__path__) > 1:
+                    raise ValueError(
+                        "py_modules only supports modules whose __path__"
+                        " has length 1 or those who are single-file."
+                    )
+                [module_path] = module.__path__
         else:
             raise TypeError(
                 "py_modules must be a list of file paths, URIs, "
@@ -80,16 +96,60 @@ def upload_py_modules_if_needed(
             module_uri = module_path
         else:
             # module_path is a local path.
-            excludes = runtime_env.get("excludes", None)
-            module_uri = get_uri_for_directory(module_path, excludes=excludes)
-            upload_package_if_needed(
-                module_uri,
-                scratch_dir,
-                module_path,
-                excludes=excludes,
-                include_parent_dir=True,
-                logger=logger,
-            )
+            if Path(module_path).is_dir() or Path(module_path).suffix == ".py":
+                is_dir = Path(module_path).is_dir()
+                excludes = runtime_env.get("excludes", None)
+                if is_dir:
+                    module_uri = get_uri_for_directory(module_path, excludes=excludes)
+                else:
+                    module_uri = get_uri_for_file(module_path)
+                if upload_fn is None:
+                    try:
+                        upload_package_if_needed(
+                            module_uri,
+                            scratch_dir,
+                            module_path,
+                            excludes=excludes,
+                            include_parent_dir=is_dir,
+                            logger=logger,
+                        )
+                    except Exception as e:
+                        from ray.util.spark.utils import is_in_databricks_runtime
+
+                        if is_in_databricks_runtime():
+                            raise RuntimeEnvSetupError(
+                                f"Failed to upload module {module_path} to the Ray "
+                                f"cluster, please ensure there are only files under "
+                                f"the module path, notebooks under the path are "
+                                f"not allowed, original exception: {e}"
+                            ) from e
+                        raise RuntimeEnvSetupError(
+                            f"Failed to upload module {module_path} to the Ray "
+                            f"cluster: {e}"
+                        ) from e
+                else:
+                    upload_fn(module_path, excludes=excludes)
+            elif Path(module_path).suffix == ".whl":
+                module_uri = get_uri_for_package(Path(module_path))
+                if upload_fn is None:
+                    if not package_exists(module_uri):
+                        try:
+                            upload_package_to_gcs(
+                                module_uri, Path(module_path).read_bytes()
+                            )
+                        except Exception as e:
+                            raise RuntimeEnvSetupError(
+                                f"Failed to upload {module_path} to the Ray "
+                                f"cluster: {e}"
+                            ) from e
+                else:
+                    upload_fn(module_path, excludes=None, is_file=True)
+            else:
+                raise ValueError(
+                    "py_modules entry must be a .py file, "
+                    "a directory, or a .whl file; "
+                    f"got {module_path}"
+                )
 
         py_modules_uris.append(module_uri)
 
@@ -100,16 +160,25 @@ def upload_py_modules_if_needed(
     return runtime_env
 
 
-class PyModulesManager:
-    def __init__(self, resources_dir: str):
+class PyModulesPlugin(RuntimeEnvPlugin):
+
+    name = "py_modules"
+
+    def __init__(
+        self, resources_dir: str, gcs_aio_client: "GcsAioClient"  # noqa: F821
+    ):
         self._resources_dir = os.path.join(resources_dir, "py_modules_files")
+        self._gcs_aio_client = gcs_aio_client
         try_to_create_directory(self._resources_dir)
-        assert _internal_kv_initialized()
+
+    def _get_local_dir_from_uri(self, uri: str):
+        return get_local_dir_from_uri(uri, self._resources_dir)
 
     def delete_uri(
         self, uri: str, logger: Optional[logging.Logger] = default_logger
     ) -> int:
         """Delete URI and return the number of bytes deleted."""
+        logger.info("Got request to delete pymodule URI %s", uri)
         local_dir = get_local_dir_from_uri(uri, self._resources_dir)
         local_dir_size = get_directory_size_bytes(local_dir)
 
@@ -120,7 +189,7 @@ class PyModulesManager:
 
         return local_dir_size
 
-    def get_uris(self, runtime_env: dict) -> Optional[List[str]]:
+    def get_uris(self, runtime_env) -> List[str]:
         return runtime_env.py_modules()
 
     async def create(
@@ -130,40 +199,35 @@ class PyModulesManager:
         context: RuntimeEnvContext,
         logger: Optional[logging.Logger] = default_logger,
     ) -> int:
-        # Currently create method is still a sync process, to avoid blocking
-        # the loop, need to run this function in another thread.
-        # TODO(Catch-Bull): Refactor method create into an async process, and
-        # make this method running in current loop.
-        def _create():
-            module_dir = download_and_unpack_package(
-                uri, self._resources_dir, logger=logger
-            )
-            return get_directory_size_bytes(module_dir)
 
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _create)
+        module_dir = await download_and_unpack_package(
+            uri, self._resources_dir, self._gcs_aio_client, logger=logger
+        )
+
+        if is_whl_uri(uri):
+            wheel_uri = module_dir
+            module_dir = self._get_local_dir_from_uri(uri)
+            await install_wheel_package(
+                wheel_uri=wheel_uri, target_dir=module_dir, logger=logger
+            )
+
+        return get_directory_size_bytes(module_dir)
 
     def modify_context(
         self,
-        uris: Optional[List[str]],
+        uris: List[str],
         runtime_env_dict: Dict,
         context: RuntimeEnvContext,
         logger: Optional[logging.Logger] = default_logger,
     ):
-        if uris is None:
-            return
         module_dirs = []
         for uri in uris:
-            module_dir = get_local_dir_from_uri(uri, self._resources_dir)
+            module_dir = self._get_local_dir_from_uri(uri)
             if not module_dir.exists():
                 raise ValueError(
                     f"Local directory {module_dir} for URI {uri} does "
                     "not exist on the cluster. Something may have gone wrong while "
-                    "downloading or unpacking the py_modules files."
+                    "downloading, unpacking or installing the py_modules files."
                 )
             module_dirs.append(str(module_dir))
-        # Insert the py_modules directories into the PYTHONPATH.
-        python_path = os.pathsep.join(module_dirs)
-        if "PYTHONPATH" in context.env_vars:
-            python_path += os.pathsep + context.env_vars["PYTHONPATH"]
-        context.env_vars["PYTHONPATH"] = python_path
+        set_pythonpath_in_context(os.pathsep.join(module_dirs), context)

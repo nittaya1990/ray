@@ -1,47 +1,45 @@
-import pytest
 import sys
 import time
 
-try:
-    import pytest_timeout
-except ImportError:
-    pytest_timeout = None
+import pytest
 
 import ray
-import ray.cluster_utils
 import ray._private.gcs_utils as gcs_utils
-
-from ray.autoscaler._private.commands import debug_status
+import ray.cluster_utils
+import ray.experimental.internal_kv as internal_kv
+from ray._private.ray_constants import (
+    DEBUG_AUTOSCALING_ERROR,
+    DEBUG_AUTOSCALING_STATUS,
+)
+from ray.autoscaler._private.constants import AUTOSCALER_UPDATE_INTERVAL_S
 from ray._private.test_utils import (
+    convert_actor_state,
     generate_system_config_map,
+    is_placement_group_removed,
     kill_actor_and_wait_for_failure,
+    reset_autoscaler_v2_enabled_cache,
     run_string_as_driver,
     wait_for_condition,
-    is_placement_group_removed,
-    convert_actor_state,
 )
+from ray.autoscaler._private.commands import debug_status
 from ray.exceptions import RaySystemError
-from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.client.ray_client_helpers import connect_to_client_or_not
-import ray.experimental.internal_kv as internal_kv
-from ray.ray_constants import DEBUG_AUTOSCALING_ERROR, DEBUG_AUTOSCALING_STATUS
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 
 def get_ray_status_output(address):
-    if gcs_utils.use_gcs_for_bootstrap():
-        gcs_client = gcs_utils.GcsClient(address=address)
-    else:
-        redis_client = ray._private.services.create_redis_client(address, "")
-        gcs_client = gcs_utils.GcsClient.create_from_redis(redis_client)
+    gcs_client = ray._raylet.GcsClient(address=address)
     internal_kv._initialize_internal_kv(gcs_client)
     status = internal_kv._internal_kv_get(DEBUG_AUTOSCALING_STATUS)
     error = internal_kv._internal_kv_get(DEBUG_AUTOSCALING_ERROR)
+    print(debug_status(status, error, address=address))
     return {
-        "demand": debug_status(status, error)
+        "demand": debug_status(status, error, address=address)
         .split("Demands:")[1]
         .strip("\n")
         .strip(" "),
-        "usage": debug_status(status, error)
+        "usage": debug_status(status, error, address=address)
         .split("Demands:")[0]
         .split("Usage:")[1]
         .strip("\n")
@@ -53,7 +51,9 @@ def get_ray_status_output(address):
     "ray_start_cluster_head_with_external_redis",
     [
         generate_system_config_map(
-            num_heartbeats_timeout=10, gcs_rpc_server_reconnect_timeout_s=60
+            health_check_initial_delay_ms=0,
+            health_check_failure_threshold=10,
+            gcs_rpc_server_reconnect_timeout_s=60,
         )
     ],
     indirect=True,
@@ -82,7 +82,9 @@ def test_create_placement_group_during_gcs_server_restart(
     "ray_start_cluster_head_with_external_redis",
     [
         generate_system_config_map(
-            num_heartbeats_timeout=10, gcs_rpc_server_reconnect_timeout_s=60
+            health_check_initial_delay_ms=0,
+            health_check_failure_threshold=10,
+            gcs_rpc_server_reconnect_timeout_s=60,
         )
     ],
     indirect=True,
@@ -111,6 +113,18 @@ def test_placement_group_wait_api(ray_start_cluster_head_with_external_redis):
     # Wait for placement group 1 after it is removed.
     with pytest.raises(Exception):
         placement_group1.wait(10)
+
+
+def test_placement_group_wait_api_timeout(shutdown_only):
+    """Make sure the wait API timeout works
+
+    https://github.com/ray-project/ray/issues/27287
+    """
+    ray.init(num_cpus=1)
+    pg = ray.util.placement_group(bundles=[{"CPU": 2}])
+    start = time.time()
+    assert not pg.wait(5)
+    assert 5 <= time.time() - start
 
 
 @pytest.mark.parametrize("connect_to_client", [False, True])
@@ -148,6 +162,7 @@ def test_detached_placement_group(ray_start_cluster):
     # Make sure detached placement group will alive when job dead.
     driver_code = f"""
 import ray
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 ray.init(address="{info["address"]}")
 
@@ -162,8 +177,9 @@ class Actor:
         return True
 
 for bundle_index in range(2):
-    actor = Actor.options(lifetime="detached", placement_group=pg,
-                placement_group_bundle_index=bundle_index).remote()
+    actor = Actor.options(lifetime="detached",
+        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg,
+                placement_group_bundle_index=bundle_index)).remote()
     ray.get(actor.ready.remote())
 
 ray.shutdown()
@@ -173,7 +189,7 @@ ray.shutdown()
 
     # Wait until the driver is reported as dead by GCS.
     def is_job_done():
-        jobs = ray.state.jobs()
+        jobs = ray._private.state.jobs()
         for job in jobs:
             if job["IsDead"]:
                 return True
@@ -188,7 +204,7 @@ ray.shutdown()
 
     def assert_alive_num_actor(expected_num_actor):
         alive_num_actor = 0
-        for actor_info in ray.state.actors().values():
+        for actor_info in ray._private.state.actors().values():
             if actor_info["State"] == convert_actor_state(
                 gcs_utils.ActorTableData.ALIVE
             ):
@@ -228,8 +244,9 @@ ray.shutdown()
             # Schedule nested actor with the placement group.
             for bundle_index in range(2):
                 actor = NestedActor.options(
-                    placement_group=pg,
-                    placement_group_bundle_index=bundle_index,
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg, placement_group_bundle_index=bundle_index
+                    ),
                     lifetime="detached",
                 ).remote()
                 ray.get(actor.ready.remote())
@@ -278,7 +295,7 @@ ray.shutdown()
 
     # Wait until the driver is reported as dead by GCS.
     def is_job_done():
-        jobs = ray.state.jobs()
+        jobs = ray._private.state.jobs()
         for job in jobs:
             if job["IsDead"]:
                 return True
@@ -296,7 +313,9 @@ ray.shutdown()
     assert placement_group is not None
     assert placement_group.wait(5)
     actor = Actor.options(
-        placement_group=placement_group, placement_group_bundle_index=0
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=placement_group, placement_group_bundle_index=0
+        )
     ).remote()
 
     ray.get(actor.ping.remote())
@@ -382,13 +401,17 @@ def test_placement_group_gpu_set(ray_start_cluster, connect_to_client):
             return ray.get_gpu_ids()
 
         result = get_gpus.options(
-            placement_group=placement_group, placement_group_bundle_index=0
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=placement_group, placement_group_bundle_index=0
+            )
         ).remote()
         result = ray.get(result)
         assert result == [0]
 
         result = get_gpus.options(
-            placement_group=placement_group, placement_group_bundle_index=1
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=placement_group, placement_group_bundle_index=1
+            )
         ).remote()
         result = ray.get(result)
         assert result == [0]
@@ -414,12 +437,29 @@ def test_placement_group_gpu_assigned(ray_start_cluster, connect_to_client):
         assert pg1.wait(10)
         assert pg2.wait(10)
 
-        gpu_ids_res.add(ray.get(f.options(placement_group=pg1).remote()))
-        gpu_ids_res.add(ray.get(f.options(placement_group=pg2).remote()))
+        gpu_ids_res.add(
+            ray.get(
+                f.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg1
+                    )
+                ).remote()
+            )
+        )
+        gpu_ids_res.add(
+            ray.get(
+                f.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg2
+                    )
+                ).remote()
+            )
+        )
 
         assert len(gpu_ids_res) == 2
 
 
+@pytest.mark.repeat(3)
 def test_actor_scheduling_not_block_with_placement_group(ray_start_cluster):
     """Tests the scheduling of lots of actors will not be blocked
     when using placement groups.
@@ -439,7 +479,12 @@ def test_actor_scheduling_not_block_with_placement_group(ray_start_cluster):
 
     actor_num = 1000
     pgs = [ray.util.placement_group([{"CPU": 1}]) for _ in range(actor_num)]
-    actors = [A.options(placement_group=pg).remote() for pg in pgs]
+    actors = [
+        A.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg)
+        ).remote()
+        for pg in pgs
+    ]
     refs = [actor.ready.remote() for actor in actors]
 
     expected_created_num = 1
@@ -497,16 +542,32 @@ def test_placement_group_gpu_unique_assigned(ray_start_cluster, connect_to_clien
     # Create actors out of order.
     actors = []
     actors.append(
-        Actor.options(placement_group=pg, placement_group_bundle_index=0).remote()
+        Actor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg, placement_group_bundle_index=0
+            )
+        ).remote()
     )
     actors.append(
-        Actor.options(placement_group=pg, placement_group_bundle_index=3).remote()
+        Actor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg, placement_group_bundle_index=3
+            )
+        ).remote()
     )
     actors.append(
-        Actor.options(placement_group=pg, placement_group_bundle_index=2).remote()
+        Actor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg, placement_group_bundle_index=2
+            )
+        ).remote()
     )
     actors.append(
-        Actor.options(placement_group=pg, placement_group_bundle_index=1).remote()
+        Actor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg, placement_group_bundle_index=1
+            )
+        ).remote()
     )
 
     for actor in actors:
@@ -517,9 +578,11 @@ def test_placement_group_gpu_unique_assigned(ray_start_cluster, connect_to_clien
     assert len(gpu_ids_res) == 4
 
 
-def test_placement_group_status_no_bundle_demand(ray_start_cluster):
+@pytest.mark.parametrize("enable_v2", [True, False])
+def test_placement_group_status_no_bundle_demand(ray_start_cluster, enable_v2):
+    reset_autoscaler_v2_enabled_cache()
     cluster = ray_start_cluster
-    cluster.add_node(num_cpus=4)
+    cluster.add_node(num_cpus=4, _system_config={"enable_autoscaler_v2": enable_v2})
     ray.init(address=cluster.address)
 
     @ray.remote
@@ -546,10 +609,11 @@ def test_placement_group_status_no_bundle_demand(ray_start_cluster):
     assert demand_output["demand"] == "(no resource demands)"
 
 
-def test_placement_group_status(ray_start_cluster):
+@pytest.mark.parametrize("enable_v2", [True, False])
+def test_placement_group_status(ray_start_cluster, enable_v2):
     cluster = ray_start_cluster
-    cluster.add_node(num_cpus=4)
-    ray.init(address=cluster.address)
+    cluster.add_node(num_cpus=4, _system_config={"enable_autoscaler_v2": enable_v2})
+    ray.init(cluster.address)
 
     @ray.remote(num_cpus=1)
     class A:
@@ -559,26 +623,35 @@ def test_placement_group_status(ray_start_cluster):
     pg = ray.util.placement_group([{"CPU": 1}])
     ray.get(pg.ready())
 
-    # Wait until the usage is updated, which is
+    # Wait until the usage is updated to the expected, which is
     # when the demand is also updated.
     def is_usage_updated():
         demand_output = get_ray_status_output(cluster.address)
-        return demand_output["usage"] != ""
+        cpu_usage = demand_output["usage"]
+        if cpu_usage == "":
+            return False
+        cpu_usage = cpu_usage.split("\n")[0]
+        expected = "0.0/4.0 CPU (0.0 used of 1.0 reserved in placement groups)"
+        if cpu_usage != expected:
+            assert cpu_usage == "0.0/4.0 CPU"
+            return False
+        return True
 
-    wait_for_condition(is_usage_updated)
-    demand_output = get_ray_status_output(cluster.address)
-    cpu_usage = demand_output["usage"].split("\n")[0]
-    expected = "0.0/4.0 CPU (0.0 used of 1.0 reserved in placement groups)"
-    assert cpu_usage == expected
+    wait_for_condition(is_usage_updated, AUTOSCALER_UPDATE_INTERVAL_S)
 
     # 2 CPU + 1 PG CPU == 3.0/4.0 CPU (1 used by pg)
     actors = [A.remote() for _ in range(2)]
-    actors_in_pg = [A.options(placement_group=pg).remote() for _ in range(1)]
+    actors_in_pg = [
+        A.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg)
+        ).remote()
+        for _ in range(1)
+    ]
 
     ray.get([actor.ready.remote() for actor in actors])
     ray.get([actor.ready.remote() for actor in actors_in_pg])
     # Wait long enough until the usage is propagated to GCS.
-    time.sleep(5)
+    time.sleep(AUTOSCALER_UPDATE_INTERVAL_S)
     demand_output = get_ray_status_output(cluster.address)
     cpu_usage = demand_output["usage"].split("\n")[0]
     expected = "3.0/4.0 CPU (1.0 used of 1.0 reserved in placement groups)"
@@ -628,7 +701,6 @@ def test_placement_group_local_resource_view(monkeypatch, ray_start_cluster):
         # Increase broadcasting interval so that node resource will arrive
         # at raylet after local resource all being allocated.
         m.setenv("RAY_raylet_report_resources_period_milliseconds", "2000")
-        m.setenv("RAY_grpc_based_resource_broadcast", "true")
         cluster = ray_start_cluster
 
         cluster.add_node(num_cpus=16, object_store_memory=1e9)
@@ -669,9 +741,14 @@ def test_placement_group_local_resource_view(monkeypatch, ray_start_cluster):
         # Local resource will be allocated and here we are to ensure
         # local view is consistent and node resouce updates are discarded
         workers = [
-            Worker.options(placement_group=pg).remote(i) for i in range(NUM_CPU_BUNDLES)
+            Worker.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg)
+            ).remote(i)
+            for i in range(NUM_CPU_BUNDLES)
         ]
-        trainer = Trainer.options(placement_group=pg).remote(0)
+        trainer = Trainer.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg)
+        ).remote(0)
         ray.get([workers[i].work.remote() for i in range(NUM_CPU_BUNDLES)])
         ray.get(trainer.train.remote())
 
@@ -688,4 +765,9 @@ def test_fractional_resources_handle_correct(ray_start_cluster):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-sv", __file__]))
+    import os
+
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

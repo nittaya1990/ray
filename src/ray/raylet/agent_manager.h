@@ -14,15 +14,16 @@
 
 #pragma once
 
+#include <atomic>
+#include <boost/asio/deadline_timer.hpp>
+#include <csignal>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "ray/common/id.h"
-#include "ray/rpc/agent_manager/agent_manager_client.h"
-#include "ray/rpc/agent_manager/agent_manager_server.h"
-#include "ray/rpc/runtime_env/runtime_env_client.h"
 #include "ray/util/process.h"
+#include "src/ray/protobuf/gcs.pb.h"
 
 namespace ray {
 namespace raylet {
@@ -31,87 +32,61 @@ typedef std::function<std::shared_ptr<boost::asio::deadline_timer>(std::function
                                                                    uint32_t delay_ms)>
     DelayExecutorFn;
 
-typedef std::function<std::shared_ptr<rpc::RuntimeEnvAgentClientInterface>(
-    const std::string &ip_address, int port)>
-    RuntimeEnvAgentClientFactoryFn;
-
-/// Callback that's callaed after runtime env is created.
-/// \param[in] successful Whether or not the creation was successful.
-/// \param[in] serialized_runtime_env_context Serialized context.
-/// \param[in] setup_error_message The error message if runtime env creation fails.
-/// It must be only set when successful == false.
-typedef std::function<void(bool successful,
-                           const std::string &serialized_runtime_env_context,
-                           const std::string &setup_error_message)>
-    CreateRuntimeEnvCallback;
-typedef std::function<void(bool successful)> DeleteURIsCallback;
-
-class AgentManager : public rpc::AgentManagerServiceHandler {
+// Manages a separate "Agent" process. In constructor (or the `StartAgent` method) it
+// starts a process with `agent_commands` plus some additional arguments.
+//
+// Raylet outlives agents. This means when Raylet exits, the agents must exit; on the
+// other hand, if the agent exits, the raylet may exit only if fate_shares = true. This is
+// implement by the dtor of AgentManager to kill the agent process.
+//
+// We typically start these agents:
+// - The DashboardAgent: `ray/dashboard/agent.py`
+// - The RuntimeEnvAgent: `ray/_private/runtime_env/agent/main.py`
+class AgentManager {
  public:
   struct Options {
     const NodeID node_id;
+    const std::string agent_name;
+    // Commands to start the agent. Note we append extra arguments:
+    // --agent-id $AGENT_ID # A random string of int
     std::vector<std::string> agent_commands;
+    // If true: the started process fate-shares with the raylet. i.e., when the process
+    // fails to start or exits, we SIGTERM the raylet.
+    bool fate_shares;
   };
 
-  explicit AgentManager(Options options, DelayExecutorFn delay_executor,
-                        RuntimeEnvAgentClientFactoryFn runtime_env_agent_client_factory,
-                        bool start_agent = true /* for test */)
+  explicit AgentManager(
+      Options options,
+      DelayExecutorFn delay_executor,
+      std::function<void(const rpc::NodeDeathInfo &)> shutdown_raylet_gracefully,
+      bool start_agent = true /* for test */)
       : options_(std::move(options)),
         delay_executor_(std::move(delay_executor)),
-        runtime_env_agent_client_factory_(std::move(runtime_env_agent_client_factory)) {
+        shutdown_raylet_gracefully_(shutdown_raylet_gracefully),
+        fate_shares_(options_.fate_shares) {
+    if (options_.agent_name.empty()) {
+      RAY_LOG(FATAL) << "AgentManager agent_name must not be empty.";
+    }
+    if (options_.agent_commands.empty()) {
+      RAY_LOG(FATAL) << "AgentManager agent_commands must not be empty.";
+    }
     if (start_agent) {
       StartAgent();
     }
   }
-
-  void HandleRegisterAgent(const rpc::RegisterAgentRequest &request,
-                           rpc::RegisterAgentReply *reply,
-                           rpc::SendReplyCallback send_reply_callback) override;
-
-  /// Request agent to create a runtime env.
-  /// \param[in] runtime_env The runtime env.
-  virtual void CreateRuntimeEnv(
-      const JobID &job_id, const std::string &serialized_runtime_env,
-      const std::string &serialized_allocated_resource_instances,
-      CreateRuntimeEnvCallback callback);
-
-  /// Request agent to delete a list of URIs.
-  /// \param[in] URIs The list of URIs to delete.
-  virtual void DeleteURIs(const std::vector<std::string> &uris,
-                          DeleteURIsCallback callback);
+  ~AgentManager();
 
  private:
   void StartAgent();
 
  private:
-  Options options_;
-  pid_t agent_pid_ = 0;
-  int agent_port_ = 0;
-  /// The number of times the agent is restarted.
-  std::atomic<uint32_t> agent_restart_count_ = 0;
-  /// Whether or not we intend to start the agent.  This is false if we
-  /// are missing Ray Dashboard dependencies, for example.
-  bool should_start_agent_ = true;
-  std::string agent_ip_address_;
+  const Options options_;
+  Process process_;
   DelayExecutorFn delay_executor_;
-  RuntimeEnvAgentClientFactoryFn runtime_env_agent_client_factory_;
-  std::shared_ptr<rpc::RuntimeEnvAgentClientInterface> runtime_env_agent_client_;
-};
-
-class DefaultAgentManagerServiceHandler : public rpc::AgentManagerServiceHandler {
- public:
-  explicit DefaultAgentManagerServiceHandler(std::shared_ptr<AgentManager> &delegate)
-      : delegate_(delegate) {}
-
-  void HandleRegisterAgent(const rpc::RegisterAgentRequest &request,
-                           rpc::RegisterAgentReply *reply,
-                           rpc::SendReplyCallback send_reply_callback) override {
-    RAY_CHECK(delegate_ != nullptr);
-    delegate_->HandleRegisterAgent(request, reply, send_reply_callback);
-  }
-
- private:
-  std::shared_ptr<AgentManager> &delegate_;
+  std::function<void(const rpc::NodeDeathInfo &)> shutdown_raylet_gracefully_;
+  // If true, when the agent dies, raylet kills itself.
+  std::atomic<bool> fate_shares_;
+  std::unique_ptr<std::thread> monitor_thread_;
 };
 
 }  // namespace raylet

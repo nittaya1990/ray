@@ -2,12 +2,14 @@ import logging
 from types import ModuleType
 from typing import Any, Dict, List, Optional
 
+from ray.autoscaler._private.command_runner import DockerCommandRunner, SSHCommandRunner
 from ray.autoscaler.command_runner import CommandRunnerInterface
-from ray.autoscaler._private.command_runner import SSHCommandRunner, DockerCommandRunner
+from ray.util.annotations import DeveloperAPI
 
 logger = logging.getLogger(__name__)
 
 
+@DeveloperAPI
 class NodeProvider:
     """Interface for getting and returning nodes from a Cloud.
 
@@ -48,7 +50,11 @@ class NodeProvider:
         be called again to refresh results.
 
         Examples:
-            >>> provider.non_terminated_nodes({TAG_RAY_NODE_KIND: "worker"})
+            >>> from ray.autoscaler.node_provider import NodeProvider
+            >>> from ray.autoscaler.tags import TAG_RAY_NODE_KIND
+            >>> provider = NodeProvider(...) # doctest: +SKIP
+            >>> provider.non_terminated_nodes( # doctest: +SKIP
+            ...     {TAG_RAY_NODE_KIND: "worker"})
             ["node-1", "node-2"]
 
         """
@@ -80,8 +86,8 @@ class NodeProvider:
         Assumes ip-address is unique per node.
 
         Args:
-            ip_address (str): Address of node.
-            use_internal_ip (bool): Whether the ip address is
+            ip_address: Address of node.
+            use_internal_ip: Whether the ip address is
                 public or private.
 
         Raises:
@@ -118,21 +124,30 @@ class NodeProvider:
         """Creates a number of nodes within the namespace.
 
         Optionally returns a mapping from created node ids to node metadata.
+
+        Optionally may throw a
+        ray.autoscaler.node_launch_exception.NodeLaunchException which the
+        autoscaler may use to provide additional functionality such as
+        observability.
+
         """
         raise NotImplementedError
 
-    def create_node_with_resources(
+    def create_node_with_resources_and_labels(
         self,
         node_config: Dict[str, Any],
         tags: Dict[str, str],
         count: int,
         resources: Dict[str, float],
+        labels: Dict[str, str],
     ) -> Optional[Dict[str, Any]]:
-        """Create nodes with a given resource config.
+        """Create nodes with a given resource and label config.
 
         This is the method actually called by the autoscaler. Prefer to
         implement this when possible directly, otherwise it delegates to the
         create_node() implementation.
+
+        Optionally may throw a ray.autoscaler.node_launch_exception.NodeLaunchException.
         """
         return self.create_node(node_config, tags, count)
 
@@ -155,7 +170,7 @@ class NodeProvider:
         mapping from deleted node ids to node metadata.
         """
         for node_id in node_ids:
-            logger.info("NodeProvider: " "{}: Terminating node".format(node_id))
+            logger.info("NodeProvider: {}: Terminating node".format(node_id))
             self.terminate_node(node_id)
         return None
 
@@ -193,17 +208,17 @@ class NodeProvider:
         """Returns the CommandRunner class used to perform SSH commands.
 
         Args:
-        log_prefix(str): stores "NodeUpdater: {}: ".format(<node_id>). Used
+        log_prefix: stores "NodeUpdater: {}: ".format(<node_id>). Used
             to print progress in the CommandRunner.
-        node_id(str): the node ID.
-        auth_config(dict): the authentication configs from the autoscaler
+        node_id: the node ID.
+        auth_config: the authentication configs from the autoscaler
             yaml file.
-        cluster_name(str): the name of the cluster.
-        process_runner(module): the module to use to run the commands
+        cluster_name: the name of the cluster.
+        process_runner: the module to use to run the commands
             in the CommandRunner. E.g., subprocess.
-        use_internal_ip(bool): whether the node_id belongs to an internal ip
+        use_internal_ip: whether the node_id belongs to an internal ip
             or external ip.
-        docker_config(dict): If set, the docker information of the docker
+        docker_config: If set, the docker information of the docker
             container that commands should be run on.
         """
         common_args = {
@@ -230,3 +245,19 @@ class NodeProvider:
     ) -> Dict[str, Any]:
         """Fills out missing "resources" field for available_node_types."""
         return cluster_config
+
+    def safe_to_scale(self) -> bool:
+        """Optional condition to determine if it's safe to proceed with an autoscaling
+        update. Can be used to wait for convergence of state managed by an external
+        cluster manager.
+
+        Called by the autoscaler immediately after non_terminated_nodes().
+        If False is returned, the autoscaler will abort the update.
+        """
+        return True
+
+    def post_process(self) -> None:
+        """This optional method is executed at the end of
+        StandardAutoscaler._update().
+        """
+        pass

@@ -9,13 +9,18 @@ from ray._private.test_utils import (
     check_local_files_gced,
     generate_runtime_env_dict,
 )
+from ray._private.runtime_env import dependency_utils
 from ray._private.runtime_env.conda import _get_conda_dict_with_ray_inserted
-from ray._private.runtime_env.validation import _rewrite_pip_list_ray_libraries
+from ray._private.runtime_env.dependency_utils import (
+    INTERNAL_PIP_FILENAME,
+    MAX_INTERNAL_PIP_FILENAME_TRIES,
+)
 from ray.runtime_env import RuntimeEnv
 
 import yaml
 import tempfile
 from pathlib import Path
+import subprocess
 
 import ray
 
@@ -23,14 +28,6 @@ if not os.environ.get("CI"):
     # This flags turns on the local development that link against current ray
     # packages and fall back all the dependencies to current python's site.
     os.environ["RAY_RUNTIME_ENV_LOCAL_DEV_MODE"] = "1"
-
-
-def test_rewrite_pip_list_ray_libraries():
-    input = ["--extra-index-url my.url", "ray==1.4", "requests", "ray[serve]"]
-    output = _rewrite_pip_list_ray_libraries(input)
-    assert "ray" not in output
-    assert "ray[serve]" not in output
-    assert output[:3] == ["--extra-index-url my.url", "ray==1.4", "requests"]
 
 
 def test_get_conda_dict_with_ray_inserted_m1_wheel(monkeypatch):
@@ -204,5 +201,174 @@ class TestGC:
         wait_for_condition(lambda: check_local_files_gced(cluster), timeout=30)
 
 
+def test_import_in_subprocess(shutdown_only):
+
+    ray.init()
+
+    @ray.remote(runtime_env={"pip": ["pip-install-test==0.5"]})
+    def f():
+        return subprocess.run(["python", "-c", "import pip_install_test"]).returncode
+
+    assert ray.get(f.remote()) == 0
+
+
+def test_runtime_env_conda_not_exists_not_hang(shutdown_only):
+    """Verify when the conda env doesn't exist, it doesn't hang Ray."""
+    ray.init(runtime_env={"conda": "env_which_does_not_exist"})
+
+    @ray.remote
+    def f():
+        return 1
+
+    refs = [f.remote() for _ in range(5)]
+
+    for ref in refs:
+        with pytest.raises(ray.exceptions.RuntimeEnvSetupError) as exc_info:
+            ray.get(ref)
+        assert "doesn't exist from the output of `conda info --json`" in str(
+            exc_info.value
+        )  # noqa
+
+
+def test_get_requirements_file():
+    """Unit test for dependency_utils.get_requirements_file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # If pip_list is None, we should return the internal pip filename.
+        assert dependency_utils.get_requirements_file(
+            tmpdir, pip_list=None
+        ) == os.path.join(tmpdir, INTERNAL_PIP_FILENAME)
+
+        # If the internal pip filename is not in pip_list, we should return the internal
+        # pip filename.
+        assert dependency_utils.get_requirements_file(
+            tmpdir, pip_list=["foo", "bar"]
+        ) == os.path.join(tmpdir, INTERNAL_PIP_FILENAME)
+
+        # If the internal pip filename is in pip_list, we should append numbers to the
+        # end of the filename until we find one that doesn't conflict.
+        assert dependency_utils.get_requirements_file(
+            tmpdir, pip_list=["foo", "bar", f"-r {INTERNAL_PIP_FILENAME}"]
+        ) == os.path.join(tmpdir, f"{INTERNAL_PIP_FILENAME}.1")
+        assert dependency_utils.get_requirements_file(
+            tmpdir,
+            pip_list=[
+                "foo",
+                "bar",
+                f"{INTERNAL_PIP_FILENAME}.1",
+                f"{INTERNAL_PIP_FILENAME}.2",
+            ],
+        ) == os.path.join(tmpdir, f"{INTERNAL_PIP_FILENAME}.3")
+
+        # If we can't find a valid filename, we should raise an error.
+        with pytest.raises(RuntimeError) as excinfo:
+            dependency_utils.get_requirements_file(
+                tmpdir,
+                pip_list=[
+                    "foo",
+                    "bar",
+                    *[
+                        f"{INTERNAL_PIP_FILENAME}.{i}"
+                        for i in range(MAX_INTERNAL_PIP_FILENAME_TRIES)
+                    ],
+                ],
+            )
+        assert "Could not find a valid filename for the internal " in str(excinfo.value)
+
+
+def test_working_dir_applies_for_pip_creation(start_cluster, tmp_working_dir):
+    cluster, address = start_cluster
+
+    with open(Path(tmp_working_dir) / "requirements.txt", "w") as f:
+        f.write("-r more_requirements.txt")
+
+    with open(Path(tmp_working_dir) / "more_requirements.txt", "w") as f:
+        f.write("pip-install-test==0.5")
+
+    ray.init(
+        address,
+        runtime_env={
+            "working_dir": tmp_working_dir,
+            "pip": ["-r ${RAY_RUNTIME_ENV_CREATE_WORKING_DIR}/requirements.txt"],
+        },
+    )
+
+    @ray.remote
+    def test_import():
+        import pip_install_test
+
+        return pip_install_test.__name__
+
+    assert ray.get(test_import.remote()) == "pip_install_test"
+
+
+def test_working_dir_applies_for_pip_creation_files(start_cluster, tmp_working_dir):
+    """
+    Different from test_working_dir_applies_for_pip_creation, this test uses a file
+    in `pip`. This file is read by the driver and hence has no relative path to the
+    more_requirements.txt file, so you need to add a
+    ${RAY_RUNTIME_ENV_CREATE_WORKING_DIR} in the referenced path.
+    """
+    cluster, address = start_cluster
+
+    with open(Path(tmp_working_dir) / "requirements.txt", "w") as f:
+        f.write("-r ${RAY_RUNTIME_ENV_CREATE_WORKING_DIR}/more_requirements.txt")
+
+    with open(Path(tmp_working_dir) / "more_requirements.txt", "w") as f:
+        f.write("pip-install-test==0.5")
+
+    ray.init(
+        address,
+        runtime_env={
+            "working_dir": tmp_working_dir,
+            "pip": str(Path(tmp_working_dir) / "requirements.txt"),
+        },
+    )
+
+    @ray.remote
+    def test_import():
+        import pip_install_test
+
+        return pip_install_test.__name__
+
+    assert ray.get(test_import.remote()) == "pip_install_test"
+
+
+def test_working_dir_applies_for_conda_creation(start_cluster, tmp_working_dir):
+    cluster, address = start_cluster
+
+    with open(Path(tmp_working_dir) / "requirements.txt", "w") as f:
+        f.write("-r more_requirements.txt")
+
+    with open(Path(tmp_working_dir) / "more_requirements.txt", "w") as f:
+        f.write("pip-install-test==0.5")
+
+    # Note: if you want to refernce some file in the working dir, you need to use
+    # the ${RAY_RUNTIME_ENV_CREATE_WORKING_DIR} variable.
+    with open(Path(tmp_working_dir) / "environment.yml", "w") as f:
+        f.write("dependencies:\n")
+        f.write(" - pip\n")
+        f.write(" - pip:\n")
+        f.write("   - -r ${RAY_RUNTIME_ENV_CREATE_WORKING_DIR}/more_requirements.txt\n")
+
+    ray.init(
+        address,
+        runtime_env={
+            "working_dir": tmp_working_dir,
+            "conda": str(Path(tmp_working_dir) / "environment.yml"),
+        },
+    )
+
+    @ray.remote
+    def test_import():
+        import pip_install_test
+
+        return pip_install_test.__name__
+
+    assert ray.get(test_import.remote()) == "pip_install_test"
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-sv", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

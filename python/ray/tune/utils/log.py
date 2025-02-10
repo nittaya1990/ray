@@ -1,7 +1,12 @@
+import time
 from enum import Enum
-from typing import Union
+from typing import Dict, Tuple, Union
+
+from ray.util import PublicAPI
+from ray.util.annotations import DeveloperAPI
 
 
+@PublicAPI
 class Verbosity(Enum):
     V0_MINIMAL = 0
     V1_EXPERIMENT = 1
@@ -15,6 +20,7 @@ class Verbosity(Enum):
 verbosity: Union[int, Verbosity] = Verbosity.V3_TRIAL_DETAILS
 
 
+@DeveloperAPI
 def set_verbosity(level: Union[int, Verbosity]):
     global verbosity
 
@@ -24,6 +30,7 @@ def set_verbosity(level: Union[int, Verbosity]):
         verbosity = level
 
 
+@DeveloperAPI
 def has_verbosity(level: Union[int, Verbosity]) -> bool:
     """Return True if passed level exceeds global verbosity level."""
     global verbosity
@@ -34,6 +41,7 @@ def has_verbosity(level: Union[int, Verbosity]) -> bool:
     return verbosity_level >= log_level
 
 
+@DeveloperAPI
 def disable_ipython():
     """Disable output of IPython HTML objects."""
     try:
@@ -42,3 +50,15 @@ def disable_ipython():
         InteractiveShell.clear_instance()
     except Exception:
         pass
+
+
+_log_cache_count: Dict[str, Tuple[str, float]] = {}
+
+
+def _dedup_logs(domain: str, value: str, repeat_after_s: int = 5) -> bool:
+    cur_val, ts = _log_cache_count.get(domain, (None, None))
+    if value == cur_val and time.monotonic() - repeat_after_s < ts:
+        return False
+    else:
+        _log_cache_count[domain] = value, time.monotonic()
+        return True

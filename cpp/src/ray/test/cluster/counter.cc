@@ -83,11 +83,61 @@ bool Counter::CheckRestartInActorCreationTask() { return is_restared; }
 
 bool Counter::CheckRestartInActorTask() { return ray::WasCurrentActorRestarted(); }
 
-RAY_REMOTE(RAY_FUNC(Counter::FactoryCreate), Counter::FactoryCreateException,
+ray::ActorHandle<Counter> Counter::CreateChildActor(std::string actor_name) {
+  auto child_actor =
+      ray::Actor(RAY_FUNC(Counter::FactoryCreate)).SetName(actor_name).Remote();
+  child_actor.Task(&Counter::GetCount).Remote().Get();
+  return child_actor;
+}
+
+std::string Counter::GetNamespaceInActor() { return ray::GetNamespace(); }
+
+std::string Counter::CreateNestedChildActor(std::string actor_name) {
+  child_actor = ray::Actor(RAY_FUNC(Counter::FactoryCreate)).SetName(actor_name).Remote();
+  child_actor.Task(&Counter::GetCount).Remote().Get();
+  return "OK";
+}
+
+int Counter::Plus1ForActor(ray::ActorHandle<Counter> actor) {
+  return *actor.Task(&Counter::Plus1).Remote().Get();
+}
+
+int Counter::GetIntByObjectRef(ray::ObjectRef<int> object_ref) {
+  return *object_ref.Get();
+}
+
+RAY_REMOTE(RAY_FUNC(Counter::FactoryCreate),
+           Counter::FactoryCreateException,
            RAY_FUNC(Counter::FactoryCreate, int),
-           RAY_FUNC(Counter::FactoryCreate, int, int), &Counter::Plus1, &Counter::Add,
-           &Counter::Exit, &Counter::GetPid, &Counter::ExceptionFunc,
-           &Counter::CheckRestartInActorCreationTask, &Counter::CheckRestartInActorTask,
-           &Counter::GetVal, &Counter::GetIntVal);
+           RAY_FUNC(Counter::FactoryCreate, int, int),
+           &Counter::Plus1,
+           &Counter::Add,
+           &Counter::Exit,
+           &Counter::GetPid,
+           &Counter::ExceptionFunc,
+           &Counter::CheckRestartInActorCreationTask,
+           &Counter::CheckRestartInActorTask,
+           &Counter::GetNamespaceInActor,
+           &Counter::GetVal,
+           &Counter::GetIntVal,
+           &Counter::Initialized,
+           &Counter::CreateChildActor,
+           &Counter::GetEnvVar,
+           &Counter::Plus1ForActor,
+           &Counter::GetCount,
+           &Counter::CreateNestedChildActor,
+           &Counter::GetBytes,
+           &Counter::EchoBytes,
+           &Counter::EchoString,
+           &Counter::GetIntByObjectRef,
+           &Counter::EchoStrings,
+           &Counter::EchoAnyArray);
 
 RAY_REMOTE(ActorConcurrentCall::FactoryCreate, &ActorConcurrentCall::CountDown);
+
+std::string GetEnvVar(std::string key) {
+  auto value = std::getenv(key.c_str());
+  return value == NULL ? "" : std::string(value);
+}
+
+RAY_REMOTE(GetEnvVar);

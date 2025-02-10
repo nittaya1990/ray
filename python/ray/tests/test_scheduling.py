@@ -11,16 +11,17 @@ import numpy as np
 import pytest
 
 import ray
-from ray.internal.internal_api import memory_summary
-import ray.util.accelerators
 import ray.cluster_utils
-from ray._private.test_utils import fetch_prometheus
-
+import ray.util.accelerators
+from ray._private.internal_api import memory_summary
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from ray._private.test_utils import (
-    wait_for_condition,
     Semaphore,
-    object_memory_usage,
     SignalActor,
+    object_memory_usage,
+    get_metric_check_condition,
+    wait_for_condition,
+    MetricSamplePattern,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ def test_load_balancing(ray_start_cluster):
     @ray.remote
     def f():
         time.sleep(0.10)
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     attempt_to_load_balance(f, [], 100, num_nodes, 10)
     attempt_to_load_balance(f, [], 1000, num_nodes, 100)
@@ -62,12 +63,21 @@ def test_load_balancing(ray_start_cluster):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Times out on Windows")
 def test_hybrid_policy(ray_start_cluster):
-
     cluster = ray_start_cluster
-    num_nodes = 2
+
     num_cpus = 10
-    for _ in range(num_nodes):
-        cluster.add_node(num_cpus=num_cpus, memory=num_cpus)
+    cluster.add_node(
+        num_cpus=num_cpus,
+        memory=num_cpus,
+        _system_config={
+            "scheduler_top_k_absolute": 1,
+            "scheduler_top_k_fraction": 0,
+        },
+    )
+    cluster.add_node(
+        num_cpus=num_cpus,
+        memory=num_cpus,
+    )
     cluster.wait_for_nodes()
     ray.init(address=cluster.address)
 
@@ -83,7 +93,7 @@ def test_hybrid_policy(ray_start_cluster):
     def get_node():
         ray.get(block_driver.release.remote())
         ray.get(block_task.acquire.remote())
-        return ray.worker.global_worker.current_node_id
+        return ray._private.worker.global_worker.current_node_id
 
     # Below the hybrid threshold we pack on the local node first.
     refs = [get_node.remote() for _ in range(5)]
@@ -138,7 +148,7 @@ def test_legacy_spillback_distribution(ray_start_cluster):
     @ray.remote
     def task():
         time.sleep(1)
-        return ray.worker.global_worker.current_node_id
+        return ray._private.worker.global_worker.current_node_id
 
     # Make sure tasks are spilled back non-deterministically.
     locations = ray.get([task.remote() for _ in range(8)])
@@ -155,7 +165,7 @@ def test_legacy_spillback_distribution(ray_start_cluster):
             pass
 
         def get_location(self):
-            return ray.worker.global_worker.current_node_id
+            return ray._private.worker.global_worker.current_node_id
 
     actors = [Actor1.remote() for _ in range(10)]
     locations = ray.get([actor.get_location.remote() for actor in actors])
@@ -181,10 +191,10 @@ def test_local_scheduling_first(ray_start_cluster):
     @ray.remote(num_cpus=1)
     def f():
         time.sleep(0.01)
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     def local():
-        return ray.get(f.remote()) == ray.worker.global_worker.node.unique_id
+        return ray.get(f.remote()) == ray._private.worker.global_worker.node.unique_id
 
     # Wait for a worker to get started.
     wait_for_condition(local)
@@ -206,7 +216,7 @@ def test_load_balancing_with_dependencies(ray_start_cluster):
     @ray.remote
     def f(x):
         time.sleep(0.1)
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     # This object will be local to one of the raylets. Make sure
     # this doesn't prevent tasks from being scheduled on other raylets.
@@ -278,11 +288,11 @@ def test_spread_scheduling_overrides_locality_aware_scheduling(ray_start_cluster
 
     @ray.remote(resources={"pin": 1})
     def non_local():
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     @ray.remote(scheduling_strategy="SPREAD")
     def f(x):
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     # Test that task f() runs on the local node as well
     # even though remote node has the dependencies.
@@ -327,11 +337,11 @@ def test_locality_aware_leasing(ray_start_cluster):
 
     @ray.remote(resources={"pin": 1})
     def non_local():
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     @ray.remote
     def f(x):
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     # Test that task f() runs on the same node as non_local()
     # even though local node is lower critical resource utilization.
@@ -359,15 +369,15 @@ def test_locality_aware_leasing_cached_objects(ray_start_cluster):
 
     @ray.remote
     def f():
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     @ray.remote
     def g(x):
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     @ray.remote
     def h(x, y):
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     # f_obj1 pinned on worker1.
     f_obj1 = f.options(resources={"pin_worker1": 1}).remote()
@@ -401,7 +411,7 @@ def test_locality_aware_leasing_borrowed_objects(ray_start_cluster):
 
     @ray.remote
     def f():
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     @ray.remote
     def g(x):
@@ -409,10 +419,14 @@ def test_locality_aware_leasing_borrowed_objects(ray_start_cluster):
 
     @ray.remote
     def h(x):
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     # f will run on worker, f_obj will be pinned on worker.
     f_obj = f.options(resources={"pin_worker": 1}).remote()
+    # Make sure owner has the location information for f_obj,
+    # before we launch g so g worker can get the locality information
+    # from the owner.
+    ray.wait([f_obj], fetch_local=False)
     # g will run on head, f_obj will be borrowed by head, and we confirm that
     # h(f_obj) is scheduled onto worker, the node that has f_obj.
     assert (
@@ -474,7 +488,7 @@ def test_many_args(ray_start_cluster):
     (
         num_tasks_submitted_before,
         num_leases_requested_before,
-    ) = ray.worker.global_worker.core_worker.get_task_submission_stats()
+    ) = ray._private.worker.global_worker.core_worker.get_task_submission_stats()
     tasks = []
     for i in range(100):
         args = [np.random.choice(xs) for _ in range(10)]
@@ -484,7 +498,7 @@ def test_many_args(ray_start_cluster):
     (
         num_tasks_submitted,
         num_leases_requested,
-    ) = ray.worker.global_worker.core_worker.get_task_submission_stats()
+    ) = ray._private.worker.global_worker.core_worker.get_task_submission_stats()
     num_tasks_submitted -= num_tasks_submitted_before
     num_leases_requested -= num_leases_requested_before
     print("submitted:", num_tasks_submitted, "leases requested:", num_leases_requested)
@@ -549,12 +563,12 @@ def test_gpu(monkeypatch):
                 pass
 
             def get_location(self):
-                return ray.worker.global_worker.node.unique_id
+                return ray._private.worker.global_worker.node.unique_id
 
         @ray.remote(num_cpus=1)
         def task_cpu():
             time.sleep(10)
-            return ray.worker.global_worker.node.unique_id
+            return ray._private.worker.global_worker.node.unique_id
 
         @ray.remote(num_returns=2, num_gpus=0.5)
         def launcher():
@@ -564,7 +578,7 @@ def test_gpu(monkeypatch):
             actor_results = [a.get_location.remote() for _ in range(n)]
             return (
                 ray.get(task_results + actor_results),
-                ray.worker.global_worker.node.unique_id,
+                ray._private.worker.global_worker.node.unique_id,
             )
 
         r = launcher.remote()
@@ -576,9 +590,9 @@ def test_gpu(monkeypatch):
         ), "expected launcher task to be scheduled on GPU nodes"
 
         for node_id in ids:
-            assert node_id in cpu_node_ids, (
-                "expected non-GPU tasks/actors to be scheduled on" "non-GPU nodes."
-            )
+            assert (
+                node_id in cpu_node_ids
+            ), "expected non-GPU tasks/actors to be scheduled on non-GPU nodes."
     finally:
         ray.shutdown()
         cluster.shutdown()
@@ -671,9 +685,14 @@ def test_gpu_scheduling_liveness(ray_start_cluster):
     ray.get(o)
 
     workers = [
-        Worker.options(placement_group=pg).remote(i) for i in range(NUM_CPU_BUNDLES)
+        Worker.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg)
+        ).remote(i)
+        for i in range(NUM_CPU_BUNDLES)
     ]
-    trainer = Trainer.options(placement_group=pg).remote(0)
+    trainer = Trainer.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg)
+    ).remote(0)
 
     # If the gpu scheduling doesn't properly work, the below
     # code will hang.
@@ -693,12 +712,6 @@ def test_gpu_scheduling_liveness(ray_start_cluster):
     indirect=True,
 )
 def test_scheduling_class_depth(ray_start_regular):
-
-    node_info = ray.nodes()[0]
-    metrics_export_port = node_info["MetricsExportPort"]
-    addr = node_info["NodeManagerAddress"]
-    prom_addr = f"{addr}:{metrics_export_port}"
-
     @ray.remote(num_cpus=1000)
     def infeasible():
         pass
@@ -714,28 +727,34 @@ def test_scheduling_class_depth(ray_start_regular):
 
     # We expect the 2 calls to `infeasible` to be separate scheduling classes
     # because one has depth=1, and the other has depth=2.
-
     metric_name = "ray_internal_num_infeasible_scheduling_classes"
 
-    def make_condition(n):
-        def condition():
-            _, metric_names, metric_samples = fetch_prometheus([prom_addr])
-            if metric_name in metric_names:
-                for sample in metric_samples:
-                    if sample.name == metric_name and sample.value == n:
-                        return True
-            return False
+    timeout = 60
+    if sys.platform == "win32":
+        # longer timeout is necessary to pass on windows debug/asan builds.
+        timeout = 180
 
-        return condition
-
-    wait_for_condition(make_condition(2))
+    wait_for_condition(
+        get_metric_check_condition([MetricSamplePattern(name=metric_name, value=2)]),
+        timeout=timeout,
+    )
     start_infeasible.remote(2)
-    wait_for_condition(make_condition(3))
+    wait_for_condition(
+        get_metric_check_condition([MetricSamplePattern(name=metric_name, value=3)]),
+        timeout=timeout,
+    )
     start_infeasible.remote(4)
-    wait_for_condition(make_condition(4))
+    wait_for_condition(
+        get_metric_check_condition([MetricSamplePattern(name=metric_name, value=4)]),
+        timeout=timeout,
+    )
 
 
 if __name__ == "__main__":
+    import os
     import pytest
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

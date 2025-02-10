@@ -71,13 +71,7 @@
       <dependency>
         <groupId>org.testng</groupId>
         <artifactId>testng</artifactId>
-        <version>7.3.0</version>
-        <exclusions>
-          <exclusion>
-            <groupId>org.yaml</groupId>
-            <artifactId>snakeyaml</artifactId>
-          </exclusion>
-        </exclusions>
+        <version>7.5.1</version>
       </dependency>
     </dependencies>
   </dependencyManagement>
@@ -252,6 +246,8 @@
               <excludes>
                 <exclude>**/RayCall.java</exclude>
                 <exclude>**/ActorCall.java</exclude>
+                  <exclude>**/Call.java</exclude>
+                  <exclude>**/ActorCall.java</exclude>
                 <exclude>**/PyActorCall.java</exclude>
                 <exclude>**/runtime/generated/**/*.*</exclude>
                 <exclude>**/serve/generated/**/*.*</exclude>

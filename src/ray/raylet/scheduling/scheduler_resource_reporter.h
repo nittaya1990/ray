@@ -18,7 +18,7 @@
 #include "ray/common/ray_config.h"
 #include "ray/common/task/task_spec.h"
 #include "ray/raylet/scheduling/internal.h"
-#include "ray/raylet/scheduling/local_task_manager.h"
+#include "ray/raylet/scheduling/local_task_manager_interface.h"
 
 namespace ray {
 namespace raylet {
@@ -30,28 +30,24 @@ class SchedulerResourceReporter {
       const absl::flat_hash_map<SchedulingClass,
                                 std::deque<std::shared_ptr<internal::Work>>>
           &tasks_to_schedule,
-      const absl::flat_hash_map<
-          SchedulingClass, std::deque<std::shared_ptr<internal::Work>>> &infeasible_tasks,
-      const LocalTaskManager &local_task_manager);
+      const absl::flat_hash_map<SchedulingClass,
+                                std::deque<std::shared_ptr<internal::Work>>>
+          &infeasible_tasks,
+      const ILocalTaskManager &local_task_manager);
 
   /// Populate the relevant parts of the heartbeat table. This is intended for
   /// sending resource usage of raylet to gcs. In particular, this should fill in
   /// resource_load and resource_load_by_shape.
   ///
   /// \param[out] data: Output parameter. `resource_load` and `resource_load_by_shape` are
-  /// the only
-  ///                   fields used.
-  /// \param[in] last_reported_resources: The last reported resources. Used to check
-  /// whether
-  ///                                     resources have been changed.
-  void FillResourceUsage(
-      rpc::ResourcesData &data,
-      const std::shared_ptr<SchedulingResources> &last_reported_resources) const;
+  /// the only fields used.
+  void FillResourceUsage(rpc::ResourcesData &data) const;
 
-  /// Populate the list of pending or infeasible actor tasks for node stats.
+  /// Populate the count of pending and infeasible actor tasks, organized by shape.
   ///
-  /// \param[out] reply: Output parameter. `infeasible_tasks` is the only field filled.
-  void FillPendingActorInfo(rpc::GetNodeStatsReply *reply) const;
+  /// \param[out] data: Output parameter. `resource_load_by_shape` is the only field
+  /// filled.
+  void FillPendingActorCountByShape(rpc::ResourcesData &data) const;
 
  private:
   int64_t TotalBacklogSize(SchedulingClass scheduling_class) const;

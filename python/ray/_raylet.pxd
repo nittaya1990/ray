@@ -11,16 +11,26 @@ from libc.stdint cimport (
 from libcpp cimport bool as c_bool
 from libcpp.string cimport string as c_string
 from libcpp.vector cimport vector as c_vector
+from libcpp.unordered_map cimport unordered_map
 from libcpp.memory cimport (
     shared_ptr,
     unique_ptr
 )
+from libcpp.pair cimport pair as c_pair
+from libcpp.utility cimport pair
+from ray.includes.optional cimport (
+    optional,
+    nullopt,
+    make_optional,
+)
+
 from ray.includes.common cimport (
     CBuffer,
     CRayObject,
     CAddress,
     CConcurrencyGroup,
     CSchedulingStrategy,
+    CLabelMatchExpressions,
 )
 from ray.includes.libcoreworker cimport (
     ActorHandleSharedPtr,
@@ -30,7 +40,8 @@ from ray.includes.libcoreworker cimport (
 
 from ray.includes.unique_ids cimport (
     CObjectID,
-    CActorID
+    CActorID,
+    CTaskID,
 )
 from ray.includes.function_descriptor cimport (
     CFunctionDescriptor,
@@ -58,7 +69,8 @@ cdef extern from "Python.h":
 
     # You can find the cpython definition in Include/cpython/pystate.h#L59
     ctypedef struct CPyThreadState "PyThreadState":
-        int recursion_depth
+        int recursion_limit
+        int recursion_remaining
 
     # From Include/ceveal.h#67
     int Py_GetRecursionLimit()
@@ -90,7 +102,6 @@ cdef class ObjectRef(BaseID):
 
     cdef CObjectID native(self)
 
-
 cdef class ActorID(BaseID):
     cdef CActorID data
 
@@ -113,6 +124,9 @@ cdef class CoreWorker:
         object eventloop_for_default_cg
         object thread_for_default_cg
         object fd_to_cgname_dict
+        object _task_id_to_future_lock
+        dict _task_id_to_future
+        object event_loop_executor
 
     cdef _create_put_buffer(self, shared_ptr[CBuffer] &metadata,
                             size_t data_size, ObjectRef object_ref,
@@ -120,18 +134,25 @@ cdef class CoreWorker:
                             CObjectID *c_object_id, shared_ptr[CBuffer] *data,
                             c_bool created_by_worker,
                             owner_address=*,
-                            c_bool inline_small_object=*)
+                            c_bool inline_small_object=*,
+                            c_bool is_experimental_channel=*)
     cdef unique_ptr[CAddress] _convert_python_address(self, address=*)
     cdef store_task_output(
-            self, serialized_object, const CObjectID &return_id, size_t
-            data_size, shared_ptr[CBuffer] &metadata, const c_vector[CObjectID]
-            &contained_id, int64_t *task_output_inlined_bytes,
+            self, serialized_object,
+            const CObjectID &return_id,
+            const CObjectID &generator_id,
+            size_t data_size, shared_ptr[CBuffer] &metadata, const c_vector[CObjectID]
+            &contained_id, const CAddress &caller_address,
+            int64_t *task_output_inlined_bytes,
             shared_ptr[CRayObject] *return_ptr)
     cdef store_task_outputs(
-            self, worker, outputs, const c_vector[CObjectID] return_ids,
-            c_vector[shared_ptr[CRayObject]] *returns)
-    cdef yield_current_fiber(self, CFiberEvent &fiber_event)
-    cdef make_actor_handle(self, ActorHandleSharedPtr c_actor_handle)
+            self,
+            worker, outputs,
+            const CAddress &caller_address,
+            c_vector[c_pair[CObjectID, shared_ptr[CRayObject]]] *returns,
+            CObjectID ref_generator_id=*)
+    cdef make_actor_handle(self, ActorHandleSharedPtr c_actor_handle,
+                           c_bool weak_ref)
     cdef c_function_descriptors_to_python(
         self, const c_vector[CFunctionDescriptor] &c_function_descriptors)
     cdef initialize_eventloops_for_actor_concurrency_group(
@@ -139,6 +160,16 @@ cdef class CoreWorker:
     cdef python_scheduling_strategy_to_c(
         self, python_scheduling_strategy,
         CSchedulingStrategy *c_scheduling_strategy)
+    cdef python_label_match_expressions_to_c(
+        self, python_expressions,
+        CLabelMatchExpressions *c_expressions)
+    cdef CObjectID allocate_dynamic_return_id_for_generator(
+            self,
+            const CAddress &owner_address,
+            const CTaskID &task_id,
+            return_size,
+            generator_index,
+            is_async_actor)
 
 cdef class FunctionDescriptor:
     cdef:

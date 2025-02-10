@@ -5,6 +5,7 @@ import io.ray.api.id.ActorId;
 import io.ray.api.id.JobId;
 import io.ray.api.id.TaskId;
 import io.ray.api.id.UniqueId;
+import io.ray.api.runtimeenv.RuntimeEnv;
 import io.ray.runtime.generated.Common.Address;
 import io.ray.runtime.generated.Common.TaskType;
 import java.nio.ByteBuffer;
@@ -12,7 +13,7 @@ import java.nio.ByteBuffer;
 /** Worker context for cluster mode. This is a wrapper class for worker context of core worker. */
 public class NativeWorkerContext implements WorkerContext {
 
-  private final ThreadLocal<ClassLoader> currentClassLoader = new ThreadLocal<>();
+  private ClassLoader currentClassLoader = null;
 
   @Override
   public UniqueId getCurrentWorkerId() {
@@ -21,24 +22,12 @@ public class NativeWorkerContext implements WorkerContext {
 
   @Override
   public JobId getCurrentJobId() {
-    return JobId.fromByteBuffer(nativeGetCurrentJobId());
+    return JobId.fromBytes(nativeGetCurrentJobId());
   }
 
   @Override
   public ActorId getCurrentActorId() {
     return ActorId.fromByteBuffer(nativeGetCurrentActorId());
-  }
-
-  @Override
-  public ClassLoader getCurrentClassLoader() {
-    return currentClassLoader.get();
-  }
-
-  @Override
-  public void setCurrentClassLoader(ClassLoader currentClassLoader) {
-    if (this.currentClassLoader.get() != currentClassLoader) {
-      this.currentClassLoader.set(currentClassLoader);
-    }
   }
 
   @Override
@@ -60,15 +49,26 @@ public class NativeWorkerContext implements WorkerContext {
     }
   }
 
+  @Override
+  public RuntimeEnv getCurrentRuntimeEnv() {
+    String serialized_runtime_env = nativeGetSerializedRuntimeEnv();
+    if (serialized_runtime_env == null) {
+      return null;
+    }
+    return RuntimeEnv.deserialize(serialized_runtime_env);
+  }
+
   private static native int nativeGetCurrentTaskType();
 
   private static native ByteBuffer nativeGetCurrentTaskId();
 
-  private static native ByteBuffer nativeGetCurrentJobId();
+  private static native byte[] nativeGetCurrentJobId();
 
   private static native ByteBuffer nativeGetCurrentWorkerId();
 
   private static native ByteBuffer nativeGetCurrentActorId();
 
   private static native byte[] nativeGetRpcAddress();
+
+  private static native String nativeGetSerializedRuntimeEnv();
 }

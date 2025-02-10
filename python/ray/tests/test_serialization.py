@@ -6,13 +6,16 @@ import re
 import string
 import sys
 import weakref
+from dataclasses import make_dataclass
 
 import numpy as np
-from numpy import log
 import pytest
+from numpy import log
 
 import ray
 import ray.cluster_utils
+import ray.exceptions
+from ray import cloudpickle
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +23,12 @@ logger = logging.getLogger(__name__)
 def is_named_tuple(cls):
     """Return True if cls is a namedtuple and False otherwise."""
     b = cls.__bases__
-    if len(b) != 1 or b[0] != tuple:
+    if len(b) != 1 or b[0] is not tuple:
         return False
     f = getattr(cls, "_fields", None)
     if not isinstance(f, tuple):
         return False
-    return all(type(n) == str for n in f)
+    return all(type(n) is str for n in f)
 
 
 @pytest.mark.parametrize(
@@ -44,8 +47,8 @@ def test_simple_serialization(ray_start_regular):
         "a",
         string.printable,
         "\u262F",
-        u"hello world",
-        u"\xff\xfe\x9c\x001\x000\x00",
+        "hello world",
+        "\xff\xfe\x9c\x001\x000\x00",
         None,
         True,
         False,
@@ -92,8 +95,8 @@ def test_simple_serialization(ray_start_regular):
         # TODO(rkn): The numpy dtypes currently come back as regular integers
         # or floats.
         if type(obj).__module__ != "numpy":
-            assert type(obj) == type(new_obj_1)
-            assert type(obj) == type(new_obj_2)
+            assert type(obj) is type(new_obj_1)
+            assert type(obj) is type(new_obj_2)
 
 
 @pytest.mark.parametrize(
@@ -112,7 +115,7 @@ def test_complex_serialization(ray_start_regular):
                 # This is a special case because currently
                 # np.testing.assert_equal fails because we do not properly
                 # handle different numerical types.
-                assert obj1 == obj2, "Objects {} and {} are " "different.".format(
+                assert obj1 == obj2, "Objects {} and {} are different.".format(
                     obj1, obj2
                 )
             else:
@@ -132,23 +135,19 @@ def test_complex_serialization(ray_start_regular):
         elif type(obj1) is list or type(obj2) is list:
             assert len(obj1) == len(
                 obj2
-            ), "Objects {} and {} are lists with " "different lengths.".format(
-                obj1, obj2
-            )
+            ), "Objects {} and {} are lists with different lengths.".format(obj1, obj2)
             for i in range(len(obj1)):
                 assert_equal(obj1[i], obj2[i])
         elif type(obj1) is tuple or type(obj2) is tuple:
             assert len(obj1) == len(
                 obj2
-            ), "Objects {} and {} are tuples " "with different lengths.".format(
-                obj1, obj2
-            )
+            ), "Objects {} and {} are tuples with different lengths.".format(obj1, obj2)
             for i in range(len(obj1)):
                 assert_equal(obj1[i], obj2[i])
         elif is_named_tuple(type(obj1)) or is_named_tuple(type(obj2)):
             assert len(obj1) == len(
                 obj2
-            ), "Objects {} and {} are named " "tuples with different lengths.".format(
+            ), "Objects {} and {} are named tuples with different lengths.".format(
                 obj1, obj2
             )
             for i in range(len(obj1)):
@@ -156,7 +155,7 @@ def test_complex_serialization(ray_start_regular):
         else:
             assert obj1 == obj2, "Objects {} and {} are different.".format(obj1, obj2)
 
-    long_extras = [0, np.array([["hi", u"hi"], [1.3, 1]])]
+    long_extras = [0, np.array([["hi", "hi"], [1.3, 1]])]
 
     PRIMITIVE_OBJECTS = [
         0,
@@ -169,8 +168,8 @@ def test_complex_serialization(ray_start_regular):
         "a",
         string.printable,
         "\u262F",
-        u"hello world",
-        u"\xff\xfe\x9c\x001\x000\x00",
+        "hello world",
+        "\xff\xfe\x9c\x001\x000\x00",
         None,
         True,
         False,
@@ -249,30 +248,26 @@ def test_complex_serialization(ray_start_regular):
         NamedTupleExample(1, 1.0, "hi", np.zeros([3, 5]), [1, 2, 3]),
     ]
 
-    # Test dataclasses in Python 3.7.
-    if sys.version_info >= (3, 7):
-        from dataclasses import make_dataclass
+    DataClass0 = make_dataclass("DataClass0", [("number", int)])
 
-        DataClass0 = make_dataclass("DataClass0", [("number", int)])
+    CUSTOM_OBJECTS.append(DataClass0(number=3))
 
-        CUSTOM_OBJECTS.append(DataClass0(number=3))
+    class CustomClass:
+        def __init__(self, value):
+            self.value = value
 
-        class CustomClass:
-            def __init__(self, value):
-                self.value = value
+    DataClass1 = make_dataclass("DataClass1", [("custom", CustomClass)])
 
-        DataClass1 = make_dataclass("DataClass1", [("custom", CustomClass)])
+    class DataClass2(DataClass1):
+        @classmethod
+        def from_custom(cls, data):
+            custom = CustomClass(data)
+            return cls(custom)
 
-        class DataClass2(DataClass1):
-            @classmethod
-            def from_custom(cls, data):
-                custom = CustomClass(data)
-                return cls(custom)
+        def __reduce__(self):
+            return (self.from_custom, (self.custom.value,))
 
-            def __reduce__(self):
-                return (self.from_custom, (self.custom.value,))
-
-        CUSTOM_OBJECTS.append(DataClass2(custom=CustomClass(43)))
+    CUSTOM_OBJECTS.append(DataClass2(custom=CustomClass(43)))
 
     BASE_OBJECTS = PRIMITIVE_OBJECTS + COMPLEX_OBJECTS + CUSTOM_OBJECTS
 
@@ -303,7 +298,7 @@ def test_complex_serialization(ray_start_regular):
         assert_equal(obj, ray.get(ray.put(obj)))
 
     # Test StringIO serialization
-    s = io.StringIO(u"Hello, world!\n")
+    s = io.StringIO("Hello, world!\n")
     s.seek(0)
     line = s.readline()
     s.seek(0)
@@ -337,6 +332,7 @@ def test_numpy_subclass_serialization_pickle(ray_start_regular):
 
 def test_inspect_serialization(enable_pickle_debug):
     import threading
+
     from ray.cloudpickle import dumps_debug
 
     lock = threading.Lock()
@@ -551,7 +547,7 @@ def test_reducer_override_no_reference_cycle(ray_start_shared_local_modes):
     wr = weakref.ref(f)
 
     bio = io.BytesIO()
-    from ray.cloudpickle import CloudPickler, loads, dumps
+    from ray.cloudpickle import CloudPickler, dumps, loads
 
     p = CloudPickler(bio, protocol=5)
     p.dump(f)
@@ -632,7 +628,7 @@ def test_numpy_ufunc(ray_start_shared_local_modes):
     @ray.remote
     def f():
         # add reference to the numpy ufunc
-        log
+        _ = log
 
     ray.get(f.remote())
 
@@ -654,7 +650,150 @@ def test_recursive_resolve(ray_start_shared_local_modes):
     assert ray.get(ref) == 42
 
 
+def test_serialization_before_init(shutdown_only):
+    """This test checks if serializers registered before initializing Ray
+    works after initialization."""
+    # make sure ray is shutdown
+    ray.shutdown()
+    assert ray._private.worker.global_worker.current_job_id.is_nil()
+
+    import threading
+
+    class A:
+        def __init__(self, x):
+            self.x = x
+            self.lock = threading.Lock()  # could not be serialized!
+
+    def custom_serializer(a):
+        return a.x
+
+    def custom_deserializer(b):
+        return A(b)
+
+    # Register serializer and deserializer for class A:
+    ray.util.register_serializer(
+        A, serializer=custom_serializer, deserializer=custom_deserializer
+    )
+
+    # Initialize Ray later.
+    ray.init()
+    ray.get(ray.put(A(1)))  # success!
+
+
+def test_serialization_pydantic_runtime_env(ray_start_regular):
+    @ray.remote
+    def test(pydantic_model):
+        return pydantic_model.x
+
+    @ray.remote(runtime_env={"pip": ["pydantic<2"]})
+    def py1():
+        from pydantic import BaseModel
+
+        class Foo(BaseModel):
+            x: int
+
+        return ray.get(test.remote(Foo(x=1)))
+
+    @ray.remote(runtime_env={"pip": ["pydantic>=2"]})
+    def py2():
+        from pydantic.v1 import BaseModel
+
+        class Foo(BaseModel):
+            x: int
+
+        return ray.get(test.remote(Foo(x=2)))
+
+    assert ray.get(py1.remote()) == 1
+    assert ray.get(py2.remote()) == 2
+
+
+def test_usage_with_dataclass(ray_start_regular):
+    import dataclasses
+
+    @dataclasses.dataclass
+    class Test:
+        v: str
+
+    @ray.remote
+    def test(x, expect):
+        assert dataclasses.asdict(x) == expect, dataclasses.asdict(x)
+        return x
+
+    expect_dict = {"v": "x"}
+
+    x = Test(v="x")
+    new_x = ray.get(test.remote(x, expect=expect_dict))
+    assert new_x == x
+    assert dataclasses.asdict(new_x) == dataclasses.asdict(x)
+    assert dataclasses.asdict(new_x) == expect_dict
+
+    y = Test(v="y")
+    expect_dict = {"v": "y"}
+    new_y = ray.get(test.remote(y, expect=expect_dict))
+    assert new_y == y
+    assert dataclasses.asdict(new_y) == dataclasses.asdict(y)
+    assert dataclasses.asdict(new_y) == expect_dict
+
+
+def test_cannot_out_of_band_serialize_object_ref(shutdown_only, monkeypatch):
+    monkeypatch.setenv("RAY_allow_out_of_band_object_ref_serialization", "0")
+    ray.init()
+
+    # Use ray.remote as a workaround because
+    # RAY_allow_out_of_band_object_ref_serialization cannot be set dynamically.
+    @ray.remote
+    def test():
+        ref = ray.put(1)
+
+        @ray.remote
+        def f():
+            _ = ref
+
+        with pytest.raises(ray.exceptions.OufOfBandObjectRefSerializationException):
+            ray.get(f.remote())
+
+        @ray.remote
+        def f():
+            cloudpickle.dumps(ray.put(1))
+
+        with pytest.raises(ray.exceptions.OufOfBandObjectRefSerializationException):
+            ray.get(f.remote())
+
+    return ray.get(test.remote())
+
+
+def test_can_out_of_band_serialize_object_ref_with_env_var(shutdown_only, monkeypatch):
+    monkeypatch.setenv("RAY_allow_out_of_band_object_ref_serialization", "1")
+    ray.init()
+
+    # Use ray.remote as a workaround because
+    # RAY_allow_out_of_band_object_ref_serialization cannot be set dynamically.
+    @ray.remote
+    def test():
+        ref = ray.put(1)
+
+        @ray.remote
+        def f():
+            _ = ref
+
+        ray.get(f.remote())
+
+        @ray.remote
+        def f():
+            ref = ray.put(1)
+            cloudpickle.dumps(ref)
+
+        ray.get(f.remote())
+
+    # It should pass.
+    ray.get(test.remote())
+
+
 if __name__ == "__main__":
+    import os
     import pytest
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

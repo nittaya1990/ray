@@ -23,6 +23,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -73,11 +74,30 @@ class Process {
   /// \param[in] decouple True iff the parent will not wait for the child to exit.
   /// \param[in] env Additional environment variables to be set on this process besides
   /// the environment variables of the parent process.
-  explicit Process(const char *argv[], void *io_service, std::error_code &ec,
-                   bool decouple = false, const ProcessEnvironment &env = {});
+  /// \param[in] pipe_to_stdin If true, it creates a pipe and redirect to child process'
+  /// stdin. It is used for health checking from a child process.
+  /// Child process can read stdin to detect when the current process dies.
+  ///
+  // The subprocess is child of this process, so it's caller process's duty to handle
+  // SIGCHLD signal and reap the zombie children.
+  //
+  // Note: if RAY_kill_child_processes_on_worker_exit_with_raylet_subreaper is set to
+  // true, Raylet will kill any orphan grandchildren processes when the spawned process
+  // dies, *even if* `decouple` is set to `true`.
+  explicit Process(const char *argv[],
+                   void *io_service,
+                   std::error_code &ec,
+                   bool decouple = false,
+                   const ProcessEnvironment &env = {},
+                   bool pipe_to_stdin = false);
   /// Convenience function to run the given command line and wait for it to finish.
   static std::error_code Call(const std::vector<std::string> &args,
                               const ProcessEnvironment &env = {});
+  /// Executes command line operation.
+  ///
+  /// \param[in] argv The command line command to execute.
+  /// \return The output from the command.
+  static std::string Exec(const std::string command);
   static Process CreateNewDummy();
   static Process FromPid(pid_t pid);
   pid_t GetId() const;
@@ -93,8 +113,10 @@ class Process {
   /// Convenience function to start a process in the background.
   /// \param pid_file A file to write the PID of the spawned process in.
   static std::pair<Process, std::error_code> Spawn(
-      const std::vector<std::string> &args, bool decouple,
-      const std::string &pid_file = std::string(), const ProcessEnvironment &env = {});
+      const std::vector<std::string> &args,
+      bool decouple,
+      const std::string &pid_file = std::string(),
+      const ProcessEnvironment &env = {});
   /// Waits for process to terminate. Not supported for unowned processes.
   /// \return The process's exit code. Returns 0 for a dummy process, -1 for a null one.
   int Wait() const;
@@ -109,6 +131,20 @@ pid_t GetPID();
 bool IsParentProcessAlive();
 
 bool IsProcessAlive(pid_t pid);
+
+static constexpr char kProcDirectory[] = "/proc";
+
+// Platform-specific kill for the specified process identifier.
+// Currently only supported on Linux. Returns nullopt for other platforms.
+std::optional<std::error_code> KillProc(pid_t pid);
+
+// Platform-specific utility to find the process IDs of all processes
+// that have the specified parent_pid as their parent.
+// In other words, find all immediate children of the specified process
+// id.
+//
+// Currently only supported on Linux. Returns nullopt on other platforms.
+std::optional<std::vector<pid_t>> GetAllProcsWithPpid(pid_t parent_pid);
 
 }  // namespace ray
 

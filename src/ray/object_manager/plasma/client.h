@@ -24,6 +24,7 @@
 
 #include "ray/common/buffer.h"
 #include "ray/common/status.h"
+#include "ray/object_manager/common.h"
 #include "ray/object_manager/plasma/common.h"
 #include "ray/util/visibility.h"
 #include "src/ray/protobuf/common.pb.h"
@@ -31,8 +32,22 @@
 namespace plasma {
 
 using ray::Buffer;
+using ray::PlasmaObjectHeader;
 using ray::SharedMemoryBuffer;
 using ray::Status;
+
+struct MutableObject {
+  MutableObject(uint8_t *base_ptr, const PlasmaObject &object_info)
+      : header(
+            reinterpret_cast<PlasmaObjectHeader *>(base_ptr + object_info.header_offset)),
+        buffer(std::make_shared<SharedMemoryBuffer>(base_ptr + object_info.data_offset,
+                                                    object_info.allocated_size)),
+        allocated_size(object_info.allocated_size) {}
+
+  PlasmaObjectHeader *header;
+  std::shared_ptr<SharedMemoryBuffer> buffer;
+  const int64_t allocated_size;
+};
 
 /// Object buffer data structure.
 struct ObjectBuffer {
@@ -77,8 +92,14 @@ class PlasmaClientInterface {
   /// \param[out] object_buffers The object results.
   /// \param is_from_worker Whether or not if the Get request comes from a Ray workers.
   /// \return The return status.
-  virtual Status Get(const std::vector<ObjectID> &object_ids, int64_t timeout_ms,
-                     std::vector<ObjectBuffer> *object_buffers, bool is_from_worker) = 0;
+  virtual Status Get(const std::vector<ObjectID> &object_ids,
+                     int64_t timeout_ms,
+                     std::vector<ObjectBuffer> *object_buffers,
+                     bool is_from_worker) = 0;
+
+  virtual Status ExperimentalMutableObjectRegisterWriter(const ObjectID &object_id) = 0;
+  virtual Status GetExperimentalMutableObject(
+      const ObjectID &object_id, std::unique_ptr<MutableObject> *mutable_object) = 0;
 
   /// Seal an object in the object store. The object will be immutable after
   /// this
@@ -125,7 +146,9 @@ class PlasmaClientInterface {
   /// be either sealed or aborted.
   virtual Status CreateAndSpillIfNeeded(const ObjectID &object_id,
                                         const ray::rpc::Address &owner_address,
-                                        int64_t data_size, const uint8_t *metadata,
+                                        bool is_mutable,
+                                        int64_t data_size,
+                                        const uint8_t *metadata,
                                         int64_t metadata_size,
                                         std::shared_ptr<Buffer> *data,
                                         plasma::flatbuf::ObjectSource source,
@@ -158,7 +181,8 @@ class PlasmaClient : public PlasmaClientInterface {
   /// \param num_retries number of attempts to connect to IPC socket, default 50
   /// \return The return status.
   Status Connect(const std::string &store_socket_name,
-                 const std::string &manager_socket_name = "", int release_delay = 0,
+                 const std::string &manager_socket_name = "",
+                 int release_delay = 0,
                  int num_retries = -1);
 
   /// Create an object in the Plasma Store. Any metadata for this object must be
@@ -188,10 +212,14 @@ class PlasmaClient : public PlasmaClientInterface {
   /// The returned object must be released once it is done with.  It must also
   /// be either sealed or aborted.
   Status CreateAndSpillIfNeeded(const ObjectID &object_id,
-                                const ray::rpc::Address &owner_address, int64_t data_size,
-                                const uint8_t *metadata, int64_t metadata_size,
+                                const ray::rpc::Address &owner_address,
+                                bool is_mutable,
+                                int64_t data_size,
+                                const uint8_t *metadata,
+                                int64_t metadata_size,
                                 std::shared_ptr<Buffer> *data,
-                                plasma::flatbuf::ObjectSource source, int device_num = 0);
+                                plasma::flatbuf::ObjectSource source,
+                                int device_num = 0);
 
   /// Create an object in the Plasma Store. Any metadata for this object must be
   /// be passed in when the object is created.
@@ -220,10 +248,13 @@ class PlasmaClient : public PlasmaClientInterface {
   /// The returned object must be released once it is done with.  It must also
   /// be either sealed or aborted.
   Status TryCreateImmediately(const ObjectID &object_id,
-                              const ray::rpc::Address &owner_address, int64_t data_size,
-                              const uint8_t *metadata, int64_t metadata_size,
+                              const ray::rpc::Address &owner_address,
+                              int64_t data_size,
+                              const uint8_t *metadata,
+                              int64_t metadata_size,
                               std::shared_ptr<Buffer> *data,
-                              plasma::flatbuf::ObjectSource source, int device_num = 0);
+                              plasma::flatbuf::ObjectSource source,
+                              int device_num = 0);
 
   /// Get some objects from the Plasma Store. This function will block until the
   /// objects have all been created and sealed in the Plasma Store or the
@@ -240,8 +271,27 @@ class PlasmaClient : public PlasmaClientInterface {
   /// \param[out] object_buffers The object results.
   /// \param is_from_worker Whether or not if the Get request comes from a Ray workers.
   /// \return The return status.
-  Status Get(const std::vector<ObjectID> &object_ids, int64_t timeout_ms,
-             std::vector<ObjectBuffer> *object_buffers, bool is_from_worker);
+  Status Get(const std::vector<ObjectID> &object_ids,
+             int64_t timeout_ms,
+             std::vector<ObjectBuffer> *object_buffers,
+             bool is_from_worker);
+
+  /// Register an experimental mutable object writer. The writer is on a different node
+  /// and wants to write to this node.
+  ///
+  /// \param[in] object_id The ID of the object.
+  /// \return The return status.
+  Status ExperimentalMutableObjectRegisterWriter(const ObjectID &object_id);
+
+  /// Get an experimental mutable object.
+  ///
+  /// \param[in] object_id The ID of the object.
+  /// \param[in] mutable_object Struct containing pointers for the object
+  /// header, which is used to synchronize with other writers and readers, and
+  /// the object data and metadata, which is read by the application.
+  /// \return The return status.
+  Status GetExperimentalMutableObject(const ObjectID &object_id,
+                                      std::unique_ptr<MutableObject> *mutable_object);
 
   /// Tell Plasma that the client no longer needs the object. This should be
   /// called after Get() or Create() when the client is done with the object.
@@ -334,8 +384,10 @@ class PlasmaClient : public PlasmaClientInterface {
   /// \param retry_with_request_id If the request is not yet fulfilled, this
   ///        will be set to a unique ID with which the client should retry.
   /// \param data The address of the newly created object will be written here.
-  Status RetryCreate(const ObjectID &object_id, uint64_t request_id,
-                     const uint8_t *metadata, uint64_t *retry_with_request_id,
+  Status RetryCreate(const ObjectID &object_id,
+                     uint64_t request_id,
+                     const uint8_t *metadata,
+                     uint64_t *retry_with_request_id,
                      std::shared_ptr<Buffer> *data);
 
   friend class PlasmaBuffer;

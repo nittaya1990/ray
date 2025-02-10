@@ -23,7 +23,7 @@ namespace gcs {
 class InMemoryStoreClientTest : public StoreClientTestBase {
  public:
   void InitStoreClient() override {
-    store_client_ = std::make_shared<InMemoryStoreClient>(*(io_service_pool_->Get()));
+    store_client_ = std::make_shared<InMemoryStoreClient>();
   }
 
   void DisconnectStoreClient() override {}
@@ -31,20 +31,9 @@ class InMemoryStoreClientTest : public StoreClientTestBase {
 
 TEST_F(InMemoryStoreClientTest, AsyncPutAndAsyncGetTest) { TestAsyncPutAndAsyncGet(); }
 
-TEST_F(InMemoryStoreClientTest, AsyncPutAndDeleteWithIndexTest) {
-  TestAsyncPutAndDeleteWithIndex();
-}
-
 TEST_F(InMemoryStoreClientTest, AsyncGetAllAndBatchDeleteTest) {
   TestAsyncGetAllAndBatchDelete();
 }
-
-TEST_F(InMemoryStoreClientTest, TestAsyncDeleteWithIndex) { TestAsyncDeleteWithIndex(); }
-
-TEST_F(InMemoryStoreClientTest, TestAsyncBatchDeleteWithIndex) {
-  TestAsyncBatchDeleteWithIndex();
-}
-
 }  // namespace gcs
 
 }  // namespace ray
