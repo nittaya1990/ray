@@ -1,6 +1,11 @@
+# isort: skip_file
+from ray._private import log  # isort: skip # noqa: F401
 import logging
 import os
+import sys
+from typing import TYPE_CHECKING
 
+log.generate_logging_config()
 logger = logging.getLogger(__name__)
 
 
@@ -11,21 +16,27 @@ def _configure_system():
 
     """Wraps system configuration to avoid 'leaking' variables into ray."""
 
-    # MUST add pickle5 to the import path because it will be imported by some
-    # raylet modules.
+    # Sanity check pickle5 if it has been installed.
     if "pickle5" in sys.modules:
-        import pkg_resources
+        if sys.version_info >= (3, 8):
+            logger.warning(
+                "Package pickle5 becomes unnecessary in Python 3.8 and above. "
+                "Its presence may confuse libraries including Ray. "
+                "Please uninstall the package."
+            )
+
+        import importlib.metadata
 
         try:
-            version_info = pkg_resources.require("pickle5")
-            version = tuple(int(n) for n in version_info[0].version.split("."))
+            version_str = importlib.metadata.version("pickle5")
+            version = tuple(int(n) for n in version_str.split("."))
             if version < (0, 0, 10):
-                raise ImportError(
-                    "You are using an old version of pickle5 "
-                    "that leaks memory, please run "
-                    "'pip install pickle5 -U' to upgrade"
+                logger.warning(
+                    "Although not used by Ray, a version of pickle5 that leaks memory "
+                    "is found in the environment. Please run 'pip install pickle5 -U' "
+                    "to upgrade."
                 )
-        except pkg_resources.DistributionNotFound:
+        except importlib.metadata.PackageNotFoundError:
             logger.warning(
                 "You are using the 'pickle5' module, but "
                 "the exact version is unknown (possibly carried as "
@@ -34,36 +45,6 @@ def _configure_system():
                 "previous versions may leak memory."
             )
 
-    # Check that grpc can actually be imported on Apple Silicon. Some package
-    # managers (such as `pip`) can't properly install the grpcio library yet,
-    # so provide a proactive error message if that's the case.
-    if platform.system() == "Darwin" and platform.machine() == "arm64":
-        try:
-            import grpc  # noqa: F401
-        except ImportError:
-            raise ImportError(
-                "Failed to import grpc on Apple Silicon. On Apple"
-                " Silicon machines, try `pip uninstall grpcio; conda "
-                "install grpcio`. Check out "
-                "https://docs.ray.io/en/master/ray-overview/installation.html"
-                "#m1-mac-apple-silicon-support for more details."
-            )
-
-    if "OMP_NUM_THREADS" not in os.environ:
-        logger.debug(
-            "[ray] Forcing OMP_NUM_THREADS=1 to avoid performance "
-            "degradation with many workers (issue #6998). You can "
-            "override this by explicitly setting OMP_NUM_THREADS."
-        )
-        os.environ["OMP_NUM_THREADS"] = "1"
-
-    # Add the directory containing pickle5 to the Python path so that we find
-    # the pickle5 version packaged with ray and not a pre-existing pickle5.
-    pickle5_path = os.path.join(
-        os.path.abspath(os.path.dirname(__file__)), "pickle5_files"
-    )
-    sys.path.insert(0, pickle5_path)
-
     # Importing psutil & setproctitle. Must be before ray._raylet is
     # initialized.
     thirdparty_files = os.path.join(
@@ -71,18 +52,13 @@ def _configure_system():
     )
     sys.path.insert(0, thirdparty_files)
 
-    if sys.platform == "win32":
-        import ray._private.compat  # noqa: E402
-
-        ray._private.compat.patch_redis_empty_recv()
-
     if (
         platform.system() == "Linux"
         and "Microsoft".lower() in platform.release().lower()
     ):
-        import ray._private.compat  # noqa: E402
+        from ray._private import compat  # noqa: E402
 
-        ray._private.compat.patch_psutil()
+        compat.patch_psutil()
 
     # Expose ray ABI symbols which may be dependent by other shared
     # libraries such as _streaming.so. See BUILD.bazel:_raylet
@@ -101,13 +77,14 @@ _configure_system()
 # Delete configuration function.
 del _configure_system
 
-# Replaced with the current commit when building the wheels.
-__commit__ = "{{RAY_COMMIT_SHA}}"
-__version__ = "2.0.0.dev0"
+from ray import _version  # noqa: E402
+
+__commit__ = _version.commit
+__version__ = _version.version
 
 import ray._raylet  # noqa: E402
 
-from ray._raylet import (  # noqa: E402
+from ray._raylet import (  # noqa: E402,F401
     ActorClassID,
     ActorID,
     NodeID,
@@ -117,21 +94,24 @@ from ray._raylet import (  # noqa: E402
     FunctionID,
     ObjectID,
     ObjectRef,
+    ObjectRefGenerator,
+    DynamicObjectRefGenerator,
     TaskID,
     UniqueID,
     Language,
     PlacementGroupID,
+    ClusterID,
 )
 
 _config = _Config()
 
-from ray.state import (  # noqa: E402
+from ray._private.state import (  # noqa: E402,F401
     nodes,
     timeline,
     cluster_resources,
     available_resources,
 )
-from ray.worker import (  # noqa: E402,F401
+from ray._private.worker import (  # noqa: E402,F401
     LOCAL_MODE,
     SCRIPT_MODE,
     WORKER_MODE,
@@ -149,43 +129,68 @@ from ray.worker import (  # noqa: E402,F401
     shutdown,
     wait,
 )
-import ray.internal  # noqa: E402
+
+from ray._private.ray_logging.logging_config import LoggingConfig  # noqa: E402
 
 # We import ray.actor because some code is run in actor.py which initializes
 # some functions in the worker.
 import ray.actor  # noqa: E402,F401
-from ray.actor import method  # noqa: E402
-from ray.cross_language import java_function, java_actor_class  # noqa: E402
-from ray.runtime_context import get_runtime_context  # noqa: E402
-from ray import autoscaler  # noqa:E402
-from ray import data  # noqa: E402,F401
-from ray import util  # noqa: E402
+from ray.actor import method  # noqa: E402,F401
+
+# TODO(qwang): We should remove this exporting in Ray2.0.
+from ray.cross_language import java_function, java_actor_class  # noqa: E402,F401
+from ray.runtime_context import get_runtime_context  # noqa: E402,F401
+from ray import internal  # noqa: E402,F401
+from ray import util  # noqa: E402,F401
 from ray import _private  # noqa: E402,F401
-from ray import workflow  # noqa: E402,F401
 
 # We import ClientBuilder so that modules can inherit from `ray.ClientBuilder`.
-from ray.client_builder import client, ClientBuilder  # noqa: E402
+from ray.client_builder import client, ClientBuilder  # noqa: E402,F401
 
+
+class _DeprecationWrapper:
+    def __init__(self, name, real_worker):
+        self._name = name
+        self._real_worker = real_worker
+        self._warned = set()
+
+    def __getattr__(self, attr):
+        value = getattr(self._real_worker, attr)
+        if attr not in self._warned:
+            self._warned.add(attr)
+            logger.warning(
+                f"DeprecationWarning: `ray.{self._name}.{attr}` is a private "
+                "attribute and access will be removed in a future Ray version."
+            )
+        return value
+
+
+# TODO(ekl) remove this entirely after 3rd party libraries are all migrated.
+worker = _DeprecationWrapper("worker", ray._private.worker)
+ray_constants = _DeprecationWrapper("ray_constants", ray._private.ray_constants)
+serialization = _DeprecationWrapper("serialization", ray._private.serialization)
+state = _DeprecationWrapper("state", ray._private.state)
+
+
+# Pulic Ray APIs
 __all__ = [
     "__version__",
     "_config",
     "get_runtime_context",
-    "actor",
-    "available_resources",
     "autoscaler",
+    "available_resources",
     "cancel",
     "client",
     "ClientBuilder",
     "cluster_resources",
-    "data",
     "get",
     "get_actor",
     "get_gpu_ids",
     "init",
-    "internal",
     "is_initialized",
     "java_actor_class",
     "java_function",
+    "cpp_function",
     "kill",
     "Language",
     "method",
@@ -195,11 +200,67 @@ __all__ = [
     "shutdown",
     "show_in_dashboard",
     "timeline",
-    "util",
     "wait",
     "LOCAL_MODE",
     "SCRIPT_MODE",
     "WORKER_MODE",
+    "LoggingConfig",
+]
+
+# Public APIs that should automatically trigger ray.init().
+AUTO_INIT_APIS = {
+    "cancel",
+    "get",
+    "get_actor",
+    "get_gpu_ids",
+    "kill",
+    "put",
+    "wait",
+    "get_runtime_context",
+}
+
+# Public APIs that should not automatically trigger ray.init().
+NON_AUTO_INIT_APIS = {
+    "ClientBuilder",
+    "LOCAL_MODE",
+    "Language",
+    "SCRIPT_MODE",
+    "WORKER_MODE",
+    "__version__",
+    "_config",
+    "autoscaler",
+    "available_resources",
+    "client",
+    "cluster_resources",
+    "cpp_function",
+    "init",
+    "is_initialized",
+    "java_actor_class",
+    "java_function",
+    "method",
+    "nodes",
+    "remote",
+    "show_in_dashboard",
+    "shutdown",
+    "timeline",
+    "LoggingConfig",
+}
+
+assert set(__all__) == AUTO_INIT_APIS | NON_AUTO_INIT_APIS
+from ray._private.auto_init_hook import wrap_auto_init_for_all_apis  # noqa: E402
+
+wrap_auto_init_for_all_apis(AUTO_INIT_APIS)
+del wrap_auto_init_for_all_apis
+
+# Subpackages
+__all__ += [
+    "actor",
+    "autoscaler",
+    "data",
+    "internal",
+    "util",
+    "widgets",
+    "workflow",
 ]
 
 # ID types
@@ -212,33 +273,32 @@ __all__ += [
     "FunctionID",
     "ObjectID",
     "ObjectRef",
+    "ObjectRefGenerator",
+    "DynamicObjectRefGenerator",
     "TaskID",
     "UniqueID",
     "PlacementGroupID",
 ]
 
 
-# Remove modules from top-level ray
-def _ray_user_setup_function():
-    import os
+# Delay importing of expensive, isolated subpackages. Note that for proper type
+# checking support these imports must be kept in sync between type checking and
+# runtime behavior.
+if TYPE_CHECKING:
+    from ray import autoscaler
+    from ray import data
+    from ray import workflow
+else:
 
-    user_setup_fn = os.environ.get("RAY_USER_SETUP_FUNCTION")
-    if user_setup_fn is not None:
-        try:
-            module_name, fn_name = user_setup_fn.rsplit(".", 1)
-            m = __import__(module_name, globals(), locals(), [fn_name])
-            getattr(m, fn_name)()
-        except Exception as e:
-            # We still need to allow ray to be imported, even there is
-            # something in the setup function.
-            logger.warning(
-                f"Failed to run user setup function: {user_setup_fn}. "
-                f"Error message {e}"
-            )
+    def __getattr__(name: str):
+        import importlib
 
+        if name in ["data", "workflow", "autoscaler"]:
+            return importlib.import_module("." + name, __name__)
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-_ray_user_setup_function()
 
 del os
 del logging
-del _ray_user_setup_function
+del sys
+del TYPE_CHECKING

@@ -21,21 +21,18 @@ import pytest
 import pandas
 import numpy as np
 from numpy.testing import assert_array_equal
-import ray
-from ray.util.client.ray_client_helpers import ray_start_client_server
+from ray.tests.conftest import ray_start_regular_shared  # noqa F401
 
-modin_compatible_version = sys.version_info >= (3, 7, 0)
 modin_installed = True
 
-if modin_compatible_version:
-    try:
-        import modin  # noqa: F401
-    except ModuleNotFoundError:
-        modin_installed = False
+try:
+    import modin  # noqa: F401
+except ModuleNotFoundError:
+    modin_installed = False
 
-skip = not modin_compatible_version or not modin_installed
+skip = not modin_installed
 
-# These tests are written for versions of Modin that require python 3.7+
+# These tests are written for versions of Modin that require python 3.8+
 pytestmark = pytest.mark.skipif(skip, reason="Outdated or missing Modin dependency")
 
 if not skip:
@@ -43,24 +40,15 @@ if not skip:
     import modin.pandas as pd
 
 
-# Module scoped fixture. Will first run all tests without ray
-# client, then rerun all tests with a single ray client session.
-@pytest.fixture(params=[False, True], autouse=True, scope="module")
-def run_ray_client(request):
-    if request.param:
-        with ray_start_client_server() as client:
-            yield client
-    else:
-        # Run without ray client (do nothing)
-        yield
-        # Cleanup state before rerunning tests with client
-        ray.shutdown()
+@pytest.fixture(autouse=True)
+def connect_to_ray_cluster(ray_start_regular_shared):  # noqa F811
+    yield
 
 
 random_state = np.random.RandomState(seed=42)
 
 # Size of test dataframes
-NCOLS, NROWS = (2 ** 6, 2 ** 8)
+NCOLS, NROWS = (2**6, 2**8)
 
 # Range for values for test data
 RAND_LOW = 0

@@ -2,16 +2,21 @@ package io.ray.test;
 
 import com.google.common.base.Preconditions;
 import io.ray.api.ActorHandle;
+import io.ray.api.CppActorHandle;
 import io.ray.api.ObjectRef;
 import io.ray.api.PyActorHandle;
 import io.ray.api.Ray;
+import io.ray.api.exception.CrossLanguageException;
+import io.ray.api.exception.RayException;
+import io.ray.api.exception.RayTimeoutException;
+import io.ray.api.function.CppActorClass;
+import io.ray.api.function.CppActorMethod;
+import io.ray.api.function.CppFunction;
 import io.ray.api.function.PyActorClass;
 import io.ray.api.function.PyActorMethod;
 import io.ray.api.function.PyFunction;
 import io.ray.runtime.actor.NativeActorHandle;
-import io.ray.runtime.exception.CrossLanguageException;
-import io.ray.runtime.exception.RayException;
-import io.ray.runtime.generated.Common.Language;
+import io.ray.runtime.serializer.RayExceptionSerializer;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -19,6 +24,8 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
+import java.util.function.Supplier;
 import org.apache.commons.io.FileUtils;
 import org.testng.Assert;
 import org.testng.annotations.BeforeClass;
@@ -28,6 +35,7 @@ import org.testng.annotations.Test;
 public class CrossLanguageInvocationTest extends BaseTest {
 
   private static final String PYTHON_MODULE = "test_cross_language_invocation";
+  private static final String[] CPP_LIBRARYS = {"counter", "plus"};
 
   @BeforeClass
   public void beforeClass() {
@@ -40,12 +48,26 @@ public class CrossLanguageInvocationTest extends BaseTest {
 
     // Write the test Python file to the temp dir.
     InputStream in =
-        CrossLanguageInvocationTest.class.getResourceAsStream("/" + PYTHON_MODULE + ".py");
+        CrossLanguageInvocationTest.class.getResourceAsStream(
+            File.separator + PYTHON_MODULE + ".py");
     File pythonFile = new File(tempDir.getAbsolutePath() + File.separator + PYTHON_MODULE + ".py");
     try {
       FileUtils.copyInputStreamToFile(in, pythonFile);
     } catch (IOException e) {
       throw new RuntimeException(e);
+    }
+
+    // Write the test Cpp files to the temp dir.
+    for (String lib : CPP_LIBRARYS) {
+      in =
+          CrossLanguageInvocationTest.class.getResourceAsStream(
+              File.separator + "cpp" + File.separator + lib + ".so");
+      File cppFile = new File(tempDir.getAbsolutePath() + File.separator + lib + ".so");
+      try {
+        FileUtils.copyInputStreamToFile(in, cppFile);
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
     }
 
     System.setProperty(
@@ -117,6 +139,13 @@ public class CrossLanguageInvocationTest extends BaseTest {
       Assert.assertEquals(((Number) r7array[0]).intValue(), input7array[0]);
       Assert.assertEquals(((Number) r7array[1]).intValue(), input7array[1]);
     }
+    // objectRef
+    {
+      ObjectRef<Integer> input = Ray.put(1);
+      ObjectRef<Integer> res =
+          Ray.task(PyFunction.of(PYTHON_MODULE, "py_return_input", Integer.class), input).remote();
+      Assert.assertEquals(res.get(), input.get());
+    }
     // Unsupported types, all Java specific types, e.g. List / Map...
     {
       Assert.expectThrows(
@@ -151,6 +180,146 @@ public class CrossLanguageInvocationTest extends BaseTest {
     ObjectRef<byte[]> res =
         actor.task(PyActorMethod.of("increase", byte[].class), "1".getBytes()).remote();
     Assert.assertEquals(res.get(), "2".getBytes());
+
+    ObjectRef<String> numRef = Ray.put("2");
+    ObjectRef<byte[]> res2 =
+        actor.task(PyActorMethod.of("increase", byte[].class), numRef).remote();
+    Assert.assertEquals(res2.get(), "4".getBytes());
+  }
+
+  @Test
+  public void testCallingPythonAsyncActor() {
+    {
+      PyActorHandle actor =
+          Ray.actor(PyActorClass.of(PYTHON_MODULE, "AsyncCounter"), "1".getBytes())
+              .setAsync(true)
+              .remote();
+      actor.task(PyActorMethod.of("block_task", byte[].class)).remote();
+      ObjectRef<byte[]> res =
+          actor.task(PyActorMethod.of("increase", byte[].class), "1".getBytes()).remote();
+      Assert.assertEquals(res.get(), "2".getBytes());
+    }
+    {
+      PyActorHandle actor =
+          Ray.actor(PyActorClass.of(PYTHON_MODULE, "SyncCounter"), "1".getBytes())
+              .setAsync(false)
+              .remote();
+      actor.task(PyActorMethod.of("block_task", byte[].class)).remote();
+      ObjectRef<byte[]> res =
+          actor.task(PyActorMethod.of("increase", byte[].class), "1".getBytes()).remote();
+      Supplier<Boolean> getValue =
+          () -> {
+            if (equals(res.get() == "2".getBytes())) {
+              return true;
+            } else {
+              return false;
+            }
+          };
+      Assert.assertFalse(TestUtils.waitForCondition(getValue, 30000));
+    }
+  }
+
+  @Test
+  public void testCallingCppFunction() {
+    // Test calling a simple C++ function.
+    ObjectRef<Integer> res = Ray.task(CppFunction.of("Plus", Integer.class), 1, 2).remote();
+    Assert.assertEquals(res.get(), Integer.valueOf(3));
+    // Test calling a C++ function that returns a large object.
+    ObjectRef<int[]> res1 =
+        Ray.task(CppFunction.of("ReturnLargeArray", int[].class), new int[100000]).remote();
+    Assert.assertEquals(res1.get().length, 100000);
+    // Test calling a C++ function with String type input/output.
+    ObjectRef<String> res2 = Ray.task(CppFunction.of("Echo", String.class), "CallCpp").remote();
+    Assert.assertEquals(res2.get(), "CallCpp");
+    // Test calling a C++ function that throws an exception.
+    Assert.expectThrows(
+        Exception.class,
+        () -> {
+          ObjectRef<Object> res3 = Ray.task(CppFunction.of("ThrowTask")).remote();
+          res3.get();
+        });
+  }
+
+  @Test
+  public void testCallingCppActor() {
+    String actorName = "actor_name";
+    CppActorHandle actor =
+        Ray.actor(CppActorClass.of("RAY_FUNC(Counter::FactoryCreate)", "Counter"))
+            .setName(actorName)
+            .remote();
+    ObjectRef<Integer> res = actor.task(CppActorMethod.of("Plus1", Integer.class)).remote();
+    Assert.assertEquals(res.get(), Integer.valueOf(1));
+    ObjectRef<byte[]> b =
+        actor.task(CppActorMethod.of("GetBytes", byte[].class), "C++ Worker").remote();
+    Assert.assertEquals(b.get(), "C++ Worker".getBytes());
+
+    ObjectRef<byte[]> b2 =
+        actor.task(CppActorMethod.of("EchoBytes", byte[].class), "C++ Worker".getBytes()).remote();
+    Assert.assertEquals(b2.get(), "C++ Worker".getBytes());
+
+    ObjectRef<byte[]> b3 =
+        actor.task(CppActorMethod.of("EchoBytes", byte[].class), new byte[0]).remote();
+    Assert.assertEquals(b3.get(), new byte[0]);
+
+    ObjectRef<byte[]> b4 = actor.task(CppActorMethod.of("EchoBytes", byte[].class), null).remote();
+    Assert.assertThrows(CrossLanguageException.class, () -> b4.get());
+
+    // Test get cpp actor by actor name.
+    Optional<CppActorHandle> optional = Ray.getActor(actorName);
+    Assert.assertTrue(optional.isPresent());
+    CppActorHandle actor2 = optional.get();
+    ObjectRef<Integer> res2 = actor2.task(CppActorMethod.of("Plus1", Integer.class)).remote();
+    Assert.assertEquals(res2.get(), Integer.valueOf(2));
+
+    // Test get other cpp actor by actor name.
+    String childName = "child_name";
+    ObjectRef<String> res3 =
+        actor.task(CppActorMethod.of("CreateNestedChildActor", String.class), childName).remote();
+    Assert.assertEquals(res3.get(), "OK");
+    Optional<CppActorHandle> optional3 = Ray.getActor(childName);
+    Assert.assertTrue(optional3.isPresent());
+    CppActorHandle actor3 = optional3.get();
+    ObjectRef<Integer> res4 = actor3.task(CppActorMethod.of("Plus1", Integer.class)).remote();
+    Assert.assertEquals(res4.get(), Integer.valueOf(1));
+    Object[] strings = new Object[] {"str1", "str2"};
+    ObjectRef<Object[]> ref_strings =
+        actor.task(CppActorMethod.of("EchoStrings", Object[].class), strings).remote();
+    Assert.assertEquals(ref_strings.get(), strings);
+
+    if (System.getProperty("os.name").toUpperCase().indexOf("Windows") == -1) {
+      // Testing the supported parameter types for c++ worker std::any type
+      Object[] inputs =
+          new Object[] {
+            true, // Boolean
+            Byte.MAX_VALUE, // Byte
+            Short.MAX_VALUE, // Short
+            Integer.MAX_VALUE, // Integer
+            Long.MAX_VALUE, // Long
+            Long.MIN_VALUE,
+            BigInteger.valueOf(Long.MAX_VALUE), // BigInteger
+            "Hello World!", // String
+            1.234f, // Float
+            1.234, // Double
+            "binary".getBytes() // byte[]
+          };
+      ObjectRef<Object[]> ref_objs =
+          actor.task(CppActorMethod.of("EchoAnyArray", Object[].class), inputs).remote();
+      Object[] objs_result = ref_objs.get();
+      Assert.assertEquals(objs_result.length, inputs.length);
+      Assert.assertEquals((Boolean) objs_result[0], inputs[0]);
+      Assert.assertEquals((Byte) objs_result[1], inputs[1]);
+      Assert.assertEquals((Short) objs_result[2], inputs[2]);
+      Assert.assertEquals((Integer) objs_result[3], inputs[3]);
+      Assert.assertEquals((Long) objs_result[4], inputs[4]);
+      Assert.assertEquals((Long) objs_result[5], inputs[5]);
+      // BigInteger change to Long
+      Assert.assertEquals((Long) objs_result[6], Long.MAX_VALUE);
+      Assert.assertEquals((String) objs_result[7], inputs[7]);
+      // Float change to double
+      Assert.assertTrue(Math.abs((Double) objs_result[8] - 1.234) < 0.000001);
+      Assert.assertTrue(Math.abs((Double) objs_result[9] - (Double) inputs[9]) < 0.000001);
+      Assert.assertEquals((byte[]) objs_result[10], (byte[]) inputs[10]);
+    }
   }
 
   @Test
@@ -204,7 +373,7 @@ public class CrossLanguageInvocationTest extends BaseTest {
       String formattedException =
           org.apache.commons.lang3.exception.ExceptionUtils.getStackTrace(e);
       io.ray.runtime.generated.Common.RayException exception =
-          io.ray.runtime.generated.Common.RayException.parseFrom(e.toBytes());
+          io.ray.runtime.generated.Common.RayException.parseFrom(RayExceptionSerializer.toBytes(e));
       Assert.assertEquals(exception.getFormattedExceptionString(), formattedException);
     }
   }
@@ -220,7 +389,6 @@ public class CrossLanguageInvocationTest extends BaseTest {
       // ex is a Python exception(py_func_python_raise_exception) with no cause.
       Assert.assertTrue(ex instanceof CrossLanguageException);
       CrossLanguageException e = (CrossLanguageException) ex;
-      Assert.assertEquals(e.getLanguage(), Language.PYTHON);
       // ex.cause is null.
       Assert.assertNull(ex.getCause());
       Assert.assertTrue(
@@ -278,7 +446,7 @@ public class CrossLanguageInvocationTest extends BaseTest {
       Assert.assertTrue(message.contains("py_func_nest_java_throw_exception"), message);
       Assert.assertEquals(
           org.apache.commons.lang3.StringUtils.countMatches(
-              message, "io.ray.runtime.exception.RayTaskException"),
+              message, "io.ray.api.exception.RayTaskException"),
           2);
       Assert.assertTrue(message.contains("py_func_java_throw_exception"), message);
       Assert.assertTrue(message.contains("java.lang.ArithmeticException: / by zero"), message);
@@ -377,26 +545,6 @@ public class CrossLanguageInvocationTest extends BaseTest {
     return res.get();
   }
 
-  public static class TestActor {
-
-    public TestActor(byte[] v) {
-      value = v;
-    }
-
-    public byte[] concat(byte[] v) {
-      byte[] c = new byte[value.length + v.length];
-      System.arraycopy(value, 0, c, 0, value.length);
-      System.arraycopy(v, 0, c, value.length, v.length);
-      return c;
-    }
-
-    public byte[] getValue() {
-      return value;
-    }
-
-    private byte[] value;
-  }
-
   public void testPyCallJavaOeveridedMethodWithDefault() {
     ObjectRef<Object> res =
         Ray.task(
@@ -413,5 +561,30 @@ public class CrossLanguageInvocationTest extends BaseTest {
         Ray.task(PyFunction.of(PYTHON_MODULE, "py_func_call_java_overloaded_method", Object.class))
             .remote();
     Assert.assertEquals(true, res.get());
+  }
+
+  @Test
+  public void testCppActorMaxConcurrency() {
+    CppActorHandle actor =
+        Ray.actor(CppActorClass.of("ActorConcurrentCall::FactoryCreate", "ActorConcurrentCall"))
+            .setMaxConcurrency(3)
+            .remote();
+    ObjectRef<String> ref1 = actor.task(CppActorMethod.of("CountDown", String.class)).remote();
+    ObjectRef<String> ref2 = actor.task(CppActorMethod.of("CountDown", String.class)).remote();
+    ObjectRef<String> ref3 = actor.task(CppActorMethod.of("CountDown", String.class)).remote();
+    Assert.assertEquals(ref1.get(), "ok");
+    Assert.assertEquals(ref2.get(), "ok");
+    Assert.assertEquals(ref3.get(), "ok");
+
+    CppActorHandle actor2 =
+        Ray.actor(CppActorClass.of("ActorConcurrentCall::FactoryCreate", "ActorConcurrentCall"))
+            .setMaxConcurrency(1)
+            .remote();
+    ObjectRef<String> r1 = actor2.task(CppActorMethod.of("CountDown", String.class)).remote();
+    ObjectRef<String> r2 = actor2.task(CppActorMethod.of("CountDown", String.class)).remote();
+    ObjectRef<String> r3 = actor2.task(CppActorMethod.of("CountDown", String.class)).remote();
+    Assert.expectThrows(RayTimeoutException.class, () -> r1.get(2000));
+    Assert.expectThrows(RayTimeoutException.class, () -> r2.get(2000));
+    Assert.expectThrows(RayTimeoutException.class, () -> r3.get(2000));
   }
 }

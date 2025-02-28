@@ -1,16 +1,18 @@
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.framework import try_import_torch
-from ray.rllib.utils.framework import TensorType
+from ray.rllib.utils.typing import TensorType
 
 torch, nn = try_import_torch()
 
 
+@OldAPIStack
 class GRUGate(nn.Module):
     """Implements a gated recurrent unit for use in AttentionNet"""
 
     def __init__(self, dim: int, init_bias: int = 0.0, **kwargs):
         """
         input_shape (torch.Tensor): dimension of the input
-        init_bias (int): Bias added to every input to stabilize training
+        init_bias: Bias added to every input to stabilize training
         """
         super().__init__(**kwargs)
         # Xavier initialization of torch tensors

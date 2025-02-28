@@ -8,8 +8,8 @@
       Z. Dai, Z. Yang, et al. - Carnegie Mellon U - 2019.
       https://www.aclweb.org/anthology/P19-1285.pdf
 """
-import gym
-from gym.spaces import Box, Discrete, MultiDiscrete
+import gymnasium as gym
+from gymnasium.spaces import Box, Discrete, MultiDiscrete
 import numpy as np
 import tree  # pip install dm_tree
 from typing import Dict, Optional, Union
@@ -25,23 +25,25 @@ from ray.rllib.models.torch.recurrent_net import RecurrentNetwork
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.policy.view_requirement import ViewRequirement
-from ray.rllib.utils.annotations import override
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.spaces.space_utils import get_base_struct_from_space
 from ray.rllib.utils.torch_utils import flatten_inputs_to_1d_tensor, one_hot
 from ray.rllib.utils.typing import ModelConfigDict, TensorType, List
+from ray.rllib.utils.deprecation import deprecation_warning
+from ray.util import log_once
 
 torch, nn = try_import_torch()
 
 
+@OldAPIStack
 class GTrXLNet(RecurrentNetwork, nn.Module):
     """A GTrXL net Model described in [2].
 
     This is still in an experimental phase.
     Can be used as a drop-in replacement for LSTMs in PPO and IMPALA.
-    For an example script, see: `ray/rllib/examples/attention_net.py`.
 
-    To use this network as a replacement for an RNN, configure your Trainer
+    To use this network as a replacement for an RNN, configure your Algorithm
     as follows:
 
     Examples:
@@ -76,33 +78,32 @@ class GTrXLNet(RecurrentNetwork, nn.Module):
         """Initializes a GTrXLNet.
 
         Args:
-            num_transformer_units (int): The number of Transformer repeats to
+            num_transformer_units: The number of Transformer repeats to
                 use (denoted L in [2]).
-            attention_dim (int): The input and output dimensions of one
+            attention_dim: The input and output dimensions of one
                 Transformer unit.
-            num_heads (int): The number of attention heads to use in parallel.
+            num_heads: The number of attention heads to use in parallel.
                 Denoted as `H` in [3].
-            memory_inference (int): The number of timesteps to concat (time
+            memory_inference: The number of timesteps to concat (time
                 axis) and feed into the next transformer unit as inference
                 input. The first transformer unit will receive this number of
                 past observations (plus the current one), instead.
-            memory_training (int): The number of timesteps to concat (time
+            memory_training: The number of timesteps to concat (time
                 axis) and feed into the next transformer unit as training
                 input (plus the actual input sequence of len=max_seq_len).
                 The first transformer unit will receive this number of
                 past observations (plus the input sequence), instead.
-            head_dim (int): The dimension of a single(!) attention head within
+            head_dim: The dimension of a single(!) attention head within
                 a multi-head attention unit. Denoted as `d` in [3].
-            position_wise_mlp_dim (int): The dimension of the hidden layer
+            position_wise_mlp_dim: The dimension of the hidden layer
                 within the position-wise MLP (after the multi-head attention
                 block within one Transformer unit). This is the size of the
                 first of the two layers within the PositionwiseFeedforward. The
                 second layer always has size=`attention_dim`.
-            init_gru_gate_bias (float): Initial bias values for the GRU gates
+            init_gru_gate_bias: Initial bias values for the GRU gates
                 (two GRUs per Transformer unit, one after the MHA, one after
                 the position-wise MLP).
         """
-
         super().__init__(
             observation_space, action_space, num_outputs, model_config, name
         )
@@ -268,6 +269,10 @@ class AttentionWrapper(TorchModelV2, nn.Module):
         model_config: ModelConfigDict,
         name: str,
     ):
+        if log_once("deprecate_attention_wrapper_torch"):
+            deprecation_warning(
+                old="ray.rllib.models.torch.attention_net.AttentionWrapper"
+            )
 
         nn.Module.__init__(self)
         super().__init__(obs_space, action_space, None, model_config, name)
@@ -284,7 +289,7 @@ class AttentionWrapper(TorchModelV2, nn.Module):
             elif isinstance(space, MultiDiscrete):
                 self.action_dim += np.sum(space.nvec)
             elif space.shape is not None:
-                self.action_dim += int(np.product(space.shape))
+                self.action_dim += int(np.prod(space.shape))
             else:
                 self.action_dim += int(len(space))
 
@@ -439,7 +444,12 @@ class AttentionWrapper(TorchModelV2, nn.Module):
 
     @override(ModelV2)
     def get_initial_state(self) -> Union[List[np.ndarray], List[TensorType]]:
-        return []
+        return [
+            torch.zeros(
+                self.gtrxl.view_requirements["state_in_{}".format(i)].space.shape
+            )
+            for i in range(self.gtrxl.num_transformer_units)
+        ]
 
     @override(ModelV2)
     def value_function(self) -> TensorType:

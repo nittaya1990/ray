@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <ray/api/msgpack_adaptor.h>
 #include <ray/api/ray_exception.h>
 #include <ray/api/xlang_function.h>
 
@@ -28,6 +29,14 @@ class Serializer {
   static msgpack::sbuffer Serialize(const T &t) {
     msgpack::sbuffer buffer;
     msgpack::pack(buffer, t);
+    return buffer;
+  }
+
+  static msgpack::sbuffer Serialize(const char *data, size_t size) {
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> packer(&buffer);
+    packer.pack_bin(size);
+    packer.pack_bin_body(data, size);
     return buffer;
   }
 

@@ -1,13 +1,10 @@
-import logging
 import pytest
-from unittest.mock import patch
 
 from ray.tests.test_autoscaler import MockProvider, MockProcessRunner
 from ray.autoscaler.command_runner import CommandRunnerInterface
 from ray.autoscaler._private.command_runner import (
     SSHCommandRunner,
     DockerCommandRunner,
-    KubernetesCommandRunner,
     _with_environment_variables,
 )
 from ray.autoscaler.sdk import get_docker_host_mount_location
@@ -50,7 +47,7 @@ def test_command_runner_interface_abstraction_violation():
         for func in cmd_runner_interface_public_functions
         if not func.startswith("_")
     }
-    for subcls in [SSHCommandRunner, DockerCommandRunner, KubernetesCommandRunner]:
+    for subcls in [SSHCommandRunner, DockerCommandRunner]:
         subclass_available_functions = dir(subcls)
         subclass_public_functions = {
             func for func in subclass_available_functions if not func.startswith("_")
@@ -63,14 +60,14 @@ def test_ssh_command_runner():
     provider = MockProvider()
     provider.create_node({}, {}, 1)
     cluster_name = "cluster"
-    ssh_control_hash = hashlib.md5(cluster_name.encode()).hexdigest()
-    ssh_user_hash = hashlib.md5(getuser().encode()).hexdigest()
+    ssh_control_hash = hashlib.sha1(cluster_name.encode()).hexdigest()
+    ssh_user_hash = hashlib.sha1(getuser().encode()).hexdigest()
     ssh_control_path = "/tmp/ray_ssh_{}/{}".format(
         ssh_user_hash[:10], ssh_control_hash[:10]
     )
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -116,7 +113,7 @@ def test_ssh_command_runner():
         "--login",
         "-c",
         "-i",
-        """'true && source ~/.bashrc && export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export var1='"'"'"quote between this \\" and this"'"'"';export var2='"'"'"123"'"'"';echo helloo)'""",  # noqa: E501
+        """'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export var1='"'"'"quote between this \\" and this"'"'"';export var2='"'"'"123"'"'"';echo helloo)'""",  # noqa: E501
     ]
 
     # Much easier to debug this loop than the function call.
@@ -125,66 +122,20 @@ def test_ssh_command_runner():
     process_runner.assert_has_call("1.2.3.4", exact=expected)
 
 
-def test_kubernetes_command_runner():
-    fail_cmd = "fail command"
-    process_runner = MockProcessRunner([fail_cmd])
-    provider = MockProvider()
-    provider.create_node({}, {}, 1)
-    args = {
-        "log_prefix": "prefix",
-        "namespace": "namespace",
-        "node_id": 0,
-        "auth_config": auth_config,
-        "process_runner": process_runner,
-    }
-    cmd_runner = KubernetesCommandRunner(**args)
-
-    env_vars = {"var1": 'quote between this " and this', "var2": "123"}
-    cmd_runner.run("echo helloo", environment_variables=env_vars)
-
-    expected = [
-        "kubectl",
-        "-n",
-        "namespace",
-        "exec",
-        "-it",
-        "0",
-        "--",
-        "bash",
-        "--login",
-        "-c",
-        "-i",
-        """\'true && source ~/.bashrc && export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export var1=\'"\'"\'"quote between this \\" and this"\'"\'"\';export var2=\'"\'"\'"123"\'"\'"\';echo helloo)\'""",  # noqa: E501
-    ]
-
-    assert process_runner.calls[0] == " ".join(expected)
-
-    logger = logging.getLogger("ray.autoscaler._private.command_runner")
-    with pytest.raises(SystemExit) as pytest_wrapped_e, patch.object(
-        logger, "error"
-    ) as mock_logger_error:
-        cmd_runner.run(fail_cmd, exit_on_fail=True)
-
-    failed_cmd_expected = f"prefixCommand failed: \n\n  kubectl -n namespace exec -it 0 --'bash --login -c -i '\"'\"'true && source ~/.bashrc && export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && ({fail_cmd})'\"'\"''\n"  # noqa: E501
-    mock_logger_error.assert_called_once_with(failed_cmd_expected)
-    assert pytest_wrapped_e.type == SystemExit
-    assert pytest_wrapped_e.value.code == 1
-
-
 def test_docker_command_runner():
     process_runner = MockProcessRunner()
     provider = MockProvider()
     provider.create_node({}, {}, 1)
     cluster_name = "cluster"
-    ssh_control_hash = hashlib.md5(cluster_name.encode()).hexdigest()
-    ssh_user_hash = hashlib.md5(getuser().encode()).hexdigest()
+    ssh_control_hash = hashlib.sha1(cluster_name.encode()).hexdigest()
+    ssh_user_hash = hashlib.sha1(getuser().encode()).hexdigest()
     ssh_control_path = "/tmp/ray_ssh_{}/{}".format(
         ssh_user_hash[:10], ssh_control_hash[:10]
     )
     docker_config = {"container_name": "container"}
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -201,7 +152,7 @@ def test_docker_command_runner():
     # This string is insane because there are an absurd number of embedded
     # quotes. While this is a ridiculous string, the escape behavior is
     # important and somewhat difficult to get right for environment variables.
-    cmd = """'true && source ~/.bashrc && export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker exec -it  container /bin/bash -c '"'"'bash --login -c -i '"'"'"'"'"'"'"'"'true && source ~/.bashrc && export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export var1='"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"quote between this \\" and this"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"';export var2='"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"123"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"';echo hello)'"'"'"'"'"'"'"'"''"'"' )'"""  # noqa: E501
+    cmd = """'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (docker exec -it  container /bin/bash -c '"'"'bash --login -c -i '"'"'"'"'"'"'"'"'source ~/.bashrc; export OMP_NUM_THREADS=1 PYTHONWARNINGS=ignore && (export var1='"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"quote between this \\" and this"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"';export var2='"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"123"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"'"';echo hello)'"'"'"'"'"'"'"'"''"'"' )'"""  # noqa: E501
 
     expected = [
         "ssh",
@@ -251,7 +202,7 @@ def test_docker_rsync():
     docker_config = {"container_name": "container"}
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -341,7 +292,7 @@ def test_rsync_exclude_and_filter():
     cluster_name = "cluster"
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -376,7 +327,7 @@ def test_rsync_without_exclude_and_filter():
     cluster_name = "cluster"
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -417,7 +368,7 @@ def test_docker_shm_override(run_option_type):
     }
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -438,6 +389,10 @@ def test_docker_shm_override(run_option_type):
 
 
 if __name__ == "__main__":
+    import os
     import sys
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

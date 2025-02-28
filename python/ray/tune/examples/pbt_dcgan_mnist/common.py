@@ -1,6 +1,8 @@
-import ray
-
 import os
+
+import matplotlib.animation as animation
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -8,14 +10,11 @@ import torch.utils.data
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
-import numpy as np
-
+from scipy.stats import entropy
 from torch.autograd import Variable
 from torch.nn import functional as F
-from scipy.stats import entropy
 
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
+import ray
 
 # Training parameters
 workers = 2
@@ -181,7 +180,7 @@ def inception_score(imgs, mnist_model_ref, batch_size=32, splits=1):
 # __INCEPTION_SCORE_end__
 
 
-def train(
+def train_func(
     netD,
     netG,
     optimG,
@@ -267,9 +266,11 @@ def plot_images(dataloader):
 def demo_gan(checkpoint_paths):
     img_list = []
     fixed_noise = torch.randn(64, nz, 1, 1)
-    for netG_path in checkpoint_paths:
+    for path in checkpoint_paths:
+        checkpoint_dict = torch.load(os.path.join(path, "checkpoint.pt"))
+
         loadedG = Generator()
-        loadedG.load_state_dict(torch.load(netG_path)["netGmodel"])
+        loadedG.load_state_dict(checkpoint_dict["netGmodel"])
         with torch.no_grad():
             fake = loadedG(fixed_noise).detach().cpu()
         img_list.append(vutils.make_grid(fake, padding=2, normalize=True))

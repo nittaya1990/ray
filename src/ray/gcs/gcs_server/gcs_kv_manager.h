@@ -13,12 +13,13 @@
 // limitations under the License.
 
 #pragma once
-#include <memory>
 
-#include "absl/container/btree_map.h"
-#include "absl/synchronization/mutex.h"
-#include "ray/gcs/redis_client.h"
-#include "ray/gcs/store_client/redis_store_client.h"
+#include <memory>
+#include <string>
+
+#include "ray/common/asio/instrumented_io_context.h"
+#include "ray/common/asio/postable.h"
+#include "ray/common/status.h"
 #include "ray/rpc/gcs_server/gcs_rpc_server.h"
 
 namespace ray {
@@ -34,9 +35,20 @@ class InternalKVInterface {
   ///
   /// \param ns The namespace of the key.
   /// \param key The key to fetch.
-  /// \param callback Callback function.
-  virtual void Get(const std::string &ns, const std::string &key,
-                   std::function<void(std::optional<std::string>)> callback) = 0;
+  /// \param callback Returns the value or null if the key doesn't exist.
+  virtual void Get(const std::string &ns,
+                   const std::string &key,
+                   Postable<void(std::optional<std::string>)> callback) = 0;
+
+  /// Get the values associated with `keys`.
+  ///
+  /// \param ns The namespace of the key.
+  /// \param keys The keys to fetch.
+  /// \param callback Returns the values for those keys that exist.
+  virtual void MultiGet(
+      const std::string &ns,
+      const std::vector<std::string> &keys,
+      Postable<void(absl::flat_hash_map<std::string, std::string>)> callback) = 0;
 
   /// Associate a key with the specified value.
   ///
@@ -45,10 +57,13 @@ class InternalKVInterface {
   /// \param value The value for the pair.
   /// \param overwrite Whether to overwrite existing values. Otherwise, the update
   ///   will be ignored.
-  /// \param callback Callback function.
-  virtual void Put(const std::string &ns, const std::string &key,
-                   const std::string &value, bool overwrite,
-                   std::function<void(bool)> callback) = 0;
+  /// \param callback WARNING: it returns true if and only if A NEW ENTRY is added.
+  /// Overwritten return false.
+  virtual void Put(const std::string &ns,
+                   const std::string &key,
+                   std::string value,
+                   bool overwrite,
+                   Postable<void(bool)> callback) = 0;
 
   /// Delete the key from the store.
   ///
@@ -56,128 +71,79 @@ class InternalKVInterface {
   /// \param key The key to be deleted.
   /// \param del_by_prefix Whether to treat the key as prefix. If true, it'll
   ///     delete all keys with `key` as the prefix.
-  /// \param callback Callback function.
-  virtual void Del(const std::string &ns, const std::string &key, bool del_by_prefix,
-                   std::function<void(int64_t)> callback) = 0;
+  /// \param callback returns the number of entries deleted.
+  virtual void Del(const std::string &ns,
+                   const std::string &key,
+                   bool del_by_prefix,
+                   Postable<void(int64_t)> callback) = 0;
 
   /// Check whether the key exists in the store.
   ///
   /// \param ns The namespace of the key.
   /// \param key The key to be checked.
   /// \param callback Callback function.
-  virtual void Exists(const std::string &ns, const std::string &key,
-                      std::function<void(bool)> callback) = 0;
+  virtual void Exists(const std::string &ns,
+                      const std::string &key,
+                      Postable<void(bool)> callback) = 0;
 
   /// Get the keys for a given prefix.
   ///
   /// \param ns The namespace of the prefix.
   /// \param prefix The prefix to be scaned.
-  /// \param callback Callback function.
-  virtual void Keys(const std::string &ns, const std::string &prefix,
-                    std::function<void(std::vector<std::string>)> callback) = 0;
+  /// \param callback return all the keys matching the prefix.
+  virtual void Keys(const std::string &ns,
+                    const std::string &prefix,
+                    Postable<void(std::vector<std::string>)> callback) = 0;
 
-  /// Return the event loop associated with the instance. This is where the
-  /// callback is called.
-  virtual instrumented_io_context &GetEventLoop() = 0;
-
-  virtual ~InternalKVInterface(){};
-};
-
-class RedisInternalKV : public InternalKVInterface {
- public:
-  explicit RedisInternalKV(const RedisClientOptions &redis_options);
-
-  ~RedisInternalKV() {
-    io_service_.stop();
-    io_thread_->join();
-    redis_client_.reset();
-    io_thread_.reset();
-  }
-
-  void Get(const std::string &ns, const std::string &key,
-           std::function<void(std::optional<std::string>)> callback) override;
-
-  void Put(const std::string &ns, const std::string &key, const std::string &value,
-           bool overwrite, std::function<void(bool)> callback) override;
-
-  void Del(const std::string &ns, const std::string &key, bool del_by_prefix,
-           std::function<void(int64_t)> callback) override;
-
-  void Exists(const std::string &ns, const std::string &key,
-              std::function<void(bool)> callback) override;
-
-  void Keys(const std::string &ns, const std::string &prefix,
-            std::function<void(std::vector<std::string>)> callback) override;
-
-  instrumented_io_context &GetEventLoop() override { return io_service_; }
-
- private:
-  RedisClientOptions redis_options_;
-  std::unique_ptr<RedisClient> redis_client_;
-  // The io service used by internal kv.
-  instrumented_io_context io_service_;
-  std::unique_ptr<std::thread> io_thread_;
-  boost::asio::io_service::work work_;
-};
-
-class MemoryInternalKV : public InternalKVInterface {
- public:
-  MemoryInternalKV(instrumented_io_context &io_context) : io_context_(io_context) {}
-  void Get(const std::string &ns, const std::string &key,
-           std::function<void(std::optional<std::string>)> callback) override;
-
-  void Put(const std::string &ns, const std::string &key, const std::string &value,
-           bool overwrite, std::function<void(bool)> callback) override;
-
-  void Del(const std::string &ns, const std::string &key, bool del_by_prefix,
-           std::function<void(int64_t)> callback) override;
-
-  void Exists(const std::string &ns, const std::string &key,
-              std::function<void(bool)> callback) override;
-
-  void Keys(const std::string &ns, const std::string &prefix,
-            std::function<void(std::vector<std::string>)> callback) override;
-
-  instrumented_io_context &GetEventLoop() override { return io_context_; }
-
- private:
-  instrumented_io_context &io_context_;
-  absl::Mutex mu_;
-  absl::btree_map<std::string, std::string> map_ GUARDED_BY(mu_);
+  virtual ~InternalKVInterface() = default;
 };
 
 /// This implementation class of `InternalKVHandler`.
 class GcsInternalKVManager : public rpc::InternalKVHandler {
  public:
-  explicit GcsInternalKVManager(std::unique_ptr<InternalKVInterface> kv_instance)
-      : kv_instance_(std::move(kv_instance)) {}
+  explicit GcsInternalKVManager(std::unique_ptr<InternalKVInterface> kv_instance,
+                                std::string raylet_config_list,
+                                instrumented_io_context &io_context)
+      : kv_instance_(std::move(kv_instance)),
+        raylet_config_list_(std::move(raylet_config_list)),
+        io_context_(io_context) {}
 
-  void HandleInternalKVGet(const rpc::InternalKVGetRequest &request,
+  void HandleInternalKVGet(rpc::InternalKVGetRequest request,
                            rpc::InternalKVGetReply *reply,
                            rpc::SendReplyCallback send_reply_callback) override;
 
-  void HandleInternalKVPut(const rpc::InternalKVPutRequest &request,
+  void HandleInternalKVMultiGet(rpc::InternalKVMultiGetRequest request,
+                                rpc::InternalKVMultiGetReply *reply,
+                                rpc::SendReplyCallback send_reply_callback) override;
+
+  void HandleInternalKVPut(rpc::InternalKVPutRequest request,
                            rpc::InternalKVPutReply *reply,
                            rpc::SendReplyCallback send_reply_callback) override;
 
-  void HandleInternalKVDel(const rpc::InternalKVDelRequest &request,
+  void HandleInternalKVDel(rpc::InternalKVDelRequest request,
                            rpc::InternalKVDelReply *reply,
                            rpc::SendReplyCallback send_reply_callback) override;
 
-  void HandleInternalKVExists(const rpc::InternalKVExistsRequest &request,
+  void HandleInternalKVExists(rpc::InternalKVExistsRequest request,
                               rpc::InternalKVExistsReply *reply,
                               rpc::SendReplyCallback send_reply_callback) override;
 
-  void HandleInternalKVKeys(const rpc::InternalKVKeysRequest &request,
+  void HandleInternalKVKeys(rpc::InternalKVKeysRequest request,
                             rpc::InternalKVKeysReply *reply,
                             rpc::SendReplyCallback send_reply_callback) override;
 
-  InternalKVInterface &GetInstance() { return *kv_instance_; }
+  /// Handle get internal config.
+  void HandleGetInternalConfig(rpc::GetInternalConfigRequest request,
+                               rpc::GetInternalConfigReply *reply,
+                               rpc::SendReplyCallback send_reply_callback) override;
 
-  instrumented_io_context &GetEventLoop() { return kv_instance_->GetEventLoop(); }
+  InternalKVInterface &GetInstance() { return *kv_instance_; }
 
  private:
   std::unique_ptr<InternalKVInterface> kv_instance_;
+  const std::string raylet_config_list_;
+  instrumented_io_context &io_context_;
+  Status ValidateKey(const std::string &key) const;
 };
 
 }  // namespace gcs

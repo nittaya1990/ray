@@ -1,18 +1,32 @@
 #!/usr/bin/env python
+# ruff: noqa: E402
 """This script allows you to develop Ray Python code without needing to compile
 Ray.
 See https://docs.ray.io/en/master/development.html#building-ray-python-only"""
 
+import os
+import sys
+
+# types.py can conflict with stdlib's types.py in some python versions,
+# see https://github.com/python/cpython/issues/101210.
+# To avoid import errors, we move the current working dir to the end of sys.path.
+this_dir = os.path.dirname(__file__)
+if this_dir in sys.path:
+    cur = sys.path.remove(this_dir)
+    sys.path.append(this_dir)
+
 import argparse
 import click
-import os
 import shutil
 import subprocess
 
 import ray
 
 
-def do_link(package, force=False, local_path=None):
+def do_link(package, force=False, skip_list=None, local_path=None):
+    if skip_list and package in skip_list:
+        print(f"Skip creating symbolic link for {package}")
+        return
     package_home = os.path.abspath(os.path.join(ray.__file__, f"../{package}"))
     # Infer local_path automatically.
     if local_path is None:
@@ -59,8 +73,26 @@ def do_link(package, force=False, local_path=None):
             print("You don't have write permission " f"to {package_home}, using sudo:")
             sudo = ["sudo"]
         print(f"Creating symbolic link from \n {local_home} to \n {package_home}")
+
+        # Preserve ray/serve/generated
+        if package == "serve":
+            # Copy generated folder to a temp dir
+            generated_folder = os.path.join(package_home, "generated")
+            temp_dir = "/tmp/ray/_serve/"
+            if not os.path.exists(temp_dir):
+                os.makedirs(temp_dir)
+            subprocess.check_call(["cp", "-r", generated_folder, temp_dir])
+
         subprocess.check_call(sudo + ["rm", "-rf", package_home])
         subprocess.check_call(sudo + ["ln", "-s", local_home, package_home])
+
+        # Move generated folder to local_home
+        if package == "serve":
+            tmp_generated_folder = os.path.join(temp_dir, "generated")
+            package_generated_folder = os.path.join(package_home, "generated")
+            subprocess.check_call(
+                ["mv", tmp_generated_folder, package_generated_folder]
+            )
 
 
 if __name__ == "__main__":
@@ -70,33 +102,50 @@ if __name__ == "__main__":
     parser.add_argument(
         "--yes", "-y", action="store_true", help="Don't ask for confirmation."
     )
+    parser.add_argument(
+        "--skip",
+        "-s",
+        nargs="*",
+        help="List of folders to skip linking to facilitate workspace dev",
+        required=False,
+    )
+    parser.add_argument(
+        "--extras",
+        "-e",
+        nargs="*",
+        help="List of extra folders to link to facilitate workspace dev",
+        required=False,
+    )
+
     args = parser.parse_args()
     if not args.yes:
         print("NOTE: Use '-y' to override all python files without confirmation.")
 
-    do_link("rllib", force=args.yes, local_path="../../../rllib")
-    do_link("tune", force=args.yes)
-    do_link("sgd", force=args.yes)
-    do_link("train", force=args.yes)
-    do_link("autoscaler", force=args.yes)
-    do_link("ray_operator", force=args.yes)
-    do_link("cloudpickle", force=args.yes)
-    do_link("data", force=args.yes)
-    do_link("scripts", force=args.yes)
-    do_link("internal", force=args.yes)
-    do_link("tests", force=args.yes)
-    do_link("experimental", force=args.yes)
-    do_link("util", force=args.yes)
-    do_link("serve", force=args.yes)
-    do_link("workflow", force=args.yes)
-    do_link("_private", force=args.yes)
-    do_link("node.py", force=args.yes)
-    do_link("cluster_utils.py", force=args.yes)
-    do_link("ray_constants.py", force=args.yes)
-    # Link package's `dashboard` directly to local (repo's) dashboard.
-    # The repo's `dashboard` is a file, soft-linking to which will not work
-    # on Mac.
-    do_link("dashboard", force=args.yes, local_path="../../../dashboard")
+    do_link("llm", force=args.yes, skip_list=args.skip)
+    do_link("rllib", force=args.yes, skip_list=args.skip, local_path="../../../rllib")
+    do_link("air", force=args.yes, skip_list=args.skip)
+    do_link("tune", force=args.yes, skip_list=args.skip)
+    do_link("train", force=args.yes, skip_list=args.skip)
+    do_link("autoscaler", force=args.yes, skip_list=args.skip)
+    do_link("cloudpickle", force=args.yes, skip_list=args.skip)
+    do_link("data", force=args.yes, skip_list=args.skip)
+    do_link("scripts", force=args.yes, skip_list=args.skip)
+    do_link("internal", force=args.yes, skip_list=args.skip)
+    do_link("tests", force=args.yes, skip_list=args.skip)
+    do_link("experimental", force=args.yes, skip_list=args.skip)
+    do_link("util", force=args.yes, skip_list=args.skip)
+    do_link("workflow", force=args.yes, skip_list=args.skip)
+    do_link("serve", force=args.yes, skip_list=args.skip)
+    do_link("dag", force=args.yes, skip_list=args.skip)
+    do_link("widgets", force=args.yes, skip_list=args.skip)
+    do_link("cluster_utils.py", force=args.yes, skip_list=args.skip)
+    do_link("_private", force=args.yes, skip_list=args.skip)
+    do_link("dashboard", force=args.yes, skip_list=args.skip)
+
+    if args.extras is not None:
+        for package in args.extras:
+            do_link(package, force=args.yes, skip_list=args.skip)
+
     print(
         "Created links.\n\nIf you run into issues initializing Ray, please "
         "ensure that your local repo and the installed Ray are in sync "

@@ -85,11 +85,35 @@ bool StatsConfig::IsInitialized() const { return is_initialized_; }
 /// Metric
 ///
 using MeasureDouble = opencensus::stats::Measure<double>;
+Metric::Metric(const std::string &name,
+               const std::string &description,
+               const std::string &unit,
+               const std::vector<std::string> &tag_keys)
+    : name_(name),
+      description_(description),
+      unit_(unit),
+      measure_(nullptr),
+      name_regex_(GetMetricNameRegex()) {
+  RAY_CHECK_WITH_DISPLAY(
+      std::regex_match(name, Metric::name_regex_),
+      "Invalid metric name: " + name +
+          ". Metric names can only contain letters, numbers, _, and :. "
+          "Metric names cannot start with numbers. Metric name cannot be "
+          "empty.");
+  for (const auto &key : tag_keys) {
+    tag_keys_.push_back(opencensus::tags::TagKey::Register(key));
+  }
+}
+
+const std::regex &Metric::GetMetricNameRegex() {
+  const static std::regex name_regex("^[a-zA-Z_:][a-zA-Z0-9_:]*$");
+  return name_regex;
+}
+
 void Metric::Record(double value, const TagsType &tags) {
   if (StatsConfig::instance().IsStatsDisabled()) {
     return;
   }
-
   // NOTE(lingxuan.zlx): Double check for recording performance while
   // processing in multithread and avoid race since metrics may invoke
   // record in different threads or code pathes.
@@ -122,7 +146,8 @@ void Metric::Record(double value,
                     const std::unordered_map<std::string, std::string> &tags) {
   TagsType tags_pair_vec;
   std::for_each(
-      tags.begin(), tags.end(),
+      tags.begin(),
+      tags.end(),
       [&tags_pair_vec](std::pair<std::string, std::string> tag) {
         return tags_pair_vec.push_back({TagKeyType::Register(tag.first), tag.second});
       });

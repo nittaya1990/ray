@@ -2,15 +2,20 @@ package io.ray.runtime.gcs;
 
 import com.google.common.base.Preconditions;
 import com.google.protobuf.InvalidProtocolBufferException;
+import io.ray.api.exception.RayException;
 import io.ray.api.id.ActorId;
 import io.ray.api.id.JobId;
 import io.ray.api.id.PlacementGroupId;
 import io.ray.api.id.UniqueId;
 import io.ray.api.placementgroup.PlacementGroup;
+import io.ray.api.runtimecontext.ActorInfo;
+import io.ray.api.runtimecontext.ActorState;
+import io.ray.api.runtimecontext.Address;
 import io.ray.api.runtimecontext.NodeInfo;
 import io.ray.runtime.generated.Gcs;
 import io.ray.runtime.generated.Gcs.GcsNodeInfo;
 import io.ray.runtime.placementgroup.PlacementGroupUtils;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -24,8 +29,9 @@ public class GcsClient {
 
   private GlobalStateAccessor globalStateAccessor;
 
-  public GcsClient(String bootstrapAddress, String redisPassword) {
-    globalStateAccessor = GlobalStateAccessor.getInstance(bootstrapAddress, redisPassword);
+  public GcsClient(String bootstrapAddress, String redisUsername, String redisPassword) {
+    globalStateAccessor =
+        GlobalStateAccessor.getInstance(bootstrapAddress, redisUsername, redisPassword);
   }
 
   /**
@@ -97,33 +103,44 @@ public class GcsClient {
               data.getObjectStoreSocketName(),
               data.getRayletSocketName(),
               data.getState() == GcsNodeInfo.GcsNodeState.ALIVE,
-              new HashMap<>());
-      nodes.put(nodeId, nodeInfo);
-    }
-
-    // Fill resources.
-    for (Map.Entry<UniqueId, NodeInfo> node : nodes.entrySet()) {
-      if (node.getValue().isAlive) {
-        node.getValue().resources.putAll(getResourcesForClient(node.getKey()));
+              new HashMap<>(),
+              data.getLabelsMap());
+      if (nodeInfo.isAlive) {
+        nodeInfo.resources.putAll(data.getResourcesTotalMap());
       }
+      nodes.put(nodeId, nodeInfo);
     }
 
     return new ArrayList<>(nodes.values());
   }
 
-  private Map<String, Double> getResourcesForClient(UniqueId clientId) {
-    byte[] resourceMapBytes = globalStateAccessor.getNodeResourceInfo(clientId);
-    Gcs.ResourceMap resourceMap;
-    try {
-      resourceMap = Gcs.ResourceMap.parseFrom(resourceMapBytes);
-    } catch (InvalidProtocolBufferException e) {
-      throw new RuntimeException("Received invalid protobuf data from GCS.");
-    }
-    HashMap<String, Double> resources = new HashMap<>();
-    for (Map.Entry<String, Gcs.ResourceTableData> entry : resourceMap.getItemsMap().entrySet()) {
-      resources.put(entry.getKey(), entry.getValue().getResourceCapacity());
-    }
-    return resources;
+  public List<ActorInfo> getAllActorInfo(JobId jobId, ActorState actorState) {
+    List<ActorInfo> actorInfos = new ArrayList<>();
+    List<byte[]> results = globalStateAccessor.getAllActorInfo(jobId, actorState);
+    results.forEach(
+        result -> {
+          try {
+            Gcs.ActorTableData info = Gcs.ActorTableData.parseFrom(result);
+            UniqueId nodeId = UniqueId.NIL;
+            if (!info.getAddress().getRayletId().isEmpty()) {
+              nodeId =
+                  UniqueId.fromByteBuffer(
+                      ByteBuffer.wrap(info.getAddress().getRayletId().toByteArray()));
+            }
+            actorInfos.add(
+                new ActorInfo(
+                    ActorId.fromBytes(info.getActorId().toByteArray()),
+                    ActorState.fromValue(info.getState().getNumber()),
+                    info.getNumRestarts(),
+                    new Address(
+                        nodeId, info.getAddress().getIpAddress(), info.getAddress().getPort()),
+                    info.getName()));
+          } catch (InvalidProtocolBufferException e) {
+            throw new RayException("Failed to parse actor info.", e);
+          }
+        });
+
+    return actorInfos;
   }
 
   /** If the actor exists in GCS. */

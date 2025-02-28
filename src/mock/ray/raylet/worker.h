@@ -28,8 +28,11 @@ class MockWorkerInterface : public WorkerInterface {
   MOCK_METHOD(void, SetProcess, (Process proc), (override));
   MOCK_METHOD(Language, GetLanguage, (), (const, override));
   MOCK_METHOD(const std::string, IpAddress, (), (const, override));
+  MOCK_METHOD(void, AsyncNotifyGCSRestart, (), (override));
   MOCK_METHOD(void, Connect, (int port), (override));
-  MOCK_METHOD(void, Connect, (std::shared_ptr<rpc::CoreWorkerClientInterface> rpc_client),
+  MOCK_METHOD(void,
+              Connect,
+              (std::shared_ptr<rpc::CoreWorkerClientInterface> rpc_client),
               (override));
   MOCK_METHOD(int, Port, (), (const, override));
   MOCK_METHOD(int, AssignedPort, (), (const, override));
@@ -38,9 +41,13 @@ class MockWorkerInterface : public WorkerInterface {
   MOCK_METHOD(const TaskID &, GetAssignedTaskId, (), (const, override));
   MOCK_METHOD(bool, AddBlockedTaskId, (const TaskID &task_id), (override));
   MOCK_METHOD(bool, RemoveBlockedTaskId, (const TaskID &task_id), (override));
-  MOCK_METHOD(const std::unordered_set<TaskID> &, GetBlockedTaskIds, (),
+  MOCK_METHOD(const std::unordered_set<TaskID> &,
+              GetBlockedTaskIds,
+              (),
               (const, override));
   MOCK_METHOD(const JobID &, GetAssignedJobId, (), (const, override));
+  MOCK_METHOD(std::optional<bool>, GetIsGpu, (), (const, override));
+  MOCK_METHOD(std::optional<bool>, GetIsActorWorker, (), (const, override));
   MOCK_METHOD(int, GetRuntimeEnvHash, (), (const, override));
   MOCK_METHOD(void, AssignActorId, (const ActorID &actor_id), (override));
   MOCK_METHOD(const ActorID &, GetActorId, (), (const, override));
@@ -52,22 +59,30 @@ class MockWorkerInterface : public WorkerInterface {
   MOCK_METHOD(void, DirectActorCallArgWaitComplete, (int64_t tag), (override));
   MOCK_METHOD(const BundleID &, GetBundleId, (), (const, override));
   MOCK_METHOD(void, SetBundleId, (const BundleID &bundle_id), (override));
-  MOCK_METHOD(void, SetAllocatedInstances,
+  MOCK_METHOD(void,
+              SetAllocatedInstances,
               (const std::shared_ptr<TaskResourceInstances> &allocated_instances),
               (override));
-  MOCK_METHOD(std::shared_ptr<TaskResourceInstances>, GetAllocatedInstances, (),
+  MOCK_METHOD(std::shared_ptr<TaskResourceInstances>,
+              GetAllocatedInstances,
+              (),
               (override));
   MOCK_METHOD(void, ClearAllocatedInstances, (), (override));
-  MOCK_METHOD(void, SetLifetimeAllocatedInstances,
+  MOCK_METHOD(void,
+              SetLifetimeAllocatedInstances,
               (const std::shared_ptr<TaskResourceInstances> &allocated_instances),
               (override));
-  MOCK_METHOD(std::shared_ptr<TaskResourceInstances>, GetLifetimeAllocatedInstances, (),
+  MOCK_METHOD(std::shared_ptr<TaskResourceInstances>,
+              GetLifetimeAllocatedInstances,
+              (),
               (override));
   MOCK_METHOD(void, ClearLifetimeAllocatedInstances, (), (override));
   MOCK_METHOD(RayTask &, GetAssignedTask, (), (override));
   MOCK_METHOD(void, SetAssignedTask, (const RayTask &assigned_task), (override));
   MOCK_METHOD(bool, IsRegistered, (), (override));
   MOCK_METHOD(rpc::CoreWorkerClientInterface *, rpc_client, (), (override));
+  MOCK_METHOD(bool, SetJobId, (const JobID &job_id), (override));
+  MOCK_METHOD(const ActorID &, GetRootDetachedActorId, (), (override));
 };
 
 }  // namespace raylet

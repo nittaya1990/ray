@@ -14,29 +14,49 @@
 
 #include "ray/rpc/grpc_server.h"
 
+#include <grpcpp/ext/channelz_service_plugin.h>
+#include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/impl/service_type.h>
 
+#include <algorithm>
 #include <boost/asio/detail/socket_holder.hpp>
+#include <memory>
+#include <string>
 
 #include "ray/common/ray_config.h"
 #include "ray/rpc/common.h"
-#include "ray/rpc/grpc_server.h"
 #include "ray/stats/metric.h"
-#include "ray/util/util.h"
+#include "ray/util/thread_utils.h"
 
 namespace ray {
 namespace rpc {
 
-GrpcServer::GrpcServer(std::string name, const uint32_t port,
-                       bool listen_to_localhost_only, int num_threads,
-                       int64_t keepalive_time_ms)
-    : name_(std::move(name)),
-      port_(port),
-      listen_to_localhost_only_(listen_to_localhost_only),
-      is_closed_(true),
-      num_threads_(num_threads),
-      keepalive_time_ms_(keepalive_time_ms) {
+void GrpcServer::Init() {
+  RAY_CHECK(num_threads_ > 0) << "Num of threads in gRPC must be greater than 0";
   cqs_.resize(num_threads_);
+  // Enable built in health check implemented by gRPC:
+  //   https://github.com/grpc/grpc/blob/master/doc/health-checking.md
+  grpc::EnableDefaultHealthCheckService(true);
+  grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+  grpc::channelz::experimental::InitChannelzService();
+}
+
+void GrpcServer::Shutdown() {
+  if (!is_closed_) {
+    // Drain the executor threads.
+    // Shutdown the server with an immediate deadline.
+    // TODO(edoakes): do we want to do this in all cases?
+    server_->Shutdown(gpr_now(GPR_CLOCK_REALTIME));
+    for (const auto &cq : cqs_) {
+      cq->Shutdown();
+    }
+    for (auto &polling_thread : polling_threads_) {
+      polling_thread.join();
+    }
+    is_closed_ = true;
+    RAY_LOG(DEBUG) << "gRPC server of " << name_ << " shutdown.";
+    server_.reset();
+  }
 }
 
 void GrpcServer::Run() {
@@ -56,7 +76,21 @@ void GrpcServer::Run() {
   builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS,
                              RayConfig::instance().grpc_keepalive_timeout_ms());
   builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 0);
-
+  builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+  builder.AddChannelArgument(GRPC_ARG_HTTP2_WRITE_BUFFER_SIZE,
+                             RayConfig::instance().grpc_stream_buffer_size());
+  // NOTE(rickyyx): This argument changes how frequent the gRPC server expects a keepalive
+  // ping from the client. See https://github.com/grpc/grpc/blob/HEAD/doc/keepalive.md#faq
+  // We set this to 1min because GCS gRPC client currently sends keepalive every 1min:
+  // https://github.com/ray-project/ray/blob/releases/2.0.0/python/ray/_private/gcs_utils.py#L72
+  // Setting this value larger will trigger GOAWAY from the gRPC server to be sent to the
+  // client to back-off keepalive pings. (https://github.com/ray-project/ray/issues/25367)
+  builder.AddChannelArgument(
+      GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS,
+      // If the `client_keepalive_time` is  smaller than this, the client will receive
+      // "too many pings" error and crash.
+      std::min(static_cast<int64_t>(60000),
+               RayConfig::instance().grpc_client_keepalive_time_ms()));
   if (RayConfig::instance().USE_TLS()) {
     // Create credentials from locations specified in config
     std::string rootcert = ReadCert(RayConfig::instance().TLS_CA_CERT());
@@ -97,24 +131,33 @@ void GrpcServer::Run() {
       << "it indicates the server fails to start because the port is already used by "
       << "other processes (such as --node-manager-port, --object-manager-port, "
       << "--gcs-server-port, and ports between --min-worker-port, --max-worker-port). "
-      << "Try running lsof -i :" << specified_port
+      << "Try running sudo lsof -i :" << specified_port
       << " to check if there are other processes listening to the port.";
   RAY_CHECK(port_ > 0);
   RAY_LOG(INFO) << name_ << " server started, listening on port " << port_ << ".";
 
-  // Create calls for all the server call factories.
+  // Create calls for all the server call factories
+  //
+  // NOTE: That ServerCallFactory is created for every thread processing respective
+  //       CompletionQueue
   for (auto &entry : server_call_factories_) {
-    for (int i = 0; i < num_threads_; i++) {
-      // Create a buffer of 100 calls for each RPC handler.
-      // TODO(edoakes): a small buffer should be fine and seems to have better
-      // performance, but we don't currently handle backpressure on the client.
-      int buffer_size = 100;
-      if (entry->GetMaxActiveRPCs() != -1) {
-        buffer_size = entry->GetMaxActiveRPCs();
-      }
-      for (int j = 0; j < buffer_size; j++) {
-        entry->CreateCall();
-      }
+    // Derive target max inflight RPCs buffer based on `gcs_max_active_rpcs_per_handler`
+    //
+    // NOTE: For these handlers that have set it to -1, we set default (per
+    //       thread) buffer at 32, though it doesn't have any impact on concurrency
+    //       (since we're recreating new instance of `ServerCall` as soon as one
+    //       gets occupied therefore not serving as back-pressure mechanism)
+    size_t buffer_size;
+    if (entry->GetMaxActiveRPCs() != -1) {
+      buffer_size = std::max<size_t>(
+          1, static_cast<size_t>(entry->GetMaxActiveRPCs() / num_threads_));
+    } else {
+      buffer_size = 32;
+    }
+
+    for (size_t j = 0; j < buffer_size; j++) {
+      // Create pending `ServerCall` ready to accept incoming requests
+      entry->CreateCall();
     }
   }
   // Start threads that polls incoming requests.
@@ -125,11 +168,18 @@ void GrpcServer::Run() {
   is_closed_ = false;
 }
 
-void GrpcServer::RegisterService(GrpcService &service) {
+void GrpcServer::RegisterService(grpc::Service &service) {
+  services_.emplace_back(service);
+}
+
+void GrpcServer::RegisterService(GrpcService &service, bool token_auth) {
   services_.emplace_back(service.GetGrpcService());
 
   for (int i = 0; i < num_threads_; i++) {
-    service.InitServerCallFactories(cqs_[i], &server_call_factories_);
+    if (token_auth && cluster_id_.IsNil()) {
+      RAY_LOG(FATAL) << "Expected cluster ID for token auth!";
+    }
+    service.InitServerCallFactories(cqs_[i], &server_call_factories_, cluster_id_);
   }
 }
 
@@ -150,7 +200,6 @@ void GrpcServer::PollEventsFromCompletionQueue(int index) {
       case ServerCallState::PENDING:
         // We've received a new incoming request. Now this call object is used to
         // track this request.
-        server_call->SetState(ServerCallState::PROCESSING);
         server_call->HandleRequest();
         break;
       case ServerCallState::SENDING_REPLY:

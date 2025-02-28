@@ -1,17 +1,17 @@
 from concurrent.futures import Future
 
 import pytest
+
+import ray as real_ray
+from ray._private.test_utils import object_memory_usage, wait_for_condition
+from ray._raylet import ActorID, ObjectRef
 from ray.util.client import _ClientContext
 from ray.util.client.common import ClientActorRef, ClientObjectRef
-from ray.util.client.ray_client_helpers import ray_start_client_server
 from ray.util.client.ray_client_helpers import (
+    ray_start_client_server,
     ray_start_client_server_pair,
     ray_start_cluster_client_server_pair,
 )
-from ray._private.test_utils import wait_for_condition, object_memory_usage
-import ray as real_ray
-from ray.core.generated.gcs_pb2 import ActorTableData
-from ray._raylet import ActorID, ObjectRef
 
 
 def test_client_object_ref_basics(ray_start_regular):
@@ -215,8 +215,8 @@ def test_delete_actor_on_disconnect(ray_start_cluster):
         def test_cond():
             alive_actors = [
                 v
-                for v in real_ray.state.actors().values()
-                if v["State"] != ActorTableData.DEAD
+                for v in real_ray._private.state.actors().values()
+                if v["State"] != "DEAD"
             ]
             return len(alive_actors) == 0
 
@@ -323,7 +323,12 @@ def test_named_actor_refcount(ray_start_regular):
 
 
 if __name__ == "__main__":
+    import os
     import sys
+
     import pytest
 
-    sys.exit(pytest.main(["-v", __file__] + sys.argv[1:]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

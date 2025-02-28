@@ -22,6 +22,7 @@
 #include "ray/common/ray_object.h"
 #include "ray/gcs/gcs_client/accessor.h"
 #include "ray/object_manager/common.h"
+#include "ray/object_manager/object_directory.h"
 #include "ray/pubsub/subscriber.h"
 #include "ray/raylet/worker_pool.h"
 #include "ray/rpc/worker/core_worker_client_pool.h"
@@ -32,22 +33,34 @@ namespace ray {
 
 namespace raylet {
 
+/// The default number of retries when spilled object deletion failed.
+const int64_t kDefaultSpilledObjectDeleteRetries = 3;
+
 /// This class implements memory management for primary objects, objects that
 /// have been freed, and objects that have been spilled.
 class LocalObjectManager {
  public:
   LocalObjectManager(
-      const NodeID &node_id, std::string self_node_address, int self_node_port,
-      size_t free_objects_batch_size, int64_t free_objects_period_ms,
-      IOWorkerPoolInterface &io_worker_pool, rpc::CoreWorkerClientPool &owner_client_pool,
-      int max_io_workers, int64_t min_spilling_size, bool is_external_storage_type_fs,
+      const NodeID &node_id,
+      std::string self_node_address,
+      int self_node_port,
+      instrumented_io_context &io_service,
+      size_t free_objects_batch_size,
+      int64_t free_objects_period_ms,
+      IOWorkerPoolInterface &io_worker_pool,
+      rpc::CoreWorkerClientPool &owner_client_pool,
+      int max_io_workers,
+      int64_t min_spilling_size,
+      bool is_external_storage_type_fs,
       int64_t max_fused_object_count,
       std::function<void(const std::vector<ObjectID> &)> on_objects_freed,
       std::function<bool(const ray::ObjectID &)> is_plasma_object_spillable,
-      pubsub::SubscriberInterface *core_worker_subscriber)
+      pubsub::SubscriberInterface *core_worker_subscriber,
+      IObjectDirectory *object_directory)
       : self_node_id_(node_id),
         self_node_address_(self_node_address),
         self_node_port_(self_node_port),
+        io_service_(io_service),
         free_objects_period_ms_(free_objects_period_ms),
         free_objects_batch_size_(free_objects_batch_size),
         io_worker_pool_(io_worker_pool),
@@ -61,7 +74,8 @@ class LocalObjectManager {
         is_external_storage_type_fs_(is_external_storage_type_fs),
         max_fused_object_count_(max_fused_object_count),
         next_spill_error_log_bytes_(RayConfig::instance().verbose_spill_logs()),
-        core_worker_subscriber_(core_worker_subscriber) {}
+        core_worker_subscriber_(core_worker_subscriber),
+        object_directory_(object_directory) {}
 
   /// Pin objects.
   ///
@@ -73,9 +87,15 @@ class LocalObjectManager {
   /// \param objects Pointers to the objects to be pinned. The pointer should
   /// be kept in scope until the object can be released.
   /// \param owner_address The owner of the objects to be pinned.
+  /// \param generator_id When it's set, this means that it was a dynamically
+  /// created ObjectID, so we need to notify the owner of the outer ObjectID
+  /// that should already be owned by the same worker. If the outer ObjectID is
+  /// still in scope, then the owner can add the dynamically created ObjectID
+  /// to its ref count. Set to nil for statically allocated ObjectIDs.
   void PinObjectsAndWaitForFree(const std::vector<ObjectID> &object_ids,
                                 std::vector<std::unique_ptr<RayObject>> &&objects,
-                                const rpc::Address &owner_address);
+                                const rpc::Address &owner_address,
+                                const ObjectID &generator_id = ObjectID::Nil());
 
   /// Spill objects as much as possible as fast as possible up to the max throughput.
   ///
@@ -99,7 +119,9 @@ class LocalObjectManager {
   /// \param object_url The URL where the object is spilled.
   /// \param callback A callback to call when the restoration is done.
   /// Status will contain the error during restoration, if any.
-  void AsyncRestoreSpilledObject(const ObjectID &object_id, const std::string &object_url,
+  void AsyncRestoreSpilledObject(const ObjectID &object_id,
+                                 int64_t object_size,
+                                 const std::string &object_url,
                                  std::function<void(const ray::Status &)> callback);
 
   /// Clear any freed objects. This will trigger the callback for freed
@@ -125,10 +147,10 @@ class LocalObjectManager {
   /// \return True if spilling is still in progress. False otherwise.
   bool IsSpillingInProgress();
 
-  /// Populate object spilling stats.
+  /// Populate object store stats.
   ///
-  /// \param Output parameter.
-  void FillObjectSpillingStats(rpc::GetNodeStatsReply *reply) const;
+  /// \param reply Output parameter.
+  void FillObjectStoreStats(rpc::GetNodeStatsReply *reply) const;
 
   /// Record object spilling stats to metrics.
   void RecordMetrics() const;
@@ -139,21 +161,44 @@ class LocalObjectManager {
   /// In that case, the URL is supposed to be obtained by the object directory.
   std::string GetLocalSpilledObjectURL(const ObjectID &object_id);
 
-  /// Get the current pinned object store memory usage.
-  int64_t GetPinnedBytes() const { return pinned_objects_size_; }
+  /// Get the current bytes used by primary object copies. This number includes
+  /// bytes used by objects currently being spilled.
+  int64_t GetPrimaryBytes() const;
+
+  /// Returns true if we have objects spilled to the local
+  /// filesystem.
+  bool HasLocallySpilledObjects() const;
 
   std::string DebugString() const;
 
  private:
-  FRIEND_TEST(LocalObjectManagerTest, TestSpillObjectsOfSize);
+  struct LocalObjectInfo {
+    LocalObjectInfo(const rpc::Address &owner_address,
+                    const ObjectID &generator_id,
+                    size_t object_size)
+        : owner_address(owner_address),
+          generator_id(generator_id.IsNil() ? std::nullopt
+                                            : std::optional<ObjectID>(generator_id)),
+          object_size(object_size) {}
+    rpc::Address owner_address;
+    bool is_freed = false;
+    const std::optional<ObjectID> generator_id;
+    size_t object_size;
+  };
+
+  FRIEND_TEST(LocalObjectManagerTest, TestSpillObjectsOfSizeZero);
   FRIEND_TEST(LocalObjectManagerTest, TestSpillUptoMaxFuseCount);
   FRIEND_TEST(LocalObjectManagerTest,
               TestSpillObjectsOfSizeNumBytesToSpillHigherThanMinBytesToSpill);
   FRIEND_TEST(LocalObjectManagerTest, TestSpillObjectNotEvictable);
+  FRIEND_TEST(LocalObjectManagerTest, TestRetryDeleteSpilledObjects);
 
-  /// Asynchronously spill objects when space is needed.
-  /// The callback tries to spill objects as much as num_bytes_to_spill and returns
-  /// true if we could spill the corresponding bytes.
+  /// Asynchronously spill objects when space is needed. The callback tries to
+  /// spill at least num_bytes_to_spill and returns true if we found objects to
+  /// spill.
+  /// If num_bytes_to_spill many objects cannot be found and there are other
+  /// objects already being spilled, this will return false to give the
+  /// currently spilling objects time to finish.
   /// NOTE(sang): If 0 is given, this method spills a single object.
   ///
   /// \param num_bytes_to_spill The total number of bytes to spill.
@@ -178,11 +223,17 @@ class LocalObjectManager {
   /// Delete spilled objects stored in given urls.
   ///
   /// \param urls_to_delete List of urls to delete from external storages.
-  void DeleteSpilledObjects(std::vector<std::string> &urls_to_delete);
+  /// \param num_retries Num of retries allowed in case of failure, zero or negative
+  /// means don't retry.
+  void DeleteSpilledObjects(std::vector<std::string> urls_to_delete,
+                            int64_t num_retries = kDefaultSpilledObjectDeleteRetries);
 
   const NodeID self_node_id_;
   const std::string self_node_address_;
   const int self_node_port_;
+
+  /// The io_service/thread this class runs in.
+  instrumented_io_context &io_service_;
 
   /// The period between attempts to eagerly evict objects from plasma.
   const int64_t free_objects_period_ms_;
@@ -200,14 +251,14 @@ class LocalObjectManager {
   /// A callback to call when an object has been freed.
   std::function<void(const std::vector<ObjectID> &)> on_objects_freed_;
 
-  /// Hashmap from local objects that we are waiting to free to a tuple of
-  /// (their owner address, whether the object has been freed).
+  /// Hashmap from local objects that we are waiting to free to metadata about
+  /// the object including their owner address.
   /// All objects in this hashmap should also be in exactly one of the
   /// following maps:
   /// - pinned_objects_: objects pinned in shared memory
   /// - objects_pending_spill_: objects pinned and waiting for spill to complete
   /// - spilled_objects_url_: objects already spilled
-  absl::flat_hash_map<ObjectID, std::pair<rpc::Address, bool>> local_objects_;
+  absl::flat_hash_map<ObjectID, LocalObjectInfo> local_objects_;
 
   // Objects that are pinned on this node.
   absl::flat_hash_map<ObjectID, std::unique_ptr<RayObject>> pinned_objects_;
@@ -237,7 +288,13 @@ class LocalObjectManager {
 
   /// The total size of the objects that are currently being
   /// spilled from this node, in bytes.
-  size_t num_bytes_pending_spill_;
+  size_t num_bytes_pending_spill_ = 0;
+
+  /// The total size of the objects that are currently being
+  /// restored from this node, in bytes. Note that this only includes objects
+  /// that are being restored into the local object store. Objects restored on
+  /// behalf of remote nodes will be read directly from disk to the network.
+  size_t num_bytes_pending_restore_ = 0;
 
   /// A list of object id and url pairs that need to be deleted.
   /// We don't instantly delete objects when it goes out of scope from external storages
@@ -261,7 +318,7 @@ class LocalObjectManager {
   mutable absl::Mutex mutex_;
 
   /// The current number of active spill workers.
-  int64_t num_active_workers_ GUARDED_BY(mutex_);
+  int64_t num_active_workers_ ABSL_GUARDED_BY(mutex_);
 
   /// The max number of active spill workers.
   const int64_t max_active_workers_;
@@ -287,6 +344,9 @@ class LocalObjectManager {
   /// It is used to subscribe objects to evict.
   pubsub::SubscriberInterface *core_worker_subscriber_;
 
+  /// The object directory interface to access object information.
+  IObjectDirectory *object_directory_;
+
   ///
   /// Stats
   ///
@@ -296,6 +356,9 @@ class LocalObjectManager {
 
   /// The total wall time in seconds spent in spilling.
   double spill_time_total_s_ = 0;
+
+  /// The total number of bytes spilled currently.
+  int64_t spilled_bytes_current_ = 0;
 
   /// The total number of bytes spilled.
   int64_t spilled_bytes_total_ = 0;
@@ -321,7 +384,12 @@ class LocalObjectManager {
   /// The last time a restore log finished.
   int64_t last_restore_log_ns_ = 0;
 
+  /// The number of failed deletion requests.
+  std::atomic<int64_t> num_failed_deletion_requests_ = 0;
+
+  friend class LocalObjectManagerTestWithMinSpillingSize;
   friend class LocalObjectManagerTest;
+  friend class LocalObjectManagerFusedTest;
 };
 
 };  // namespace raylet

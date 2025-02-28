@@ -1,5 +1,5 @@
 import functools
-import gym
+import gymnasium as gym
 from math import log
 import numpy as np
 import tree  # pip install dm_tree
@@ -8,7 +8,7 @@ from typing import Optional
 from ray.rllib.models.action_dist import ActionDistribution
 from ray.rllib.models.modelv2 import ModelV2
 from ray.rllib.utils import MIN_LOG_NN_OUTPUT, MAX_LOG_NN_OUTPUT, SMALL_NUMBER
-from ray.rllib.utils.annotations import override, DeveloperAPI, ExperimentalAPI
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.framework import try_import_tf, try_import_tfp
 from ray.rllib.utils.spaces.space_utils import get_base_struct_from_space
 from ray.rllib.utils.typing import TensorType, List, Union, Tuple, ModelConfigDict
@@ -17,7 +17,7 @@ tf1, tf, tfv = try_import_tf()
 tfp = try_import_tfp()
 
 
-@DeveloperAPI
+@OldAPIStack
 class TFActionDistribution(ActionDistribution):
     """TF-specific extensions for building action distributions."""
 
@@ -46,6 +46,7 @@ class TFActionDistribution(ActionDistribution):
         return self.sampled_action_logp_op
 
 
+@OldAPIStack
 class Categorical(TFActionDistribution):
     """Categorical distribution for discrete action spaces."""
 
@@ -96,7 +97,18 @@ class Categorical(TFActionDistribution):
         return action_space.n
 
 
-@DeveloperAPI
+@OldAPIStack
+def get_categorical_class_with_temperature(t: float):
+    """Categorical distribution class that has customized default temperature."""
+
+    class CategoricalWithTemperature(Categorical):
+        def __init__(self, inputs, model=None, temperature=t):
+            super().__init__(inputs, model, temperature)
+
+    return CategoricalWithTemperature
+
+
+@OldAPIStack
 class MultiCategorical(TFActionDistribution):
     """MultiCategorical distribution for MultiDiscrete action spaces."""
 
@@ -137,7 +149,7 @@ class MultiCategorical(TFActionDistribution):
         if isinstance(actions, tf.Tensor):
             if isinstance(self.action_space, gym.spaces.Box):
                 actions = tf.reshape(
-                    actions, [-1, int(np.product(self.action_space.shape))]
+                    actions, [-1, int(np.prod(self.action_space.shape))]
                 )
             elif isinstance(self.action_space, gym.spaces.MultiDiscrete):
                 actions.set_shape((None, len(self.cats)))
@@ -185,13 +197,14 @@ class MultiCategorical(TFActionDistribution):
             high_ = np.max(action_space.high)
             assert np.all(action_space.low == low_)
             assert np.all(action_space.high == high_)
-            np.product(action_space.shape) * (high_ - low_ + 1)
+            return np.prod(action_space.shape, dtype=np.int32) * (high_ - low_ + 1)
         # MultiDiscrete space.
         else:
+            # nvec is already integer, so no casting needed.
             return np.sum(action_space.nvec)
 
 
-@ExperimentalAPI
+@OldAPIStack
 class SlateMultiCategorical(Categorical):
     """MultiCategorical distribution for MultiDiscrete action spaces.
 
@@ -234,7 +247,7 @@ class SlateMultiCategorical(Categorical):
         return tf.ones_like(self.inputs[:, 0])
 
 
-@DeveloperAPI
+@OldAPIStack
 class GumbelSoftmax(TFActionDistribution):
     """GumbelSoftmax distr. (for differentiable sampling in discr. actions
 
@@ -258,7 +271,7 @@ class GumbelSoftmax(TFActionDistribution):
         """Initializes a GumbelSoftmax distribution.
 
         Args:
-            temperature (float): Temperature parameter. For low temperatures,
+            temperature: Temperature parameter. For low temperatures,
                 the expected value approaches a categorical random variable.
                 For high temperatures, the expected value approaches a uniform
                 distribution.
@@ -306,7 +319,7 @@ class GumbelSoftmax(TFActionDistribution):
         return action_space.n
 
 
-@DeveloperAPI
+@OldAPIStack
 class DiagGaussian(TFActionDistribution):
     """Action distribution where each vector element is a gaussian.
 
@@ -375,10 +388,10 @@ class DiagGaussian(TFActionDistribution):
     def required_model_output_shape(
         action_space: gym.Space, model_config: ModelConfigDict
     ) -> Union[int, np.ndarray]:
-        return np.prod(action_space.shape) * 2
+        return np.prod(action_space.shape, dtype=np.int32) * 2
 
 
-@DeveloperAPI
+@OldAPIStack
 class SquashedGaussian(TFActionDistribution):
     """A tanh-squashed Gaussian distribution defined by: mean, std, low, high.
 
@@ -396,9 +409,9 @@ class SquashedGaussian(TFActionDistribution):
         """Parameterizes the distribution via `inputs`.
 
         Args:
-            low (float): The lowest possible sampling value
+            low: The lowest possible sampling value
                 (excluding this value).
-            high (float): The highest possible sampling value
+            high: The highest possible sampling value
                 (excluding this value).
         """
         assert tfp is not None
@@ -433,7 +446,7 @@ class SquashedGaussian(TFActionDistribution):
         # Get log-prob for squashed Gaussian.
         unsquashed_values_tanhd = tf.math.tanh(unsquashed_values)
         log_prob = log_prob_gaussian - tf.reduce_sum(
-            tf.math.log(1 - unsquashed_values_tanhd ** 2 + SMALL_NUMBER), axis=-1
+            tf.math.log(1 - unsquashed_values_tanhd**2 + SMALL_NUMBER), axis=-1
         )
         return log_prob
 
@@ -474,10 +487,10 @@ class SquashedGaussian(TFActionDistribution):
     def required_model_output_shape(
         action_space: gym.Space, model_config: ModelConfigDict
     ) -> Union[int, np.ndarray]:
-        return np.prod(action_space.shape) * 2
+        return np.prod(action_space.shape, dtype=np.int32) * 2
 
 
-@DeveloperAPI
+@OldAPIStack
 class Beta(TFActionDistribution):
     """
     A Beta distribution is defined on the interval [0, 1] and parameterized by
@@ -530,10 +543,10 @@ class Beta(TFActionDistribution):
     def required_model_output_shape(
         action_space: gym.Space, model_config: ModelConfigDict
     ) -> Union[int, np.ndarray]:
-        return np.prod(action_space.shape) * 2
+        return np.prod(action_space.shape, dtype=np.int32) * 2
 
 
-@DeveloperAPI
+@OldAPIStack
 class Deterministic(TFActionDistribution):
     """Action distribution that returns the input values directly.
 
@@ -558,10 +571,10 @@ class Deterministic(TFActionDistribution):
     def required_model_output_shape(
         action_space: gym.Space, model_config: ModelConfigDict
     ) -> Union[int, np.ndarray]:
-        return np.prod(action_space.shape)
+        return np.prod(action_space.shape, dtype=np.int32)
 
 
-@DeveloperAPI
+@OldAPIStack
 class MultiActionDistribution(TFActionDistribution):
     """Action distribution that operates on a set of actions.
 
@@ -569,7 +582,9 @@ class MultiActionDistribution(TFActionDistribution):
         inputs (Tensor list): A list of tensors from which to compute samples.
     """
 
-    def __init__(self, inputs, model, *, child_distributions, input_lens, action_space):
+    def __init__(
+        self, inputs, model, *, child_distributions, input_lens, action_space, **kwargs
+    ):
         ActionDistribution.__init__(self, inputs, model)
 
         self.action_space_struct = get_base_struct_from_space(action_space)
@@ -577,7 +592,9 @@ class MultiActionDistribution(TFActionDistribution):
         self.input_lens = np.array(input_lens, dtype=np.int32)
         split_inputs = tf.split(inputs, self.input_lens, axis=1)
         self.flat_child_distributions = tree.map_structure(
-            lambda dist, input_: dist(input_, model), child_distributions, split_inputs
+            lambda dist, input_: dist(input_, model, **kwargs),
+            child_distributions,
+            split_inputs,
         )
 
     @override(ActionDistribution)
@@ -658,10 +675,10 @@ class MultiActionDistribution(TFActionDistribution):
 
     @override(ActionDistribution)
     def required_model_output_shape(self, action_space, model_config):
-        return np.sum(self.input_lens)
+        return np.sum(self.input_lens, dtype=np.int32)
 
 
-@DeveloperAPI
+@OldAPIStack
 class Dirichlet(TFActionDistribution):
     """Dirichlet distribution for continuous actions that are between
     [0,1] and sum to 1.
@@ -715,4 +732,4 @@ class Dirichlet(TFActionDistribution):
     def required_model_output_shape(
         action_space: gym.Space, model_config: ModelConfigDict
     ) -> Union[int, np.ndarray]:
-        return np.prod(action_space.shape)
+        return np.prod(action_space.shape, dtype=np.int32)

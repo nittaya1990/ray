@@ -151,8 +151,8 @@ void StartServer() {
   // different nodes if possible.
   std::vector<std::unordered_map<std::string, double>> bundles{RESOUECES, RESOUECES};
 
-  ray::PlacementGroupCreationOptions options{"kv_server_pg", bundles,
-                                             ray::PlacementStrategy::SPREAD};
+  ray::PlacementGroupCreationOptions options{
+      "kv_server_pg", bundles, ray::PlacementStrategy::SPREAD};
   auto placement_group = ray::CreatePlacementGroup(options);
   // Wait until the placement group is created.
   assert(placement_group.Wait(10));
@@ -246,7 +246,8 @@ class Client {
 
 int main(int argc, char **argv) {
   // Start ray cluster and ray runtime.
-  ray::Init();
+  ray::RayConfig config;
+  ray::Init(config, argc, argv);
 
   StartServer();
 

@@ -7,8 +7,8 @@ import os
 from ray.tune.utils.release_test_util import ProgressCallback
 
 num_redis_shards = 5
-redis_max_memory = 10 ** 8
-object_store_memory = 10 ** 8
+redis_max_memory = 10**8
+object_store_memory = 10**8
 num_nodes = 1
 
 message = (
@@ -38,7 +38,7 @@ assert (
 if "RAY_ADDRESS" in os.environ:
     del os.environ["RAY_ADDRESS"]
 
-ray.init(num_cpus=10)
+ray.init()
 # Run the workload.
 
 # Whitespace diff to test things.
@@ -48,14 +48,15 @@ run_experiments(
             "run": "IMPALA",
             "env": "CartPole-v1",
             "config": {
-                "num_workers": 8,
+                "num_env_runners": 8,
                 "num_gpus": 0,
-                "num_envs_per_worker": 5,
+                "num_envs_per_env_runner": 5,
                 "remote_worker_envs": True,
                 "remote_env_batch_wait_ms": 99999999,
                 "rollout_fragment_length": 50,
                 "train_batch_size": 100,
             },
+            "storage_path": "/mnt/cluster_storage",
         },
     },
     callbacks=[ProgressCallback()],

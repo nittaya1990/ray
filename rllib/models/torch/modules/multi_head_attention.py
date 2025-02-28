@@ -5,12 +5,14 @@
 """
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.models.torch.misc import SlimFC
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.torch_utils import sequence_mask
 from ray.rllib.utils.framework import TensorType
 
 torch, nn = try_import_torch()
 
 
+@OldAPIStack
 class MultiHeadAttention(nn.Module):
     """A multi-head attention layer described in [1]."""
 
@@ -18,10 +20,10 @@ class MultiHeadAttention(nn.Module):
         self, in_dim: int, out_dim: int, num_heads: int, head_dim: int, **kwargs
     ):
         """
-        in_dim (int): Dimension of input
-        out_dim (int): Dimension of output
-        num_heads (int): Number of attention heads
-        head_dim (int): Output dimension of each attention head
+        in_dim: Dimension of input
+        out_dim: Dimension of output
+        num_heads: Number of attention heads
+        head_dim: Output dimension of each attention head
         """
         super().__init__(**kwargs)
 
@@ -51,7 +53,7 @@ class MultiHeadAttention(nn.Module):
         values = torch.reshape(values, [-1, L, H, D])
 
         score = torch.einsum("bihd,bjhd->bijh", queries, keys)
-        score = score / D ** 0.5
+        score = score / D**0.5
 
         # causal mask of the same length as the sequence
         mask = sequence_mask(torch.arange(1, L + 1), dtype=score.dtype)

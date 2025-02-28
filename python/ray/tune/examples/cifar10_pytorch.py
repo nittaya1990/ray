@@ -1,29 +1,36 @@
-# flake8: noqa
+# ruff: noqa
 # fmt: off
 
 # __import_begin__
-from functools import partial
-import numpy as np
 import os
+import tempfile
+from typing import Dict
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from filelock import FileLock
-from torch.utils.data import random_split
 import torchvision
 import torchvision.transforms as transforms
+from filelock import FileLock
+from torch.utils.data import random_split
+
 import ray
 from ray import tune
+from ray.tune import Checkpoint
 from ray.tune.schedulers import ASHAScheduler
+
 # __import_end__
 
 
 # __load_data_begin__
-def load_data(data_dir="./data"):
+DATA_DIR = tempfile.mkdtemp()
+
+def load_data(data_dir):
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
 
     # We add FileLock here because multiple workers will want to
@@ -38,6 +45,16 @@ def load_data(data_dir="./data"):
 
     return trainset, testset
 # __load_data_end__
+
+def load_test_data():
+    # Loads a fake dataset for testing so it doesn't rely on external download.
+    trainset = torchvision.datasets.FakeData(
+        128, (3, 32, 32), num_classes=10, transform=transforms.ToTensor()
+    )
+    testset = torchvision.datasets.FakeData(
+        16, (3, 32, 32), num_classes=10, transform=transforms.ToTensor()
+    )
+    return trainset, testset
 
 
 # __net_begin__
@@ -63,7 +80,7 @@ class Net(nn.Module):
 
 
 # __train_begin__
-def train_cifar(config, checkpoint_dir=None):
+def train_cifar(config):
     net = Net(config["l1"], config["l2"])
 
     device = "cpu"
@@ -76,16 +93,20 @@ def train_cifar(config, checkpoint_dir=None):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(net.parameters(), lr=config["lr"], momentum=0.9)
 
-    # The `checkpoint_dir` parameter gets passed by Ray Tune when a checkpoint
-    # should be restored.
-    if checkpoint_dir:
-        checkpoint = os.path.join(checkpoint_dir, "checkpoint")
-        model_state, optimizer_state = torch.load(checkpoint)
-        net.load_state_dict(model_state)
-        optimizer.load_state_dict(optimizer_state)
+    # Load existing checkpoint through `get_checkpoint()` API.
+    if tune.get_checkpoint():
+        loaded_checkpoint = tune.get_checkpoint()
+        with loaded_checkpoint.as_directory() as loaded_checkpoint_dir:
+            model_state, optimizer_state = torch.load(
+                os.path.join(loaded_checkpoint_dir, "checkpoint.pt")
+            )
+            net.load_state_dict(model_state)
+            optimizer.load_state_dict(optimizer_state)
 
-    data_dir = os.path.abspath("./data")
-    trainset, testset = load_data(data_dir)
+    if config["smoke_test"]:
+        trainset, testset = load_test_data()
+    else:
+        trainset, testset = load_data(DATA_DIR)
 
     test_abs = int(len(trainset) * 0.8)
     train_subset, val_subset = random_split(
@@ -95,17 +116,19 @@ def train_cifar(config, checkpoint_dir=None):
         train_subset,
         batch_size=int(config["batch_size"]),
         shuffle=True,
-        num_workers=8)
+        num_workers=0 if config["smoke_test"] else 8,
+    )
     valloader = torch.utils.data.DataLoader(
         val_subset,
         batch_size=int(config["batch_size"]),
         shuffle=True,
-        num_workers=8)
+        num_workers=0 if config["smoke_test"] else 8,
+    )
 
     for epoch in range(10):  # loop over the dataset multiple times
         running_loss = 0.0
         epoch_steps = 0
-        for i, data in enumerate(trainloader, 0):
+        for i, data in enumerate(trainloader):
             # get the inputs; data is a list of [inputs, labels]
             inputs, labels = data
             inputs, labels = inputs.to(device), labels.to(device)
@@ -147,30 +170,39 @@ def train_cifar(config, checkpoint_dir=None):
                 val_steps += 1
 
         # Here we save a checkpoint. It is automatically registered with
-        # Ray Tune and will potentially be passed as the `checkpoint_dir`
-        # parameter in future iterations.
-        with tune.checkpoint_dir(step=epoch) as checkpoint_dir:
-            path = os.path.join(checkpoint_dir, "checkpoint")
+        # Ray Tune and will potentially be accessed through in ``get_checkpoint()``
+        # in future iterations.
+        # Note to save a file like checkpoint, you still need to put it under a directory
+        # to construct a checkpoint.
+        with tempfile.TemporaryDirectory() as temp_checkpoint_dir:
+            path = os.path.join(temp_checkpoint_dir, "checkpoint.pt")
             torch.save(
-                (net.state_dict(), optimizer.state_dict()), path)
-
-        tune.report(loss=(val_loss / val_steps), accuracy=correct / total)
+                (net.state_dict(), optimizer.state_dict()), path
+            )
+            checkpoint = Checkpoint.from_directory(temp_checkpoint_dir)
+            tune.report(
+                {"loss": (val_loss / val_steps), "accuracy": correct / total},
+                checkpoint=checkpoint,
+            )
     print("Finished Training")
 # __train_end__
 
 
 # __test_acc_begin__
-def test_best_model(best_trial):
-    best_trained_model = Net(best_trial.config["l1"], best_trial.config["l2"])
+def test_best_model(config: Dict, checkpoint: "Checkpoint", smoke_test=False):
+    best_trained_model = Net(config["l1"], config["l2"])
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     best_trained_model.to(device)
 
-    checkpoint_path = os.path.join(best_trial.checkpoint.value, "checkpoint")
+    with checkpoint.as_directory() as checkpoint_dir:
+        checkpoint_path = os.path.join(checkpoint_dir, "checkpoint.pt")
+        model_state, optimizer_state = torch.load(checkpoint_path)
+        best_trained_model.load_state_dict(model_state)
 
-    model_state, optimizer_state = torch.load(checkpoint_path)
-    best_trained_model.load_state_dict(model_state)
-
-    trainset, testset = load_data()
+    if smoke_test:
+        _, testset = load_test_data()
+    else:
+        _, testset = load_data(DATA_DIR)
 
     testloader = torch.utils.data.DataLoader(
         testset, batch_size=4, shuffle=False, num_workers=2)
@@ -192,44 +224,41 @@ def test_best_model(best_trial):
 # __test_acc_end__
 
 # __main_begin__
-def main(num_samples=10, max_num_epochs=10, gpus_per_trial=2):
+def main(num_samples=10, max_num_epochs=10, gpus_per_trial=2, smoke_test=False):
     config = {
         "l1": tune.sample_from(lambda _: 2 ** np.random.randint(2, 9)),
         "l2": tune.sample_from(lambda _: 2 ** np.random.randint(2, 9)),
         "lr": tune.loguniform(1e-4, 1e-1),
-        "batch_size": tune.choice([2, 4, 8, 16])
+        "batch_size": tune.choice([2, 4, 8, 16]),
+        "smoke_test": smoke_test,
     }
     scheduler = ASHAScheduler(
         max_t=max_num_epochs,
         grace_period=1,
         reduction_factor=2)
-    result = tune.run(
-        tune.with_parameters(train_cifar),
-        resources_per_trial={"cpu": 2, "gpu": gpus_per_trial},
-        config=config,
-        metric="loss",
-        mode="min",
-        num_samples=num_samples,
-        scheduler=scheduler
+
+    tuner = tune.Tuner(
+        tune.with_resources(
+            tune.with_parameters(train_cifar),
+            resources={"cpu": 2, "gpu": gpus_per_trial},
+        ),
+        tune_config=tune.TuneConfig(
+            metric="loss",
+            mode="min",
+            num_samples=num_samples,
+            scheduler=scheduler
+        ),
+        param_space=config,
     )
-
-    best_trial = result.get_best_trial("loss", "min", "last")
-    print("Best trial config: {}".format(best_trial.config))
+    results = tuner.fit()
+    best_result = results.get_best_result("loss", "min")
+    print("Best trial config: {}".format(best_result.config))
     print("Best trial final validation loss: {}".format(
-        best_trial.last_result["loss"]))
+        best_result.metrics["loss"]))
     print("Best trial final validation accuracy: {}".format(
-        best_trial.last_result["accuracy"]))
+        best_result.metrics["accuracy"]))
 
-    if ray.util.client.ray.is_connected():
-        # If using Ray Client, we want to make sure checkpoint access
-        # happens on the server. So we wrap `test_best_model` in a Ray task.
-        # We have to make sure it gets executed on the same node that
-        # ``tune.run`` is called on.
-        from ray.util.ml_utils.node import force_on_current_node
-        remote_fn = force_on_current_node(ray.remote(test_best_model))
-        ray.get(remote_fn.remote(best_trial))
-    else:
-        test_best_model(best_trial)
+    test_best_model(best_result.config, best_result.checkpoint, smoke_test=smoke_test)
 
 
 # __main_end__
@@ -245,24 +274,12 @@ if __name__ == "__main__":
         "--ray-address",
         help="Address of Ray cluster for seamless distributed execution.",
         required=False)
-    parser.add_argument(
-        "--server-address",
-        type=str,
-        default=None,
-        required=False,
-        help="The address of server to connect to if using "
-             "Ray Client.")
     args, _ = parser.parse_known_args()
 
     if args.smoke_test:
         ray.init(num_cpus=2)
-        main(num_samples=1, max_num_epochs=1, gpus_per_trial=0)
+        main(num_samples=1, max_num_epochs=1, gpus_per_trial=0, smoke_test=True)
     else:
-        if args.server_address:
-            # Connect to a remote server through Ray Client.
-            ray.init(f"ray://{args.server_address}")
-        elif args.ray_address:
-            # Run directly on the Ray cluster.
-            ray.init(args.ray_address)
+        ray.init(args.ray_address)
         # Change this to activate training on GPUs
         main(num_samples=10, max_num_epochs=10, gpus_per_trial=0)

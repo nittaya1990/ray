@@ -16,10 +16,14 @@
 
 #include <gtest/gtest_prod.h>
 
+#include <deque>
 #include <functional>
+#include <memory>
 #include <queue>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -35,23 +39,76 @@ namespace ray {
 namespace pubsub {
 
 using SubscriberID = UniqueID;
+using PublisherID = UniqueID;
 
 namespace pub_internal {
+
+class SubscriberState;
+
+/// State for an entity / topic in a pub/sub channel.
+class EntityState {
+ public:
+  /// \param max_buffered_bytes set to -1 to disable buffering.
+  EntityState(int64_t max_message_size_bytes, int64_t max_buffered_bytes)
+      : max_message_size_bytes_(max_message_size_bytes),
+        max_buffered_bytes_(max_buffered_bytes) {}
+
+  /// Publishes the message to subscribers of the entity.
+  /// Returns true if there are subscribers, returns false otherwise.
+  bool Publish(std::shared_ptr<rpc::PubMessage> pub_message, size_t msg_size);
+
+  /// Manages the set of subscribers of this entity.
+  bool AddSubscriber(SubscriberState *subscriber);
+  bool RemoveSubscriber(const SubscriberID &id);
+
+  /// Gets the current set of subscribers, keyed by subscriber IDs.
+  const absl::flat_hash_map<SubscriberID, SubscriberState *> &Subscribers() const;
+
+  size_t GetNumBufferedBytes() const { return total_size_; }
+
+ protected:
+  // Subscribers of this entity.
+  // The underlying SubscriberState is owned by Publisher.
+  absl::flat_hash_map<SubscriberID, SubscriberState *> subscribers_;
+
+ private:
+  // Tracks inflight messages. The messages have shared ownership by
+  // individual subscribers, and get deleted after no subscriber has
+  // the message in buffer.
+  std::queue<std::weak_ptr<rpc::PubMessage>> pending_messages_;
+  // Size of each inflight message.
+  std::queue<size_t> message_sizes_;
+  // Protobuf messages fail to serialize if 2GB or larger. Cap published
+  // message batches to this size to ensure that we can publish each message
+  // batch. Individual messages larger than this limit will also be dropped.
+  // TODO(swang): Pubsub clients should also ensure that they don't try to
+  // publish messages larger than this.
+  const size_t max_message_size_bytes_;
+  // Set to -1 to disable buffering.
+  const int64_t max_buffered_bytes_;
+  // Total size of inflight messages.
+  size_t total_size_ = 0;
+};
 
 /// Per-channel two-way index for subscribers and the keys they subscribe to.
 /// Also supports subscribers to all keys in the channel.
 class SubscriptionIndex {
  public:
-  SubscriptionIndex() = default;
+  explicit SubscriptionIndex(rpc::ChannelType channel_type);
   ~SubscriptionIndex() = default;
+
+  SubscriptionIndex(SubscriptionIndex &&) noexcept = default;
+  SubscriptionIndex &operator=(SubscriptionIndex &&) noexcept = default;
+
+  /// Publishes the message to relevant subscribers.
+  /// Returns true if there are subscribers listening on the entity key of the message,
+  /// returns false otherwise.
+  bool Publish(std::shared_ptr<rpc::PubMessage> pub_message, size_t msg_size);
 
   /// Adds a new subscriber and the key it subscribes to.
   /// When `key_id` is empty, the subscriber subscribes to all keys.
   /// NOTE: The method is idempotent. If it adds a duplicated entry, it will be no-op.
-  bool AddEntry(const std::string &key_id, const SubscriberID &subscriber_id);
-
-  /// Returns a vector of subscriber ids that are subscribing to the given object ids.
-  std::vector<SubscriberID> GetSubscriberIdsByKeyId(const std::string &key_id) const;
+  bool AddEntry(const std::string &key_id, SubscriberState *subscriber);
 
   /// Erases the subscriber from this index.
   /// Returns whether the subscriber exists before the call.
@@ -71,16 +128,25 @@ class SubscriptionIndex {
   /// and all-entity subscribers.
   bool HasSubscriber(const SubscriberID &subscriber_id) const;
 
+  /// Returns a vector of subscriber ids that are subscribing to the given object ids.
+  /// Test only.
+  std::vector<SubscriberID> GetSubscriberIdsByKeyId(const std::string &key_id) const;
+
+  int64_t GetNumBufferedBytes() const;
+
   /// Returns true if there's no metadata remained in the private attribute.
   bool CheckNoLeaks() const;
 
  private:
+  static std::unique_ptr<EntityState> CreateEntityState(rpc::ChannelType channel_type);
+
+  // Type of channel this index is for.
+  rpc::ChannelType channel_type_;
   // Collection of subscribers that subscribe to all entities of the channel.
-  absl::flat_hash_set<SubscriberID> subscribers_to_all_;
-  // Mapping from subscribed entity id -> subscribers.
-  absl::flat_hash_map<std::string, absl::flat_hash_set<SubscriberID>>
-      key_id_to_subscribers_;
-  // Mapping from subscribers -> subscribed entity ids.
+  std::unique_ptr<EntityState> subscribers_to_all_;
+  // Mapping from subscribed entity id -> entity state.
+  absl::flat_hash_map<std::string, std::unique_ptr<EntityState>> entities_;
+  // Mapping from subscriber IDs -> subscribed key ids.
   // Reverse index of key_id_to_subscribers_.
   absl::flat_hash_map<SubscriberID, absl::flat_hash_set<std::string>>
       subscribers_to_key_id_;
@@ -95,33 +161,43 @@ struct LongPollConnection {
   rpc::SendReplyCallback send_reply_callback;
 };
 
-/// Abstraction to each subscriber.
-class Subscriber {
+/// Keeps the state of each connected subscriber.
+class SubscriberState {
  public:
-  Subscriber(std::function<double()> get_time_ms, uint64_t connection_timeout_ms,
-             const int publish_batch_size)
-      : get_time_ms_(std::move(get_time_ms)),
+  SubscriberState(SubscriberID subscriber_id,
+                  std::function<double()> get_time_ms,
+                  uint64_t connection_timeout_ms,
+                  int64_t publish_batch_size,
+                  PublisherID publisher_id)
+      : subscriber_id_(subscriber_id),
+        get_time_ms_(std::move(get_time_ms)),
         connection_timeout_ms_(connection_timeout_ms),
         publish_batch_size_(publish_batch_size),
-        last_connection_update_time_ms_(get_time_ms_()) {}
+        last_connection_update_time_ms_(get_time_ms_()),
+        publisher_id_(publisher_id) {}
 
-  ~Subscriber() = default;
+  ~SubscriberState() {
+    // Force a push to close the long-polling.
+    // Otherwise, there will be a connection leak.
+    PublishIfPossible(true);
+  }
 
   /// Connect to the subscriber. Currently, it means we cache the long polling request to
   /// memory. Once the bidirectional gRPC streaming is enabled, we should replace it.
   ///
   /// \param reply pubsub long polling reply.
   /// \param send_reply_callback A callback to reply to the long polling subscriber.
-  /// \return True if connection is new. False if there were already connections cached.
-  bool ConnectToSubscriber(rpc::PubsubLongPollingReply *reply,
+  void ConnectToSubscriber(const rpc::PubsubLongPollingRequest &request,
+                           rpc::PubsubLongPollingReply *reply,
                            rpc::SendReplyCallback send_reply_callback);
 
   /// Queue the pubsub message to publish to the subscriber.
   ///
   /// \param pub_message A message to publish.
-  /// \param try_publish If true, it try publishing the object id if there is a
-  /// connection.
-  void QueueMessage(const rpc::PubMessage &pub_message, bool try_publish = true);
+  /// \param try_publish If true, try publishing the object id if there is a connection.
+  ///     Currently only set to false in tests.
+  void QueueMessage(const std::shared_ptr<rpc::PubMessage> &pub_message,
+                    bool try_publish = true);
 
   /// Publish all queued messages if possible.
   ///
@@ -134,29 +210,32 @@ class Subscriber {
   /// Testing only. Return true if there's no metadata remained in the private attribute.
   bool CheckNoLeaks() const;
 
-  /// Return true if the subscriber is disconnected (if the subscriber is dead).
-  /// The subscriber is considered to be dead if there was no long polling connection for
-  /// the timeout.
-  bool IsDisconnected() const;
+  /// Returns true if there is a long polling connection.
+  bool ConnectionExists() const;
 
-  /// Return true if there was no new long polling connection for a long time.
-  bool IsActiveConnectionTimedOut() const;
+  /// Returns true if there are recent activities (requests or replies) between the
+  /// subscriber and publisher.
+  bool IsActive() const;
+
+  /// Returns the ID of this subscriber.
+  const SubscriberID &id() const { return subscriber_id_; }
 
  private:
-  /// Cached long polling reply callback.
-  /// It is cached whenever new long polling is coming from the subscriber.
-  /// It becomes a nullptr whenever the long polling request is replied.
+  /// Subscriber ID, for logging and debugging.
+  const SubscriberID subscriber_id_;
+  /// Inflight long polling reply callback, for replying to the subscriber.
   std::unique_ptr<LongPollConnection> long_polling_connection_;
   /// Queued messages to publish.
-  std::queue<std::unique_ptr<rpc::PubsubLongPollingReply>> mailbox_;
+  std::deque<std::shared_ptr<rpc::PubMessage>> mailbox_;
   /// Callback to get the current time.
   const std::function<double()> get_time_ms_;
   /// The time in which the connection is considered as timed out.
   uint64_t connection_timeout_ms_;
   /// The maximum number of objects to publish for each publish calls.
-  const int publish_batch_size_;
+  const int64_t publish_batch_size_;
   /// The last time long polling was connected in milliseconds.
   double last_connection_update_time_ms_;
+  PublisherID publisher_id_;
 };
 
 }  // namespace pub_internal
@@ -182,7 +261,7 @@ class PublisherInterface {
   ///
   /// \param pub_message The message to publish.
   /// Required to contain channel_type and key_id fields.
-  virtual void Publish(const rpc::PubMessage &pub_message) = 0;
+  virtual void Publish(rpc::PubMessage pub_message) = 0;
 
   /// Publish to the subscriber that the given key id is not available anymore.
   /// It will invoke the failure callback on the subscriber side.
@@ -231,30 +310,34 @@ class Publisher : public PublisherInterface {
   /// Check out CheckDeadSubscribers for more details.
   /// \param publish_batch_size The batch size of published messages.
   Publisher(const std::vector<rpc::ChannelType> &channels,
-            PeriodicalRunner *const periodical_runner,
-            std::function<double()> get_time_ms, const uint64_t subscriber_timeout_ms,
-            const int publish_batch_size)
-      : periodical_runner_(periodical_runner),
+            PeriodicalRunner &periodical_runner,
+            std::function<double()> get_time_ms,
+            const uint64_t subscriber_timeout_ms,
+            int64_t publish_batch_size,
+            PublisherID publisher_id = NodeID::FromRandom())
+      : periodical_runner_(&periodical_runner),
         get_time_ms_(std::move(get_time_ms)),
         subscriber_timeout_ms_(subscriber_timeout_ms),
-        publish_batch_size_(publish_batch_size) {
+        publish_batch_size_(publish_batch_size),
+        publisher_id_(publisher_id) {
     // Insert index map for each channel.
     for (auto type : channels) {
-      subscription_index_map_.emplace(type, pub_internal::SubscriptionIndex());
+      subscription_index_map_.emplace(type, pub_internal::SubscriptionIndex(type));
     }
 
     periodical_runner_->RunFnPeriodically([this] { CheckDeadSubscribers(); },
-                                          subscriber_timeout_ms);
+                                          subscriber_timeout_ms,
+                                          "Publisher.CheckDeadSubscribers");
   }
 
   ~Publisher() override = default;
 
-  /// Cache the subscriber's long polling request's information.
+  /// Handle a long poll request from `subscriber_id`.
   ///
   /// TODO(sang): Currently, we need to pass the callback for connection because we are
   /// using long polling internally. This should be changed once the bidirectional grpc
   /// streaming is supported.
-  void ConnectToSubscriber(const SubscriberID &subscriber_id,
+  void ConnectToSubscriber(const rpc::PubsubLongPollingRequest &request,
                            rpc::PubsubLongPollingReply *reply,
                            rpc::SendReplyCallback send_reply_callback);
 
@@ -272,7 +355,7 @@ class Publisher : public PublisherInterface {
   ///
   /// \param pub_message The message to publish.
   /// Required to contain channel_type and key_id fields.
-  void Publish(const rpc::PubMessage &pub_message) override;
+  void Publish(rpc::PubMessage pub_message) override;
 
   /// Publish to the subscriber that the given key id is not available anymore.
   /// It will invoke the failure callback on the subscriber side.
@@ -295,7 +378,6 @@ class Publisher : public PublisherInterface {
 
   /// Remove the subscriber. Once the subscriber is removed, messages won't be published
   /// to it anymore.
-  /// TODO(sang): Currently, clients don't send a RPC to unregister themselves.
   ///
   /// \param subscriber_id The node id of the subscriber to unsubscribe.
   /// \return True if erased. False otherwise.
@@ -341,6 +423,11 @@ class Publisher : public PublisherInterface {
   FRIEND_TEST(PublisherTest, TestUnregisterSubscription);
   FRIEND_TEST(PublisherTest, TestUnregisterSubscriber);
   FRIEND_TEST(PublisherTest, TestRegistrationIdempotency);
+  friend class MockPublisher;
+
+  /// Testing only.
+  Publisher() : publish_batch_size_(-1) {}
+
   /// Testing only. Return true if there's no metadata remained in the private attribute.
   bool CheckNoLeaks() const;
 
@@ -349,33 +436,56 @@ class Publisher : public PublisherInterface {
   ///
 
   int UnregisterSubscriberInternal(const SubscriberID &subscriber_id)
-      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   // Periodic runner to invoke CheckDeadSubscribers.
+  // The pointer must outlive the Publisher.
+  // Nonnull in production, may be nullptr in tests.
   PeriodicalRunner *periodical_runner_;
 
   /// Callback to get the current time.
-  const std::function<double()> get_time_ms_;
+  std::function<double()> get_time_ms_;
 
   /// The timeout where subscriber is considered as dead.
-  const uint64_t subscriber_timeout_ms_;
+  uint64_t subscriber_timeout_ms_;
 
   /// Protects below fields. Since the coordinator runs in a core worker, it should be
   /// thread safe.
   mutable absl::Mutex mutex_;
 
   /// Mapping of node id -> subscribers.
-  absl::flat_hash_map<SubscriberID, std::shared_ptr<pub_internal::Subscriber>>
-      subscribers_ GUARDED_BY(mutex_);
+  absl::flat_hash_map<SubscriberID, std::unique_ptr<pub_internal::SubscriberState>>
+      subscribers_ ABSL_GUARDED_BY(mutex_);
 
   /// Index that stores the mapping of messages <-> subscribers.
   absl::flat_hash_map<rpc::ChannelType, pub_internal::SubscriptionIndex>
-      subscription_index_map_ GUARDED_BY(mutex_);
+      subscription_index_map_ ABSL_GUARDED_BY(mutex_);
 
   /// The maximum number of objects to publish for each publish calls.
-  const int publish_batch_size_;
+  const int64_t publish_batch_size_;
 
-  absl::flat_hash_map<rpc::ChannelType, uint64_t> cum_pub_message_cnt_ GUARDED_BY(mutex_);
+  absl::flat_hash_map<rpc::ChannelType, uint64_t> cum_pub_message_cnt_
+      ABSL_GUARDED_BY(mutex_);
+
+  absl::flat_hash_map<rpc::ChannelType, uint64_t> cum_pub_message_bytes_cnt_
+      ABSL_GUARDED_BY(mutex_);
+
+  /// The monotonically increasing sequence_id for this publisher.
+  /// The publisher will add this sequence_id to every message to be published.
+  /// The sequence_id is used for handling failures: the publisher will not delete
+  /// a message from the sending queue until the subscriber has acknowledge
+  /// it has processed beyond the message's sequence_id.
+  ///
+  /// Note:
+  ///  - a valide sequence_id starts from 1.
+  ///  - the subscriber doesn't expect the sequences it receives are contiguous.
+  ///    this is due the fact a subscriber can only subscribe a subset
+  ///    of a channel.
+  int64_t next_sequence_id_ ABSL_GUARDED_BY(mutex_) = 0;
+
+  /// A unique identifier identifies the publisher_id.
+  /// TODO(scv119) add docs about the semantics.
+  const PublisherID publisher_id_;
 };
 
 }  // namespace pubsub

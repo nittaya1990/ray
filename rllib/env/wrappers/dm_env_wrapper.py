@@ -1,5 +1,5 @@
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 
 import numpy as np
 
@@ -7,6 +7,8 @@ try:
     from dm_env import specs
 except ImportError:
     specs = None
+
+from ray.rllib.utils.annotations import PublicAPI
 
 
 def _convert_spec_to_space(spec):
@@ -34,6 +36,7 @@ def _convert_spec_to_space(spec):
     )
 
 
+@PublicAPI
 class DMEnv(gym.Env):
     """A `gym.Env` wrapper for the `dm_env` API."""
 
@@ -60,11 +63,11 @@ class DMEnv(gym.Env):
         if reward is None:
             reward = 0.0
 
-        return ts.observation, reward, ts.last(), {"discount": ts.discount}
+        return ts.observation, reward, ts.last(), False, {"discount": ts.discount}
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
         ts = self._env.reset()
-        return ts.observation
+        return ts.observation, {}
 
     def render(self, mode="rgb_array"):
         if self._prev_obs is None:

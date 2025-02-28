@@ -2,13 +2,14 @@
 # This covers https://github.com/ray-project/ray/pull/12148
 
 import ray
+from ray.rllib.utils.metrics import NUM_ENV_STEPS_SAMPLED_LIFETIME
 from ray.tune import run_experiments
 from ray.tune.utils.release_test_util import ProgressCallback
 from ray._private.test_utils import monitor_memory_usage
 
 num_redis_shards = 5
-redis_max_memory = 10 ** 8
-object_store_memory = 10 ** 9
+redis_max_memory = 10**8
+object_store_memory = 10**9
 num_nodes = 3
 
 message = (
@@ -34,13 +35,12 @@ run_experiments(
             "env": "CartPole-v0",
             "num_samples": 10000,
             "config": {
-                "framework": "torch",
-                "num_workers": 7,
+                "num_env_runners": 7,
                 "num_gpus": 0,
                 "num_sgd_iter": 1,
             },
             "stop": {
-                "timesteps_total": 1,
+                NUM_ENV_STEPS_SAMPLED_LIFETIME: 1,
             },
         }
     },

@@ -8,7 +8,11 @@ from ray_release.exception import (
 )
 from ray_release.logger import logger
 from ray_release.cluster_manager.minimal import MinimalClusterManager
-from ray_release.util import format_link, anyscale_cluster_url
+from ray_release.util import (
+    format_link,
+    anyscale_cluster_url,
+    exponential_backoff_retry,
+)
 
 REPORT_S = 30.0
 
@@ -22,6 +26,8 @@ class FullClusterManager(MinimalClusterManager):
 
     def start_cluster(self, timeout: float = 600.0):
         logger.info(f"Creating cluster {self.cluster_name}")
+        logger.info(f"Autosuspend time: {self.autosuspend_minutes} minutes")
+        logger.info(f"Auto terminate after: {self.maximum_uptime_minutes} minutes")
         try:
             result = self.sdk.create_cluster(
                 dict(
@@ -39,7 +45,7 @@ class FullClusterManager(MinimalClusterManager):
         # Trigger session start
         logger.info(f"Starting cluster {self.cluster_name} ({self.cluster_id})")
         cluster_url = anyscale_cluster_url(
-            project_id=self.project_id, session_id=self.cluster_id
+            project_id=self.project_id, cluster_id=self.cluster_id
         )
         logger.info(f"Link to cluster: {format_link(cluster_url)}")
 
@@ -77,7 +83,12 @@ class FullClusterManager(MinimalClusterManager):
             # Sleep 1 sec before next check.
             time.sleep(1)
 
-            result = self.sdk.get_cluster_operation(cop_id, _request_timeout=30)
+            result = exponential_backoff_retry(
+                lambda: self.sdk.get_cluster_operation(cop_id, _request_timeout=30),
+                retry_exceptions=Exception,
+                initial_retry_delay_s=2,
+                max_retries=3,
+            )
             completed = result.result.completed
 
         result = self.sdk.get_cluster(self.cluster_id)
@@ -88,12 +99,15 @@ class FullClusterManager(MinimalClusterManager):
                 f"{cluster_url} (cluster state: {result.result.state})"
             )
 
-    def terminate_cluster(self, wait: bool = False):
+    def terminate_cluster_ex(self, wait: bool = False):
         if self.cluster_id:
+            logger.info(f"Terminating cluster with ID {self.cluster_id}")
             # Just trigger a request. No need to wait until session shutdown.
             result = self.sdk.terminate_cluster(
                 cluster_id=self.cluster_id, terminate_cluster_options={}
             )
+
+            logger.info(f"Terminate request for cluster with ID {self.cluster_id} sent")
 
             if not wait:
                 return
@@ -115,6 +129,3 @@ class FullClusterManager(MinimalClusterManager):
             while result.result.state != "Terminated":
                 time.sleep(1)
                 result = self.sdk.get_cluster(self.cluster_id)
-
-    def get_cluster_address(self) -> str:
-        return f"anyscale://{self.project_name}/{self.cluster_name}"

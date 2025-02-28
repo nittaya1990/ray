@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <boost/asio/post.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/thread.hpp>
 #include <list>
@@ -34,17 +35,18 @@ namespace core {
 /// by the SchedulingQueue to provide backpressure to clients.
 class BoundedExecutor {
  public:
-  static bool NeedDefaultExecutor(int32_t max_concurrency_in_default_group) {
-    //  Threaded actor mode only need a default executor when max_concurrency > 1.
-    return max_concurrency_in_default_group > 1;
+  static bool NeedDefaultExecutor(int32_t max_concurrency_in_default_group,
+                                  bool has_other_concurrency_groups) {
+    if (max_concurrency_in_default_group == 0) {
+      return false;
+    }
+    return max_concurrency_in_default_group > 1 || has_other_concurrency_groups;
   }
 
   explicit BoundedExecutor(int max_concurrency);
 
-  int32_t GetMaxConcurrency() const;
-
-  /// Posts work to the pool, blocking if no free threads are available.
-  void PostBlocking(std::function<void()> fn);
+  /// Posts work to the pool
+  void Post(std::function<void()> fn) { boost::asio::post(*pool_, std::move(fn)); }
 
   /// Stop the thread pool.
   void Stop();
@@ -53,16 +55,8 @@ class BoundedExecutor {
   void Join();
 
  private:
-  bool ThreadsAvailable() EXCLUSIVE_LOCKS_REQUIRED(mu_);
-
-  /// Protects access to the counters below.
-  absl::Mutex mu_;
-  /// The number of currently running tasks.
-  int num_running_ GUARDED_BY(mu_);
-  /// The max number of concurrently running tasks allowed.
-  const int max_concurrency_;
   /// The underlying thread pool for running tasks.
-  boost::asio::thread_pool pool_;
+  std::unique_ptr<boost::asio::thread_pool> pool_;
 };
 
 }  // namespace core

@@ -1,21 +1,33 @@
 import os
-import random
 import platform
+import random
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 import pytest
+
 import ray
-from ray._private.test_utils import wait_for_condition, run_string_as_driver
-from ray.tests.test_object_spilling import is_dir_empty, assert_no_thrashing
+from ray._private.test_utils import run_string_as_driver, wait_for_condition
+from ray.tests.test_object_spilling import assert_no_thrashing, is_dir_empty
+from ray._private.external_storage import (
+    FileSystemStorage,
+    ExternalStorageRayStorageImpl,
+)
+
+
+# Note: Disk write speed can be as low as 6 MiB/s in AWS Mac instances, so we have to
+# increase the timeout.
+pytestmark = [pytest.mark.timeout(900 if platform.system() == "Darwin" else 180)]
+condition_wait_timeout = 20 if os.getenv("RAY_DEBUG_MODE") == "1" else 10
 
 
 def test_delete_objects(object_spilling_config, shutdown_only):
     # Limit our object store to 75 MiB of memory.
     object_spilling_config, temp_folder = object_spilling_config
 
-    address = ray.init(
+    ray_context = ray.init(
         object_store_memory=75 * 1024 * 1024,
         _system_config={
             "max_io_workers": 1,
@@ -38,15 +50,18 @@ def test_delete_objects(object_spilling_config, shutdown_only):
 
     del replay_buffer
     del ref
-    wait_for_condition(lambda: is_dir_empty(temp_folder))
-    assert_no_thrashing(address["address"])
+    wait_for_condition(
+        lambda: is_dir_empty(temp_folder, ray_context["node_id"]),
+        timeout=condition_wait_timeout,
+    )
+    assert_no_thrashing(ray_context["address"])
 
 
 def test_delete_objects_delete_while_creating(object_spilling_config, shutdown_only):
     # Limit our object store to 75 MiB of memory.
     object_spilling_config, temp_folder = object_spilling_config
 
-    address = ray.init(
+    ray_context = ray.init(
         object_store_memory=75 * 1024 * 1024,
         _system_config={
             "max_io_workers": 4,
@@ -71,14 +86,17 @@ def test_delete_objects_delete_while_creating(object_spilling_config, shutdown_o
     # Do random sampling.
     for _ in range(200):
         ref = random.choice(replay_buffer)
-        sample = ray.get(ref, timeout=0)
+        sample = ray.get(ref, timeout=None)
         assert np.array_equal(sample, arr)
 
     # After all, make sure all objects are killed without race condition.
     del replay_buffer
     del ref
-    wait_for_condition(lambda: is_dir_empty(temp_folder))
-    assert_no_thrashing(address["address"])
+    wait_for_condition(
+        lambda: is_dir_empty(temp_folder, ray_context["node_id"]),
+        timeout=condition_wait_timeout,
+    )
+    assert_no_thrashing(ray_context["address"])
 
 
 @pytest.mark.skipif(platform.system() in ["Windows"], reason="Failing on Windows.")
@@ -86,7 +104,7 @@ def test_delete_objects_on_worker_failure(object_spilling_config, shutdown_only)
     # Limit our object store to 75 MiB of memory.
     object_spilling_config, temp_folder = object_spilling_config
 
-    address = ray.init(
+    ray_context = ray.init(
         object_store_memory=75 * 1024 * 1024,
         _system_config={
             "max_io_workers": 4,
@@ -120,7 +138,7 @@ def test_delete_objects_on_worker_failure(object_spilling_config, shutdown_only)
             # Do random sampling.
             for _ in range(200):
                 ref = random.choice(self.replay_buffer)
-                sample = ray.get(ref, timeout=0)
+                sample = ray.get(ref, timeout=None)
                 assert np.array_equal(sample, arr)
 
     a = Actor.remote()
@@ -135,11 +153,47 @@ def test_delete_objects_on_worker_failure(object_spilling_config, shutdown_only)
             return True
         return False
 
-    wait_for_condition(wait_until_actor_dead)
+    wait_for_condition(wait_until_actor_dead, timeout=condition_wait_timeout)
 
     # After all, make sure all objects are deleted upon worker failures.
-    wait_for_condition(lambda: is_dir_empty(temp_folder))
-    assert_no_thrashing(address["address"])
+    wait_for_condition(
+        lambda: is_dir_empty(temp_folder, ray_context["node_id"]),
+        timeout=condition_wait_timeout,
+    )
+    assert_no_thrashing(ray_context["address"])
+
+
+@pytest.mark.skipif(platform.system() in ["Windows"], reason="Failing on Windows.")
+def test_delete_file_non_exists(shutdown_only, tmp_path):
+    ray_context = ray.init(storage=str(tmp_path))
+
+    def create_spilled_files(num_files):
+        spilled_files = []
+        uris = []
+        for _ in range(3):
+            fd, path = tempfile.mkstemp()
+            with os.fdopen(fd, "w") as tmp:
+                tmp.write("stuff")
+            spilled_files.append(path)
+            uris.append((path + "?offset=0&size=10").encode("ascii"))
+        return spilled_files, uris
+
+    for storage in [
+        ExternalStorageRayStorageImpl(ray_context["node_id"], "session"),
+        FileSystemStorage(ray_context["node_id"], "/tmp"),
+    ]:
+        spilled_files, uris = create_spilled_files(3)
+        storage.delete_spilled_objects(uris)
+        for file in spilled_files:
+            assert not os.path.exists(file)
+
+        # delete should succeed even if some files doesn't exist.
+        spilled_files1, uris1 = create_spilled_files(3)
+        spilled_files += spilled_files1
+        uris += uris1
+        storage.delete_spilled_objects(uris)
+        for file in spilled_files:
+            assert not os.path.exists(file)
 
 
 @pytest.mark.skipif(
@@ -166,8 +220,8 @@ def test_delete_objects_multi_node(
     )
     ray.init(address=cluster.address)
     # Add 2 worker nodes.
-    for _ in range(2):
-        cluster.add_node(num_cpus=1, object_store_memory=75 * 1024 * 1024)
+    worker_node1 = cluster.add_node(num_cpus=1, object_store_memory=75 * 1024 * 1024)
+    worker_node2 = cluster.add_node(num_cpus=1, object_store_memory=75 * 1024 * 1024)
     cluster.wait_for_nodes()
 
     arr = np.random.rand(1024 * 1024)  # 8 MB data
@@ -209,15 +263,24 @@ def test_delete_objects_multi_node(
     # Kill actors to remove all references.
     for actor in actors:
         ray.kill(actor)
-        wait_for_condition(lambda: wait_until_actor_dead(actor))
+        wait_for_condition(
+            lambda: wait_until_actor_dead(actor), timeout=condition_wait_timeout
+        )
     # The multi node deletion should work.
-    wait_for_condition(lambda: is_dir_empty(temp_folder))
+    wait_for_condition(
+        lambda: is_dir_empty(temp_folder, worker_node1.node_id),
+        timeout=condition_wait_timeout,
+    )
+    wait_for_condition(
+        lambda: is_dir_empty(temp_folder, worker_node2.node_id),
+        timeout=condition_wait_timeout,
+    )
     assert_no_thrashing(cluster.address)
 
 
-def test_fusion_objects(object_spilling_config, shutdown_only):
+def test_fusion_objects(fs_only_object_spilling_config, shutdown_only):
     # Limit our object store to 75 MiB of memory.
-    object_spilling_config, temp_folder = object_spilling_config
+    object_spilling_config, temp_folder = fs_only_object_spilling_config
     min_spilling_size = 10 * 1024 * 1024
     address = ray.init(
         object_store_memory=75 * 1024 * 1024,
@@ -249,20 +312,21 @@ def test_fusion_objects(object_spilling_config, shutdown_only):
         index = random.choice(list(range(buffer_length)))
         ref = replay_buffer[index]
         solution = solution_buffer[index]
-        sample = ray.get(ref, timeout=0)
+        sample = ray.get(ref, timeout=None)
         assert np.array_equal(sample, solution)
 
     is_test_passing = False
-    # Since we'd like to see the temp directory that stores the files,
-    # we need to append this directory.
-    temp_folder = temp_folder / ray.ray_constants.DEFAULT_OBJECT_PREFIX
     for path in temp_folder.iterdir():
-        file_size = path.stat().st_size
-        # Make sure there are at least one
-        # file_size that exceeds the min_spilling_size.
-        # If we don't fusion correctly, this cannot happen.
-        if file_size >= min_spilling_size:
-            is_test_passing = True
+        # Under the temp_folder, there should be a folder called
+        # "ray_spilled_objects[_<node_id>]", which contains the
+        # spilled objects.
+        for spilled_objects_path in path.iterdir():
+            file_size = spilled_objects_path.stat().st_size
+            # Make sure there are at least one
+            # file_size that exceeds the min_spilling_size.
+            # If we don't fusion correctly, this cannot happen.
+            if file_size >= min_spilling_size:
+                is_test_passing = True
     assert is_test_passing
     assert_no_thrashing(address["address"])
 
@@ -360,7 +424,7 @@ def test_spill_objects_on_object_transfer(
 
 
 @pytest.mark.skipif(
-    platform.system() in ["Windows"], reason="Failing on " "Windows and Mac."
+    platform.system() in ["Windows"], reason="Failing on Windows and Mac."
 )
 def test_file_deleted_when_driver_exits(tmp_path, shutdown_only):
     temp_folder = tmp_path / "spill"
@@ -408,8 +472,15 @@ os.kill(os.getpid(), sig)
     print("Sending sigint...")
     with pytest.raises(subprocess.CalledProcessError):
         print(run_string_as_driver(driver.format(temp_dir=str(temp_folder), signum=2)))
-    wait_for_condition(lambda: is_dir_empty(temp_folder, append_path=""))
+    # node_id is not actually used in the following check, so we pass in a dummy one
+    wait_for_condition(
+        lambda: is_dir_empty(temp_folder, "dummy_node_id", append_path=False),
+        timeout=condition_wait_timeout,
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-sv", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

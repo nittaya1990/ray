@@ -10,14 +10,27 @@ import time
 import random
 import pytest
 from typing import Any, Callable, Optional
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import ray
+from ray._private.utils import get_or_create_event_loop
 import ray.core.generated.ray_client_pb2 as ray_client_pb2
 import ray.core.generated.ray_client_pb2_grpc as ray_client_pb2_grpc
+from ray.tests.conftest import call_ray_start_context
 from ray.util.client.common import CLIENT_SERVER_MAX_THREADS, GRPC_OPTIONS
-import ray.util.client.server.server as ray_client_server
-from ray._private.client_mode_hook import disable_client_hook
+
+
+@pytest.fixture(scope="module")
+def call_ray_start_shared(request):
+    # Starts Ray with a ray client server listening on port 50051
+    request = Mock()
+    request.param = (
+        "ray start --head --min-worker-port=0 --max-worker-port=0 --port 0 "
+        "--ray-client-server-port=50051"
+    )
+    with call_ray_start_context(request) as address:
+        yield address
+
 
 # At a high level, these tests rely on an extra RPC server sitting
 # between the client and the real Ray server to inject errors, drop responses
@@ -135,7 +148,8 @@ class MiddlemanRayletServicer(ray_client_pb2_grpc.RayletDriverServicer):
             context.set_code(e.code())
             context.set_details(e.details())
             raise
-        if self.on_response:
+        if self.on_response and method != "GetObject":
+            # GetObject streams response, handle on_response separately
             self.on_response(response)
         return response
 
@@ -163,13 +177,26 @@ class MiddlemanRayletServicer(ray_client_pb2_grpc.RayletDriverServicer):
         return self._call_inner_function(request, context, "ListNamedActors")
 
     def ClusterInfo(self, request, context=None) -> ray_client_pb2.ClusterInfoResponse:
-        return self._call_inner_function(request, context, "ClusterInfo")
+        # Cluster info is currently used for health checks and isn't retried, so
+        # don't inject errors.
+        # TODO(ckw): update ClusterInfo so that retries are only skipped for PING
+        try:
+            return self.stub.ClusterInfo(
+                request, metadata=context.invocation_metadata()
+            )
+        except grpc.RpcError as e:
+            context.set_code(e.code())
+            context.set_details(e.details())
+            raise
 
     def Terminate(self, req, context=None):
         return self._call_inner_function(req, context, "Terminate")
 
     def GetObject(self, request, context=None):
-        return self._call_inner_function(request, context, "GetObject")
+        for response in self._call_inner_function(request, context, "GetObject"):
+            if self.on_response:
+                self.on_response(response)
+            yield response
 
     def PutObject(
         self, request: ray_client_pb2.PutRequest, context=None
@@ -276,7 +303,6 @@ def start_middleman_server(
     and a ray client server on port 50051.
     """
     ray._inside_client_test = True
-    server = ray_client_server.serve("localhost:50051")
     middleman = None
     try:
         middleman = MiddlemanServer(
@@ -290,29 +316,15 @@ def start_middleman_server(
         )
         middleman.start()
         ray.init("ray://localhost:10011")
-        yield middleman, server
+        yield middleman
     finally:
         ray._inside_client_test = False
         ray.util.disconnect()
         if middleman:
             middleman.stop(0)
-        # Delete server to allow the client server to be GC'ed, which shuts
-        # down Ray. Then wait for Ray to shut down in the local process.
-        # Otherwise, the Ray cluster may stay alive until the next call to
-        # start_middleman_server(), become the backing Ray cluster to the
-        # client server, and shut down in the middle of the test case after
-        # GC finally catches up, leading to test failures.
-        server.stop(0)
-        del server
-        start = time.monotonic()
-        with disable_client_hook():
-            while ray.is_initialized():
-                time.sleep(1)
-                if time.monotonic() - start > 30:
-                    raise RuntimeError("Failed to terminate Ray")
 
 
-def test_disconnect_during_get():
+def test_disconnect_during_get(call_ray_start_shared):
     """
     Disconnect the proxy and the client in the middle of a long running get
     """
@@ -326,7 +338,7 @@ def test_disconnect_during_get():
         time.sleep(3)
         middleman.reset_channel()
 
-    with start_middleman_server() as (middleman, _):
+    with start_middleman_server() as middleman:
         disconnect_thread = threading.Thread(target=disconnect, args=(middleman,))
         disconnect_thread.start()
         result = ray.get(slow_result.remote())
@@ -334,7 +346,73 @@ def test_disconnect_during_get():
         disconnect_thread.join()
 
 
-def test_disconnect_during_large_put():
+def test_disconnects_during_large_get(call_ray_start_shared):
+    """
+    Disconnect repeatedly during a large (multi-chunk) get.
+    """
+    i = 0
+    started = False
+
+    def fail_every_three(_):
+        # Inject an error every third time this method is called
+        nonlocal i, started
+        if not started:
+            return
+        i += 1
+        if i % 3 == 0:
+            raise RuntimeError
+
+    @ray.remote
+    def large_result():
+        # 1024x1024x6 float64 matrix (96 MiB). With 5MiB chunk size,
+        # it will take at least 16 chunks to transfer this object. Since
+        # the failure is injected every 3 chunks, this transfer can only
+        # work if the chunked get request retries at the last received chunk
+        # (instead of starting from the beginning each retry)
+        return np.random.random((1024, 1024, 6))
+
+    with start_middleman_server(on_task_response=fail_every_three):
+        started = True
+        result = ray.get(large_result.remote())
+        assert result.shape == (1024, 1024, 6)
+
+
+def test_disconnects_during_large_async_get(call_ray_start_shared):
+    """
+    Disconnect repeatedly during a large (multi-chunk) async get.
+    """
+    i = 0
+    started = False
+
+    def fail_every_three(_):
+        # Inject an error every third time this method is called
+        nonlocal i, started
+        if not started:
+            return
+        i += 1
+        if i % 3 == 0:
+            raise RuntimeError
+
+    @ray.remote
+    def large_result():
+        # 1024x1024x6 float64 matrix (96 MiB). With 5MiB chunk size,
+        # it will take at least 16 chunks to transfer this object. Since
+        # the failure is injected every 3 chunks, this transfer can only
+        # work if the chunked get request retries at the last received chunk
+        # (instead of starting from the beginning each retry)
+        return np.random.random((1024, 1024, 6))
+
+    with start_middleman_server(on_data_response=fail_every_three):
+        started = True
+
+        async def get_large_result():
+            return await large_result.remote()
+
+        result = get_or_create_event_loop().run_until_complete(get_large_result())
+        assert result.shape == (1024, 1024, 6)
+
+
+def test_disconnect_during_large_put(call_ray_start_shared):
     """
     Disconnect during a large (multi-chunk) put.
     """
@@ -352,13 +430,41 @@ def test_disconnect_during_large_put():
 
     with start_middleman_server(on_data_request=fail_halfway):
         started = True
-        objref = ray.put(np.random.random((1024, 1024, 128)))
+        objref = ray.put(np.random.random((1024, 1024, 6)))
         assert i > 8  # Check that the failure was injected
         result = ray.get(objref)
-        assert result.shape == (1024, 1024, 128)
+        assert result.shape == (1024, 1024, 6)
 
 
-def test_valid_actor_state():
+def test_disconnect_during_large_schedule(call_ray_start_shared):
+    """
+    Disconnect during a remote call with a large (multi-chunk) argument.
+    """
+    i = 0
+    started = False
+
+    def fail_halfway(_):
+        # Inject an error halfway through the object transfer
+        nonlocal i, started
+        if not started:
+            return
+        i += 1
+        if i == 8:
+            raise RuntimeError
+
+    @ray.remote
+    def f(a):
+        return a.shape
+
+    with start_middleman_server(on_data_request=fail_halfway):
+        started = True
+        a = np.random.random((1024, 1024, 6))
+        result = ray.get(f.remote(a))
+        assert i > 8  # Check that the failure was injected
+        assert result == (1024, 1024, 6)
+
+
+def test_valid_actor_state(call_ray_start_shared):
     """
     Repeatedly inject errors in the middle of mutating actor calls. Check
     at the end that the final state of the actor is consistent with what
@@ -397,7 +503,7 @@ def test_valid_actor_state():
         assert ray.get(ref) == 100
 
 
-def test_valid_actor_state_2():
+def test_valid_actor_state_2(call_ray_start_shared):
     """
     Do a full disconnect (cancel channel) every 11 requests. Failure
     happens:
@@ -417,7 +523,7 @@ def test_valid_actor_state_2():
 
     i = 0
 
-    with start_middleman_server() as (middleman, _):
+    with start_middleman_server() as middleman:
 
         def fail_every_eleven(_):
             nonlocal i
@@ -435,14 +541,14 @@ def test_valid_actor_state_2():
         assert ray.get(ref) == 100
 
 
-def test_noisy_puts():
+def test_noisy_puts(call_ray_start_shared):
     """
     Randomly kills the data channel with 10% chance when receiving response
     (requests made it to server, responses dropped) and checks that final
     result is still consistent
     """
     random.seed(12345)
-    with start_middleman_server() as (middleman, _):
+    with start_middleman_server() as middleman:
 
         def fail_randomly(response: ray_client_pb2.DataResponse):
             if random.random() < 0.1:
@@ -456,7 +562,7 @@ def test_noisy_puts():
             assert result == i * 123
 
 
-def test_client_reconnect_grace_period():
+def test_client_reconnect_grace_period(call_ray_start_shared):
     """
     Tests that the client gives up attempting to reconnect the channel
     after the grace period expires.
@@ -464,7 +570,7 @@ def test_client_reconnect_grace_period():
     # Lower grace period to 5 seconds to save time
     with patch.dict(
         os.environ, {"RAY_CLIENT_RECONNECT_GRACE_PERIOD": "5"}
-    ), start_middleman_server() as (middleman, _):
+    ), start_middleman_server() as middleman:
         assert ray.get(ray.put(42)) == 42
         # Close channel
         middleman.channel.close()
@@ -478,4 +584,7 @@ def test_client_reconnect_grace_period():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

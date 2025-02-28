@@ -29,10 +29,6 @@ class RayWheelsUnspecifiedError(RayWheelsError):
     exit_code = ExitCode.CLI_ERROR
 
 
-class RayWheelsNotFoundError(RayWheelsError):
-    exit_code = ExitCode.CLI_ERROR
-
-
 class RayWheelsTimeoutError(RayWheelsError):
     exit_code = ExitCode.RAY_WHEELS_TIMEOUT
 
@@ -63,6 +59,10 @@ class ClusterCreationError(ClusterManagerError):
 
 class ClusterStartupError(ClusterManagerError):
     exit_code = ExitCode.CLUSTER_STARTUP_ERROR
+
+
+class CloudInfoError(ClusterManagerError):
+    exit_code = ExitCode.CLUSTER_RESOURCE_ERROR
 
 
 class ClusterStartupTimeout(ClusterManagerError):
@@ -125,8 +125,8 @@ class TestCommandError(CommandError):
     exit_code = ExitCode.COMMAND_ERROR
 
 
-class ResultsError(CommandError):
-    pass
+class FetchResultError(FileManagerError):
+    exit_code = ExitCode.FETCH_RESULT_ERROR
 
 
 class LogsError(CommandError):
@@ -135,3 +135,31 @@ class LogsError(CommandError):
 
 class ResultsAlert(CommandError):
     exit_code = ExitCode.COMMAND_ALERT
+
+
+class JobBrokenError(ReleaseTestError):
+    exit_code = ExitCode.ANYSCALE_ERROR
+
+
+class JobTerminatedBeforeStartError(ReleaseTestError):
+    exit_code = ExitCode.CLUSTER_STARTUP_TIMEOUT
+
+
+class JobTerminatedError(ReleaseTestError):
+    exit_code = ExitCode.ANYSCALE_ERROR
+
+
+class JobOutOfRetriesError(ReleaseTestError):
+    exit_code = ExitCode.ANYSCALE_ERROR
+
+
+class JobStartupFailed(ClusterStartupFailed):
+    pass
+
+
+class JobStartupTimeout(ClusterStartupTimeout):
+    pass
+
+
+class JobNoLogsError(ReleaseTestError):
+    exit_code = ExitCode.ANYSCALE_ERROR

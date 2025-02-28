@@ -1,43 +1,47 @@
 import collections
 import logging
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 
-from ray.tune import trial_runner
+from ray.tune.experiment import Trial
 from ray.tune.result import DEFAULT_METRIC
-from ray.tune.trial import Trial
 from ray.tune.schedulers.trial_scheduler import FIFOScheduler, TrialScheduler
+from ray.util.annotations import PublicAPI
+
+if TYPE_CHECKING:
+    from ray.tune.execution.tune_controller import TuneController
 
 logger = logging.getLogger(__name__)
 
 
+@PublicAPI
 class MedianStoppingRule(FIFOScheduler):
     """Implements the median stopping rule as described in the Vizier paper:
 
     https://research.google.com/pubs/pub46180.html
 
     Args:
-        time_attr (str): The training result attr to use for comparing time.
+        time_attr: The training result attr to use for comparing time.
             Note that you can pass in something non-temporal such as
             `training_iteration` as a measure of progress, the only requirement
             is that the attribute should increase monotonically.
-        metric (str): The training result objective value attribute. Stopping
+        metric: The training result objective value attribute. Stopping
             procedures will use this attribute. If None but a mode was passed,
             the `ray.tune.result.DEFAULT_METRIC` will be used per default.
-        mode (str): One of {min, max}. Determines whether objective is
+        mode: One of {min, max}. Determines whether objective is
             minimizing or maximizing the metric attribute.
-        grace_period (float): Only stop trials at least this old in time.
+        grace_period: Only stop trials at least this old in time.
             The mean will only be computed from this time onwards. The units
             are the same as the attribute named by `time_attr`.
-        min_samples_required (int): Minimum number of trials to compute median
+        min_samples_required: Minimum number of trials to compute median
             over.
-        min_time_slice (float): Each trial runs at least this long before
+        min_time_slice: Each trial runs at least this long before
             yielding (assuming it isn't stopped). Note: trials ONLY yield if
             there are not enough samples to evaluate performance for the
             current result AND there are other trials waiting to run.
             The units are the same as the attribute named by `time_attr`.
-        hard_stop (bool): If False, pauses trials instead of stopping
+        hard_stop: If False, pauses trials instead of stopping
             them. When all other trials are complete, paused trials will be
             resumed and allowed to run FIFO.
     """
@@ -52,7 +56,7 @@ class MedianStoppingRule(FIFOScheduler):
         min_time_slice: int = 0,
         hard_stop: bool = True,
     ):
-        FIFOScheduler.__init__(self)
+        super().__init__()
         self._stopped_trials = set()
         self._grace_period = grace_period
         self._min_samples_required = min_samples_required
@@ -95,21 +99,21 @@ class MedianStoppingRule(FIFOScheduler):
 
         return True
 
-    def on_trial_add(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def on_trial_add(self, tune_controller: "TuneController", trial: Trial):
         if not self._metric or not self._worst or not self._compare_op:
             raise ValueError(
                 "{} has been instantiated without a valid `metric` ({}) or "
                 "`mode` ({}) parameter. Either pass these parameters when "
                 "instantiating the scheduler, or pass them as parameters "
-                "to `tune.run()`".format(
+                "to `tune.TuneConfig()`".format(
                     self.__class__.__name__, self._metric, self._mode
                 )
             )
 
-        super(MedianStoppingRule, self).on_trial_add(trial_runner, trial)
+        super(MedianStoppingRule, self).on_trial_add(tune_controller, trial)
 
     def on_trial_result(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ) -> str:
         """Callback for early stopping.
 
@@ -135,7 +139,7 @@ class MedianStoppingRule(FIFOScheduler):
         trials.remove(trial)
 
         if len(trials) < self._min_samples_required:
-            action = self._on_insufficient_samples(trial_runner, trial, time)
+            action = self._on_insufficient_samples(tune_controller, trial, time)
             if action == TrialScheduler.PAUSE:
                 self._last_pause[trial] = time
                 action_str = "Yielding time to other trials."
@@ -168,7 +172,7 @@ class MedianStoppingRule(FIFOScheduler):
             return TrialScheduler.CONTINUE
 
     def on_trial_complete(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ):
         self._results[trial].append(result)
 
@@ -178,12 +182,12 @@ class MedianStoppingRule(FIFOScheduler):
         )
 
     def _on_insufficient_samples(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, time: float
+        self, tune_controller: "TuneController", trial: Trial, time: float
     ) -> str:
         pause = time - self._last_pause[trial] > self._min_time_slice
         pause = pause and [
             t
-            for t in trial_runner.get_live_trials()
+            for t in tune_controller.get_live_trials()
             if t.status in (Trial.PENDING, Trial.PAUSED)
         ]
         return TrialScheduler.PAUSE if pause else TrialScheduler.CONTINUE

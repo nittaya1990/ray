@@ -18,11 +18,10 @@
 #include <string>
 
 #include "ray/common/asio/io_service_pool.h"
+#include "ray/common/asio/postable.h"
 #include "ray/common/id.h"
 #include "ray/common/status.h"
 #include "ray/gcs/callback.h"
-#include "ray/util/logging.h"
-#include "src/ray/protobuf/gcs.pb.h"
 
 namespace ray {
 
@@ -39,111 +38,91 @@ class StoreClient {
   /// \param table_name The name of the table to be written.
   /// \param key The key that will be written to the table.
   /// \param data The value of the key that will be written to the table.
-  /// \param callback Callback that will be called after write finishes.
+  /// \param overwrite Whether to overwrite existing values. Otherwise, the update
+  ///   will be ignored.
+  /// \param callback WARNING: it returns true if and only if A NEW ENTRY is added.
+  /// Overwritten return false.
   /// \return Status
-  virtual Status AsyncPut(const std::string &table_name, const std::string &key,
-                          const std::string &data, const StatusCallback &callback) = 0;
-
-  /// Write data to the given table asynchronously.
-  ///
-  /// \param table_name The name of the table to be written.
-  /// \param key The key that will be written to the table.
-  /// \param index_key A secondary key that will be used for indexing the data.
-  /// \param data The value of the key that will be written to the table.
-  /// \param callback Callback that will be called after write finishes.
-  /// \return Status
-  virtual Status AsyncPutWithIndex(const std::string &table_name, const std::string &key,
-                                   const std::string &index_key, const std::string &data,
-                                   const StatusCallback &callback) = 0;
+  virtual Status AsyncPut(const std::string &table_name,
+                          const std::string &key,
+                          std::string data,
+                          bool overwrite,
+                          Postable<void(bool)> callback) = 0;
 
   /// Get data from the given table asynchronously.
   ///
   /// \param table_name The name of the table to be read.
   /// \param key The key to lookup from the table.
-  /// \param callback Callback that will be called after read finishes.
+  /// \param callback returns the value or null.
   /// \return Status
-  virtual Status AsyncGet(const std::string &table_name, const std::string &key,
-                          const OptionalItemCallback<std::string> &callback) = 0;
-
-  /// Get data by index from the given table asynchronously.
-  ///
-  /// \param table_name The name of the table to be read.
-  /// \param index_key The secondary key that will be used to get the indexed data.
-  /// \param callback Callback that will be called after read finishes.
-  /// \return Status
-  virtual Status AsyncGetByIndex(
-      const std::string &table_name, const std::string &index_key,
-      const MapCallback<std::string, std::string> &callback) = 0;
+  virtual Status AsyncGet(const std::string &table_name,
+                          const std::string &key,
+                          ToPostable<OptionalItemCallback<std::string>> callback) = 0;
 
   /// Get all data from the given table asynchronously.
   ///
   /// \param table_name The name of the table to be read.
-  /// \param callback Callback that will be called after data has been received.
+  /// \param callback returns the key value pairs in a map.
   /// \return Status
-  virtual Status AsyncGetAll(const std::string &table_name,
-                             const MapCallback<std::string, std::string> &callback) = 0;
+  virtual Status AsyncGetAll(
+      const std::string &table_name,
+      Postable<void(absl::flat_hash_map<std::string, std::string>)> callback) = 0;
+
+  /// Get all data from the given table asynchronously.
+  ///
+  /// \param table_name The name of the table to be read.
+  /// \param keys The keys to look up from the table.
+  /// \param callback returns the key value pairs in a map for those keys that exist.
+  /// \return Status
+  virtual Status AsyncMultiGet(
+      const std::string &table_name,
+      const std::vector<std::string> &keys,
+      Postable<void(absl::flat_hash_map<std::string, std::string>)> callback) = 0;
 
   /// Delete data from the given table asynchronously.
   ///
   /// \param table_name The name of the table from which data is to be deleted.
   /// \param key The key that will be deleted from the table.
-  /// \param callback Callback that will be called after delete finishes.
+  /// \param callback returns true if an entry with matching key is deleted.
   /// \return Status
-  virtual Status AsyncDelete(const std::string &table_name, const std::string &key,
-                             const StatusCallback &callback) = 0;
-
-  /// Delete data from the given table asynchronously, this can delete
-  /// key--value and index--key.
-  ///
-  /// \param table_name The name of the table from which data is to be deleted.
-  /// \param key The key that will be deleted from the table.
-  /// \param index_key The index key of the given key.
-  /// \param callback Callback that will be called after delete finishes.
-  /// \return Status
-  virtual Status AsyncDeleteWithIndex(const std::string &table_name,
-                                      const std::string &key,
-                                      const std::string &index_key,
-                                      const StatusCallback &callback) = 0;
+  virtual Status AsyncDelete(const std::string &table_name,
+                             const std::string &key,
+                             Postable<void(bool)> callback) = 0;
 
   /// Batch delete data from the given table asynchronously.
   ///
   /// \param table_name The name of the table from which data is to be deleted.
   /// \param keys The keys that will be deleted from the table.
-  /// \param callback Callback that will be called after delete finishes.
+  /// \param callback returns the number of deleted entries.
   /// \return Status
   virtual Status AsyncBatchDelete(const std::string &table_name,
                                   const std::vector<std::string> &keys,
-                                  const StatusCallback &callback) = 0;
+                                  Postable<void(int64_t)> callback) = 0;
 
-  /// Batch delete data from the given table asynchronously, this can delete all
-  /// key--value data and index--key data.
+  /// Get next job id by `INCR` "JobCounter" key asynchronously.
   ///
-  /// \param table_name The name of the table from which data is to be deleted.
-  /// \param keys The keys that will be deleted from the table.
-  /// \param index_keys The index keys of the given keys, they are in one-to-one
-  ///                   correspondence
-  /// \param callback Callback that will be called after delete finishes.
+  /// \param callback returns the next job id in integer representation.
   /// \return Status
-  virtual Status AsyncBatchDeleteWithIndex(const std::string &table_name,
-                                           const std::vector<std::string> &keys,
-                                           const std::vector<std::string> &index_keys,
-                                           const StatusCallback &callback) = 0;
+  virtual Status AsyncGetNextJobID(Postable<void(int)> callback) = 0;
 
-  /// Delete by index from the given table asynchronously.
+  /// Get all the keys match the prefix from the given table asynchronously.
   ///
-  /// \param table_name The name of the table from which data is to be deleted.
-  /// \param index_key The secondary key that will be used to delete the indexed data.
-  /// from the table.
-  /// \param callback Callback that will be called after delete finishes.
+  /// \param table_name The name of the table to be read.
+  /// \param prefix The prefix to be scaned.
+  /// \param callback returns all matching keys in a vector.
   /// \return Status
-  virtual Status AsyncDeleteByIndex(const std::string &table_name,
-                                    const std::string &index_key,
-                                    const StatusCallback &callback) = 0;
+  virtual Status AsyncGetKeys(const std::string &table_name,
+                              const std::string &prefix,
+                              Postable<void(std::vector<std::string>)> callback) = 0;
 
-  /// Get next job id by `INCR` "JobCounter" key synchronously.
+  /// Check whether the key exists in the table.
   ///
-  /// \return Next job id in integer representation.
-  virtual int GetNextJobID() = 0;
+  /// \param table_name The name of the table to be read.
+  /// \param key The key to be checked.
+  /// \param callback Returns true if such key exists.
+  virtual Status AsyncExists(const std::string &table_name,
+                             const std::string &key,
+                             Postable<void(bool)> callback) = 0;
 
  protected:
   StoreClient() = default;

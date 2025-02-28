@@ -1,4 +1,4 @@
-from gym.spaces import Box, Discrete, MultiDiscrete
+from gymnasium.spaces import Box, Discrete, MultiDiscrete
 import numpy as np
 import tree  # pip install dm_tree
 
@@ -8,7 +8,7 @@ from ray.rllib.models.tf.misc import normc_initializer
 from ray.rllib.models.tf.tf_modelv2 import TFModelV2
 from ray.rllib.models.utils import get_filter_config
 from ray.rllib.policy.sample_batch import SampleBatch
-from ray.rllib.utils.annotations import override
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.framework import try_import_tf
 from ray.rllib.utils.spaces.space_utils import flatten_space
 from ray.rllib.utils.tf_utils import one_hot
@@ -17,6 +17,7 @@ tf1, tf, tfv = try_import_tf()
 
 
 # __sphinx_doc_begin__
+@OldAPIStack
 class ComplexInputNetwork(TFModelV2):
     """TFModelV2 concat'ing CNN outputs to flat input(s), followed by FC(s).
 
@@ -32,6 +33,7 @@ class ComplexInputNetwork(TFModelV2):
     """
 
     def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+
         self.original_space = (
             obs_space.original_space
             if hasattr(obs_space, "original_space")
@@ -57,11 +59,11 @@ class ComplexInputNetwork(TFModelV2):
         concat_size = 0
         for i, component in enumerate(self.flattened_input_space):
             # Image space.
-            if len(component.shape) == 3:
+            if len(component.shape) == 3 and isinstance(component, Box):
                 config = {
                     "conv_filters": model_config["conv_filters"]
                     if "conv_filters" in model_config
-                    else get_filter_config(obs_space.shape),
+                    else get_filter_config(component.shape),
                     "conv_activation": model_config.get("conv_activation"),
                     "post_fcnet_hiddens": [],
                 }
@@ -73,13 +75,13 @@ class ComplexInputNetwork(TFModelV2):
                     framework="tf",
                     name="cnn_{}".format(i),
                 )
-                concat_size += self.cnns[i].num_outputs
+                concat_size += int(self.cnns[i].num_outputs)
             # Discrete|MultiDiscrete inputs -> One-hot encode.
             elif isinstance(component, (Discrete, MultiDiscrete)):
                 if isinstance(component, Discrete):
                     size = component.n
                 else:
-                    size = sum(component.nvec)
+                    size = np.sum(component.nvec)
                 config = {
                     "fcnet_hiddens": model_config["fcnet_hiddens"],
                     "fcnet_activation": model_config.get("fcnet_activation"),
@@ -93,10 +95,10 @@ class ComplexInputNetwork(TFModelV2):
                     framework="tf",
                     name="one_hot_{}".format(i),
                 )
-                concat_size += self.one_hot[i].num_outputs
+                concat_size += int(self.one_hot[i].num_outputs)
             # Everything else (1D Box).
             else:
-                size = int(np.product(component.shape))
+                size = int(np.prod(component.shape))
                 config = {
                     "fcnet_hiddens": model_config["fcnet_hiddens"],
                     "fcnet_activation": model_config.get("fcnet_activation"),
@@ -111,7 +113,7 @@ class ComplexInputNetwork(TFModelV2):
                     name="flatten_{}".format(i),
                 )
                 self.flatten_dims[i] = size
-                concat_size += self.flatten[i].num_outputs
+                concat_size += int(self.flatten[i].num_outputs)
 
         # Optional post-concat FC-stack.
         post_fc_stack_config = {

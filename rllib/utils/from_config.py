@@ -6,9 +6,11 @@ import os
 import re
 import yaml
 
+from ray.rllib.utils.annotations import DeveloperAPI
 from ray.rllib.utils import force_list, merge_dicts
 
 
+@DeveloperAPI
 def from_config(cls, config=None, **kwargs):
     """Uses the given config to create an object.
 
@@ -36,12 +38,12 @@ def from_config(cls, config=None, **kwargs):
         module+class (e.g. "ray.rllib. [...] .[some class name]")
 
     Args:
-        cls (class): The class to build an instance for (from `config`).
+        cls: The class to build an instance for (from `config`).
         config (Optional[dict, str]): The config dict or type-string or
             filename.
 
     Keyword Args:
-        kwargs (any): Optional possibility to pass the constructor arguments in
+        kwargs: Optional possibility to pass the constructor arguments in
             here and use `config` as the type-only info. Then we can call
             this like: from_config([type]?, [**kwargs for constructor])
             If `config` is already a dict, then `kwargs` will be merged
@@ -117,7 +119,7 @@ def from_config(cls, config=None, **kwargs):
             constructor = cls
     # Try the __type_registry__ of this class.
     else:
-        constructor = lookup_type(cls, type_)
+        constructor = _lookup_type(cls, type_)
 
         # Found in cls.__type_registry__.
         if constructor is not None:
@@ -208,12 +210,13 @@ def from_config(cls, config=None, **kwargs):
     return object_
 
 
+@DeveloperAPI
 def from_file(cls, filename, *args, **kwargs):
     """
     Create object from config saved in filename. Expects json or yaml file.
 
     Args:
-        filename (str): File containing the config (json or yaml).
+        filename: File containing the config (json or yaml).
 
     Returns:
         any: The object generated from the file.
@@ -233,7 +236,7 @@ def from_file(cls, filename, *args, **kwargs):
     return from_config(cls, config=config, **kwargs)
 
 
-def lookup_type(cls, type_):
+def _lookup_type(cls, type_):
     if (
         cls is not None
         and hasattr(cls, "__type_registry__")
@@ -253,3 +256,70 @@ def lookup_type(cls, type_):
             ]
         return available_class_for_type
     return None
+
+
+class _NotProvided:
+    """Singleton class to provide a "not provided" value for AlgorithmConfig signatures.
+
+    Using the only instance of this class indicates that the user does NOT wish to
+    change the value of some property.
+
+    .. testcode::
+        :skipif: True
+
+        from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
+        config = AlgorithmConfig()
+        # Print out the default learning rate.
+        print(config.lr)
+
+    .. testoutput::
+
+        0.001
+
+    .. testcode::
+        :skipif: True
+
+        # Print out the default `preprocessor_pref`.
+        print(config.preprocessor_pref)
+
+    .. testoutput::
+
+        "deepmind"
+
+    .. testcode::
+        :skipif: True
+
+        # Will only set the `preprocessor_pref` property (to None) and leave
+        # all other properties at their default values.
+        config.training(preprocessor_pref=None)
+        config.preprocessor_pref is None
+
+    .. testoutput::
+
+        True
+
+    .. testcode::
+        :skipif: True
+
+        # Still the same value (didn't touch it in the call to `.training()`.
+        print(config.lr)
+
+    .. testoutput::
+
+        0.001
+    """
+
+    class __NotProvided:
+        pass
+
+    instance = None
+
+    def __init__(self):
+        if _NotProvided.instance is None:
+            _NotProvided.instance = _NotProvided.__NotProvided()
+
+
+# Use this object as default values in all method signatures of
+# AlgorithmConfig, indicating that the respective property should NOT be touched
+# in the call.
+NotProvided = _NotProvided()

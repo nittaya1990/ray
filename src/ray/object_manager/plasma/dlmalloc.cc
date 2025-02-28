@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "ray/object_manager/plasma/malloc.h"
-
 #include <assert.h>
+
 #include <cerrno>
+
+#include "ray/object_manager/plasma/malloc.h"
 
 #ifdef __linux__
 #ifndef _GNU_SOURCE
@@ -119,9 +120,12 @@ DLMallocConfig dlmalloc_config;
 
 #ifdef _WIN32
 void create_and_mmap_buffer(int64_t size, void **pointer, HANDLE *handle) {
-  *handle = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+  *handle = CreateFileMapping(INVALID_HANDLE_VALUE,
+                              NULL,
+                              PAGE_READWRITE,
                               (DWORD)((uint64_t)size >> (CHAR_BIT * sizeof(DWORD))),
-                              (DWORD)(uint64_t)size, NULL);
+                              (DWORD)(uint64_t)size,
+                              NULL);
   RAY_CHECK(*handle != nullptr)
       << "CreateFileMapping() failed. GetLastError() = " << GetLastError();
   *pointer = MapViewOfFile(*handle, FILE_MAP_ALL_ACCESS, 0, 0, (size_t)size);
@@ -215,6 +219,21 @@ void create_and_mmap_buffer(int64_t size, void **pointer, int *fd) {
     initial_region_ptr = static_cast<char *>(*pointer);
     initial_region_size = size;
   }
+
+#ifdef __linux__
+  if (RayConfig::instance().raylet_core_dump_exclude_plasma_store()) {
+    int rval = madvise(initial_region_ptr, initial_region_size, MADV_DONTDUMP);
+    if (rval) {
+      RAY_LOG(WARNING) << "madvise(MADV_DONTDUMP) call failed: " << rval << ", "
+                       << strerror(errno);
+    } else {
+      RAY_LOG(DEBUG) << "madvise(MADV_DONTDUMP) call succeeded.";
+    }
+  } else {
+    RAY_LOG(DEBUG) << "worker_core_dump_exclude_plasma_store disabled, raylet coredumps "
+                      "will contain the object store mappings.";
+  }
+#endif /* __linux__ */
 }
 
 #endif
@@ -297,7 +316,8 @@ bool IsOutsideInitialAllocation(void *p) {
 }
 
 void SetDLMallocConfig(const std::string &plasma_directory,
-                       const std::string &fallback_directory, bool hugepage_enabled,
+                       const std::string &fallback_directory,
+                       bool hugepage_enabled,
                        bool fallback_enabled) {
   dlmalloc_config.hugepages_enabled = hugepage_enabled;
   dlmalloc_config.directory = plasma_directory;

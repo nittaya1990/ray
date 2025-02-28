@@ -7,7 +7,7 @@ import threading
 import time
 
 from ray._private.test_utils import monitor_memory_usage
-from ray.data.impl.progress_bar import ProgressBar
+from ray.data._internal.progress_bar import ProgressBar
 
 from collections import namedtuple
 from queue import Queue
@@ -64,7 +64,7 @@ class PiCalculator:
             with self.lock:
                 if not self.result_queue.empty():
                     result = self.result_queue.get(block=False)
-                time.sleep(1)
+            time.sleep(1)
         return result
 
 
@@ -135,7 +135,7 @@ def main():
             # Get the metadata.
             ray.get([actor.get_metadata.remote() for actor in actors])
             # Get the result.
-            pb = ProgressBar("Computing Pi", num_cpus)
+            pb = ProgressBar("Computing Pi", num_cpus, "actor")
             results = [actor.get_pi.remote() for actor in actors]
             pb.fetch_until_complete(results)
             pb.close()

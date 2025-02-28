@@ -17,22 +17,40 @@ namespace gcs {
 
 class MockGcsWorkerManager : public GcsWorkerManager {
  public:
-  MOCK_METHOD(void, HandleReportWorkerFailure,
-              (const rpc::ReportWorkerFailureRequest &request,
+  MOCK_METHOD(void,
+              HandleReportWorkerFailure,
+              (rpc::ReportWorkerFailureRequest request,
                rpc::ReportWorkerFailureReply *reply,
                rpc::SendReplyCallback send_reply_callback),
               (override));
-  MOCK_METHOD(void, HandleGetWorkerInfo,
-              (const rpc::GetWorkerInfoRequest &request, rpc::GetWorkerInfoReply *reply,
+  MOCK_METHOD(void,
+              HandleGetWorkerInfo,
+              (rpc::GetWorkerInfoRequest request,
+               rpc::GetWorkerInfoReply *reply,
                rpc::SendReplyCallback send_reply_callback),
               (override));
-  MOCK_METHOD(void, HandleGetAllWorkerInfo,
-              (const rpc::GetAllWorkerInfoRequest &request,
+  MOCK_METHOD(void,
+              HandleGetAllWorkerInfo,
+              (rpc::GetAllWorkerInfoRequest request,
                rpc::GetAllWorkerInfoReply *reply,
                rpc::SendReplyCallback send_reply_callback),
               (override));
-  MOCK_METHOD(void, HandleAddWorkerInfo,
-              (const rpc::AddWorkerInfoRequest &request, rpc::AddWorkerInfoReply *reply,
+  MOCK_METHOD(void,
+              HandleAddWorkerInfo,
+              (rpc::AddWorkerInfoRequest request,
+               rpc::AddWorkerInfoReply *reply,
+               rpc::SendReplyCallback send_reply_callback),
+              (override));
+  MOCK_METHOD(void,
+              HandleUpdateWorkerDebuggerPort,
+              (rpc::UpdateWorkerDebuggerPortRequest request,
+               rpc::UpdateWorkerDebuggerPortReply *reply,
+               rpc::SendReplyCallback send_reply_callback),
+              (override));
+  MOCK_METHOD(void,
+              HandleUpdateWorkerNumPausedThreads,
+              (rpc::UpdateWorkerNumPausedThreadsRequest request,
+               rpc::UpdateWorkerNumPausedThreadsReply *reply,
                rpc::SendReplyCallback send_reply_callback),
               (override));
 };

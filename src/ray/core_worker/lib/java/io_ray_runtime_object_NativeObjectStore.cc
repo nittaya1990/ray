@@ -22,8 +22,11 @@
 #include "ray/core_worker/core_worker.h"
 #include "ray/gcs/gcs_client/global_state_accessor.h"
 
-Status PutSerializedObject(JNIEnv *env, jobject obj, ObjectID object_id,
-                           ObjectID *out_object_id, bool pin_object = true,
+Status PutSerializedObject(JNIEnv *env,
+                           jobject obj,
+                           ObjectID object_id,
+                           ObjectID *out_object_id,
+                           bool pin_object = true,
                            const std::unique_ptr<rpc::Address> &owner_address = nullptr) {
   auto native_ray_object = JavaNativeRayObjectToNativeRayObject(env, obj);
   RAY_CHECK(native_ray_object != nullptr);
@@ -39,13 +42,21 @@ Status PutSerializedObject(JNIEnv *env, jobject obj, ObjectID object_id,
       nested_ids.push_back(ObjectID::FromBinary(ref.object_id()));
     }
     status = CoreWorkerProcess::GetCoreWorker().CreateOwnedAndIncrementLocalRef(
-        native_ray_object->GetMetadata(), data_size, nested_ids, out_object_id, &data,
+        /*is_experimental_mutable_object=*/false,
+        native_ray_object->GetMetadata(),
+        data_size,
+        nested_ids,
+        out_object_id,
+        &data,
         /*created_by_worker=*/true,
         /*owner_address=*/owner_address);
   } else {
     status = CoreWorkerProcess::GetCoreWorker().CreateExisting(
-        native_ray_object->GetMetadata(), data_size, object_id,
-        CoreWorkerProcess::GetCoreWorker().GetRpcAddress(), &data,
+        native_ray_object->GetMetadata(),
+        data_size,
+        object_id,
+        CoreWorkerProcess::GetCoreWorker().GetRpcAddress(),
+        &data,
         /*created_by_worker=*/true);
     *out_object_id = object_id;
   }
@@ -64,7 +75,10 @@ Status PutSerializedObject(JNIEnv *env, jobject obj, ObjectID object_id,
           *out_object_id, pin_object, owner_address));
     } else {
       RAY_CHECK_OK(CoreWorkerProcess::GetCoreWorker().SealExisting(
-          *out_object_id, /* pin_object = */ false, owner_address));
+          *out_object_id,
+          /* pin_object = */ false,
+          /* generator_id = */ ObjectID::Nil(),
+          owner_address));
     }
   }
   return Status::OK();
@@ -84,8 +98,11 @@ Java_io_ray_runtime_object_NativeObjectStore_nativePut__Lio_ray_runtime_object_N
     owner_address->ParseFromString(
         JavaByteArrayToNativeString(env, serialized_owner_actor_address_bytes));
   }
-  auto status = PutSerializedObject(env, obj, /*object_id=*/ObjectID::Nil(),
-                                    /*out_object_id=*/&object_id, /*pin_object=*/true,
+  auto status = PutSerializedObject(env,
+                                    obj,
+                                    /*object_id=*/ObjectID::Nil(),
+                                    /*out_object_id=*/&object_id,
+                                    /*pin_object=*/true,
                                     /*owner_address=*/owner_address);
   THROW_EXCEPTION_AND_RETURN_IF_NOT_OK(env, status, nullptr);
   return IdToJavaByteArray<ObjectID>(env, object_id);
@@ -96,9 +113,11 @@ Java_io_ray_runtime_object_NativeObjectStore_nativePut___3BLio_ray_runtime_objec
     JNIEnv *env, jclass, jbyteArray objectId, jobject obj) {
   auto object_id = JavaByteArrayToId<ObjectID>(env, objectId);
   ObjectID dummy_object_id;
-  auto status =
-      PutSerializedObject(env, obj, object_id,
-                          /*out_object_id=*/&dummy_object_id, /*pin_object=*/true);
+  auto status = PutSerializedObject(env,
+                                    obj,
+                                    object_id,
+                                    /*out_object_id=*/&dummy_object_id,
+                                    /*pin_object=*/true);
   THROW_EXCEPTION_AND_RETURN_IF_NOT_OK(env, status, (void)0);
 }
 
@@ -110,15 +129,19 @@ JNIEXPORT jobject JNICALL Java_io_ray_runtime_object_NativeObjectStore_nativeGet
   });
   std::vector<std::shared_ptr<RayObject>> results;
   auto status =
-      CoreWorkerProcess::GetCoreWorker().Get(object_ids, (int64_t)timeoutMs, &results);
+      CoreWorkerProcess::GetCoreWorker().Get(object_ids, (int64_t)timeoutMs, results);
   THROW_EXCEPTION_AND_RETURN_IF_NOT_OK(env, status, nullptr);
   return NativeVectorToJavaList<std::shared_ptr<RayObject>>(
       env, results, NativeRayObjectToJavaNativeRayObject);
 }
 
-JNIEXPORT jobject JNICALL Java_io_ray_runtime_object_NativeObjectStore_nativeWait(
-    JNIEnv *env, jclass, jobject objectIds, jint numObjects, jlong timeoutMs,
-    jboolean fetch_local) {
+JNIEXPORT jobject JNICALL
+Java_io_ray_runtime_object_NativeObjectStore_nativeWait(JNIEnv *env,
+                                                        jclass,
+                                                        jobject objectIds,
+                                                        jint numObjects,
+                                                        jlong timeoutMs,
+                                                        jboolean fetch_local) {
   std::vector<ObjectID> object_ids;
   JavaListToNativeVector<ObjectID>(
       env, objectIds, &object_ids, [](JNIEnv *env, jobject id) {
@@ -149,23 +172,21 @@ JNIEXPORT void JNICALL Java_io_ray_runtime_object_NativeObjectStore_nativeDelete
 
 JNIEXPORT void JNICALL
 Java_io_ray_runtime_object_NativeObjectStore_nativeAddLocalReference(
-    JNIEnv *env, jclass, jbyteArray workerId, jbyteArray objectId) {
-  auto worker_id = JavaByteArrayToId<WorkerID>(env, workerId);
+    JNIEnv *env, jclass, jbyteArray objectId) {
   auto object_id = JavaByteArrayToId<ObjectID>(env, objectId);
-  auto core_worker = CoreWorkerProcess::TryGetWorker(worker_id);
+  auto core_worker = CoreWorkerProcess::TryGetWorker();
   RAY_CHECK(core_worker);
   core_worker->AddLocalReference(object_id);
 }
 
 JNIEXPORT void JNICALL
 Java_io_ray_runtime_object_NativeObjectStore_nativeRemoveLocalReference(
-    JNIEnv *env, jclass, jbyteArray workerId, jbyteArray objectId) {
-  auto worker_id = JavaByteArrayToId<WorkerID>(env, workerId);
+    JNIEnv *env, jclass, jbyteArray objectId) {
   auto object_id = JavaByteArrayToId<ObjectID>(env, objectId);
   // We can't control the timing of Java GC, so it's normal that this method is called but
   // core worker is shutting down (or already shut down). If we can't get a core worker
   // instance here, skip calling the `RemoveLocalReference` method.
-  auto core_worker = CoreWorkerProcess::TryGetWorker(worker_id);
+  auto core_worker = CoreWorkerProcess::TryGetWorker();
   if (core_worker) {
     core_worker->RemoveLocalReference(object_id);
   }
@@ -176,7 +197,8 @@ Java_io_ray_runtime_object_NativeObjectStore_nativeGetAllReferenceCounts(JNIEnv 
                                                                          jclass) {
   auto reference_counts = CoreWorkerProcess::GetCoreWorker().GetAllReferenceCounts();
   return NativeMapToJavaMap<ObjectID, std::pair<size_t, size_t>>(
-      env, reference_counts,
+      env,
+      reference_counts,
       [](JNIEnv *env, const ObjectID &key) {
         return IdToJavaByteArray<ObjectID>(env, key);
       },
@@ -191,22 +213,25 @@ Java_io_ray_runtime_object_NativeObjectStore_nativeGetAllReferenceCounts(JNIEnv 
 }
 
 JNIEXPORT jbyteArray JNICALL
-Java_io_ray_runtime_object_NativeObjectStore_nativeGetOwnerAddress(JNIEnv *env, jclass,
+Java_io_ray_runtime_object_NativeObjectStore_nativeGetOwnerAddress(JNIEnv *env,
+                                                                   jclass,
                                                                    jbyteArray objectId) {
   auto object_id = JavaByteArrayToId<ObjectID>(env, objectId);
-  const auto &rpc_address = CoreWorkerProcess::GetCoreWorker().GetOwnerAddress(object_id);
+  const auto &rpc_address =
+      CoreWorkerProcess::GetCoreWorker().GetOwnerAddressOrDie(object_id);
   return NativeStringToJavaByteArray(env, rpc_address.SerializeAsString());
 }
 
 JNIEXPORT jbyteArray JNICALL
-Java_io_ray_runtime_object_NativeObjectStore_nativeGetOwnershipInfo(JNIEnv *env, jclass,
+Java_io_ray_runtime_object_NativeObjectStore_nativeGetOwnershipInfo(JNIEnv *env,
+                                                                    jclass,
                                                                     jbyteArray objectId) {
   auto object_id = JavaByteArrayToId<ObjectID>(env, objectId);
   rpc::Address address;
   // TODO(ekl) send serialized object status to Java land.
   std::string serialized_object_status;
-  CoreWorkerProcess::GetCoreWorker().GetOwnershipInfo(object_id, &address,
-                                                      &serialized_object_status);
+  CoreWorkerProcess::GetCoreWorker().GetOwnershipInfoOrDie(
+      object_id, &address, &serialized_object_status);
   auto address_str = address.SerializeAsString();
   auto arr = NativeStringToJavaByteArray(env, address_str);
   return arr;
@@ -214,7 +239,10 @@ Java_io_ray_runtime_object_NativeObjectStore_nativeGetOwnershipInfo(JNIEnv *env,
 
 JNIEXPORT void JNICALL
 Java_io_ray_runtime_object_NativeObjectStore_nativeRegisterOwnershipInfoAndResolveFuture(
-    JNIEnv *env, jclass, jbyteArray objectId, jbyteArray outerObjectId,
+    JNIEnv *env,
+    jclass,
+    jbyteArray objectId,
+    jbyteArray outerObjectId,
     jbyteArray ownerAddress) {
   auto object_id = JavaByteArrayToId<ObjectID>(env, objectId);
   auto outer_objectId = ObjectID::Nil();

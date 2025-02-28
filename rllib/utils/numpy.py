@@ -1,9 +1,13 @@
-from gym.spaces import Discrete, MultiDiscrete
+from collections import OrderedDict
+from gymnasium.spaces import Discrete, MultiDiscrete
 import numpy as np
 import tree  # pip install dm_tree
+from types import MappingProxyType
 from typing import List, Optional
 
-from ray.rllib.utils.deprecation import DEPRECATED_VALUE, deprecation_warning
+
+from ray.rllib.utils.annotations import PublicAPI
+from ray.rllib.utils.deprecation import Deprecated
 from ray.rllib.utils.framework import try_import_tf, try_import_torch
 from ray.rllib.utils.typing import SpaceStruct, TensorType, TensorStructType, Union
 
@@ -20,6 +24,11 @@ MIN_LOG_NN_OUTPUT = -5
 MAX_LOG_NN_OUTPUT = 2
 
 
+@PublicAPI
+@Deprecated(
+    help="RLlib itself has no use for this anymore.",
+    error=False,
+)
 def aligned_array(size: int, dtype, align: int = 64) -> np.ndarray:
     """Returns an array of a given size that is 64-byte aligned.
 
@@ -49,6 +58,11 @@ def aligned_array(size: int, dtype, align: int = 64) -> np.ndarray:
     return output
 
 
+@PublicAPI
+@Deprecated(
+    help="RLlib itself has no use for this anymore.",
+    error=False,
+)
 def concat_aligned(
     items: List[np.ndarray], time_major: Optional[bool] = None
 ) -> np.ndarray:
@@ -103,9 +117,8 @@ def concat_aligned(
         return np.concatenate(items, axis=1 if time_major else 0)
 
 
-def convert_to_numpy(
-    x: TensorStructType, reduce_type: bool = True, reduce_floats=DEPRECATED_VALUE
-):
+@PublicAPI
+def convert_to_numpy(x: TensorStructType, reduce_type: bool = True) -> TensorStructType:
     """Converts values in `stats` to non-Tensor numpy or python types.
 
     Args:
@@ -119,10 +132,6 @@ def convert_to_numpy(
         A new struct with the same structure as `x`, but with all
         values converted to numpy arrays (on CPU).
     """
-
-    if reduce_floats != DEPRECATED_VALUE:
-        deprecation_warning(old="reduce_floats", new="reduce_types", error=False)
-        reduce_type = reduce_floats
 
     # The mapping function used to numpyize torch/tf Tensors (and move them
     # to the CPU beforehand).
@@ -145,12 +154,12 @@ def convert_to_numpy(
                 ret = ret.astype(np.float32)
             elif np.issubdtype(ret.dtype, int):
                 ret = ret.astype(np.int32)
-            return ret
         return ret
 
     return tree.map_structure(mapping, x)
 
 
+@PublicAPI
 def fc(
     x: np.ndarray,
     weights: np.ndarray,
@@ -192,10 +201,12 @@ def fc(
     return np.matmul(x, weights) + (0.0 if biases is None else biases)
 
 
+@PublicAPI
 def flatten_inputs_to_1d_tensor(
     inputs: TensorStructType,
     spaces_struct: Optional[SpaceStruct] = None,
     time_axis: bool = False,
+    batch_axis: bool = True,
 ) -> TensorType:
     """Flattens arbitrary input structs according to the given spaces struct.
 
@@ -214,36 +225,49 @@ def flatten_inputs_to_1d_tensor(
 
     Args:
         inputs: The inputs to be flattened.
-        spaces_struct: The structure of the spaces that behind the input
+        spaces_struct: The (possibly nested) structure of the spaces that `inputs`
+            belongs to.
         time_axis: Whether all inputs have a time-axis (after the batch axis).
             If True, will keep not only the batch axis (0th), but the time axis
             (1st) as-is and flatten everything from the 2nd axis up.
+        batch_axis: Whether all inputs have a batch axis.
+            If True, will keep that batch axis as-is and flatten everything from the
+            other dims up.
 
     Returns:
         A single 1D tensor resulting from concatenating all
         flattened/one-hot'd input components. Depending on the time_axis flag,
         the shape is (B, n) or (B, T, n).
 
-    Examples:
-        >>> # B=2
-        >>> out = flatten_inputs_to_1d_tensor(
-        ...     {"a": [1, 0], "b": [[[0.0], [0.1]], [1.0], [1.1]]},
-        ...     spaces_struct=dict(a=Discrete(2), b=Box(shape=(2, 1)))
-        ... )
-        >>> print(out)
-        ... [[0.0, 1.0,  0.0, 0.1], [1.0, 0.0,  1.0, 1.1]]  # B=2 n=4
+    .. testcode::
+        :skipif: True
 
-        >>> # B=2; T=2
-        >>> out = flatten_inputs_to_1d_tensor(
-        ...     ([[1, 0], [0, 1]],
-        ...      [[[0.0, 0.1], [1.0, 1.1]], [[2.0, 2.1], [3.0, 3.1]]]),
-        ...     spaces_struct=tuple([Discrete(2), Box(shape=(2, ))]),
-        ...     time_axis=True
-        ... )
-        >>> print(out)
-        ... [[[0.0, 1.0, 0.0, 0.1], [1.0, 0.0, 1.0, 1.1]],
-        ...  [[1.0, 0.0, 2.0, 2.1], [0.0, 1.0, 3.0, 3.1]]]  # B=2 T=2 n=4
+        # B=2
+        from ray.rllib.utils.tf_utils import flatten_inputs_to_1d_tensor
+        from gymnasium.spaces import Discrete, Box
+        out = flatten_inputs_to_1d_tensor(
+            {"a": [1, 0], "b": [[[0.0], [0.1]], [1.0], [1.1]]},
+            spaces_struct=dict(a=Discrete(2), b=Box(shape=(2, 1)))
+        )
+        print(out)
+
+        # B=2; T=2
+        out = flatten_inputs_to_1d_tensor(
+            ([[1, 0], [0, 1]],
+             [[[0.0, 0.1], [1.0, 1.1]], [[2.0, 2.1], [3.0, 3.1]]]),
+            spaces_struct=tuple([Discrete(2), Box(shape=(2, ))]),
+            time_axis=True
+        )
+        print(out)
+
+    .. testoutput::
+
+        [[0.0, 1.0,  0.0, 0.1], [1.0, 0.0,  1.0, 1.1]]  # B=2 n=4
+        [[[0.0, 1.0, 0.0, 0.1], [1.0, 0.0, 1.0, 1.1]],
+        [[1.0, 0.0, 2.0, 2.1], [0.0, 1.0, 3.0, 3.1]]]  # B=2 T=2 n=4
     """
+    # `time_axis` must not be True if `batch_axis` is False.
+    assert not (time_axis and not batch_axis)
 
     flat_inputs = tree.flatten(inputs)
     flat_spaces = (
@@ -256,10 +280,8 @@ def flatten_inputs_to_1d_tensor(
     T = None
     out = []
     for input_, space in zip(flat_inputs, flat_spaces):
-        assert isinstance(input_, np.ndarray)
-
         # Store batch and (if applicable) time dimension.
-        if B is None:
+        if B is None and batch_axis:
             B = input_.shape[0]
             if time_axis:
                 T = input_.shape[1]
@@ -273,31 +295,87 @@ def flatten_inputs_to_1d_tensor(
         elif isinstance(space, MultiDiscrete):
             if time_axis:
                 input_ = np.reshape(input_, [B * T, -1])
-            out.append(
-                np.concatenate(
-                    [
-                        one_hot(input_[:, i], depth=n).astype(np.float32)
-                        for i, n in enumerate(space.nvec)
-                    ],
-                    axis=-1,
+            if batch_axis:
+                out.append(
+                    np.concatenate(
+                        [
+                            one_hot(input_[:, i], depth=n).astype(np.float32)
+                            for i, n in enumerate(space.nvec)
+                        ],
+                        axis=-1,
+                    )
                 )
-            )
+            else:
+                out.append(
+                    np.concatenate(
+                        [
+                            one_hot(input_[i], depth=n).astype(np.float32)
+                            for i, n in enumerate(space.nvec)
+                        ],
+                        axis=-1,
+                    )
+                )
         # Box: Flatten.
         else:
+            # Special case for spaces: Box(.., shape=(), ..)
+            if isinstance(input_, float):
+                input_ = np.array([input_])
+
             if time_axis:
                 input_ = np.reshape(input_, [B * T, -1])
-            else:
+            elif batch_axis:
                 input_ = np.reshape(input_, [B, -1])
+            else:
+                input_ = np.reshape(input_, [-1])
             out.append(input_.astype(np.float32))
 
     merged = np.concatenate(out, axis=-1)
     # Restore the time-dimension, if applicable.
     if time_axis:
         merged = np.reshape(merged, [B, T, -1])
-
     return merged
 
 
+@PublicAPI
+def make_action_immutable(obj):
+    """Flags actions immutable to notify users when trying to change them.
+
+    Can also be used with any tree-like structure containing either
+    dictionaries, numpy arrays or already immutable objects per se.
+    Note, however that `tree.map_structure()` will in general not
+    include the shallow object containing all others and therefore
+    immutability will hold only for all objects contained in it.
+    Use `tree.traverse(fun, action, top_down=False)` to include
+    also the containing object.
+
+    Args:
+        obj: The object to be made immutable.
+
+    Returns:
+        The immutable object.
+
+    .. testcode::
+        :skipif: True
+
+        import tree
+        import numpy as np
+        from ray.rllib.utils.numpy import make_action_immutable
+        arr = np.arange(1,10)
+        d = dict(a = 1, b = (arr, arr))
+        tree.traverse(make_action_immutable, d, top_down=False)
+    """
+    if isinstance(obj, np.ndarray):
+        obj.setflags(write=False)
+        return obj
+    elif isinstance(obj, OrderedDict):
+        return MappingProxyType(dict(obj))
+    elif isinstance(obj, dict):
+        return MappingProxyType(obj)
+    else:
+        return obj
+
+
+@PublicAPI
 def huber_loss(x: np.ndarray, delta: float = 1.0) -> np.ndarray:
     """Reference: https://en.wikipedia.org/wiki/Huber_loss."""
     return np.where(
@@ -305,6 +383,7 @@ def huber_loss(x: np.ndarray, delta: float = 1.0) -> np.ndarray:
     )
 
 
+@PublicAPI
 def l2_loss(x: np.ndarray) -> np.ndarray:
     """Computes half the L2 norm of a tensor (w/o the sqrt): sum(x**2) / 2.
 
@@ -317,6 +396,7 @@ def l2_loss(x: np.ndarray) -> np.ndarray:
     return np.sum(np.square(x)) / 2.0
 
 
+@PublicAPI
 def lstm(
     x,
     weights: np.ndarray,
@@ -386,11 +466,13 @@ def lstm(
     return unrolled_outputs, (c_states, h_states)
 
 
+@PublicAPI
 def one_hot(
     x: Union[TensorType, int],
     depth: int = 0,
     on_value: float = 1.0,
     off_value: float = 0.0,
+    dtype: type = np.float32,
 ) -> np.ndarray:
     """One-hot utility function for numpy.
 
@@ -416,7 +498,7 @@ def one_hot(
 
     # Handle bool arrays correctly.
     if x.dtype == np.bool_:
-        x = x.astype(np.int)
+        x = x.astype(np.int_)
         depth = 2
 
     # If depth is not given, try to infer it from the values in the array.
@@ -429,10 +511,7 @@ def one_hot(
     )
     shape = x.shape
 
-    # Python 2.7 compatibility, (*shape, depth) is not allowed.
-    shape_list = list(shape[:])
-    shape_list.append(depth)
-    out = np.ones(shape_list) * off_value
+    out = np.ones(shape=(*shape, depth)) * off_value
     indices = []
     for i in range(x.ndim):
         tiles = [1] * x.ndim
@@ -445,9 +524,26 @@ def one_hot(
         indices.append(r)
     indices.append(x)
     out[tuple(indices)] = on_value
-    return out
+    return out.astype(dtype)
 
 
+@PublicAPI
+def one_hot_multidiscrete(x, depths=List[int]):
+    # Handle torch arrays properly.
+    if torch and isinstance(x, torch.Tensor):
+        x = x.numpy()
+
+    shape = x.shape
+    return np.concatenate(
+        [
+            one_hot(x[i] if len(shape) == 1 else x[:, i], depth=n).astype(np.float32)
+            for i, n in enumerate(depths)
+        ],
+        axis=-1,
+    )
+
+
+@PublicAPI
 def relu(x: np.ndarray, alpha: float = 0.0) -> np.ndarray:
     """Implementation of the leaky ReLU function.
 
@@ -463,6 +559,7 @@ def relu(x: np.ndarray, alpha: float = 0.0) -> np.ndarray:
     return np.maximum(x, x * alpha, x)
 
 
+@PublicAPI
 def sigmoid(x: np.ndarray, derivative: bool = False) -> np.ndarray:
     """
     Returns the sigmoid function applied to x.
@@ -482,6 +579,7 @@ def sigmoid(x: np.ndarray, derivative: bool = False) -> np.ndarray:
         return 1 / (1 + np.exp(-x))
 
 
+@PublicAPI
 def softmax(
     x: Union[np.ndarray, list], axis: int = -1, epsilon: Optional[float] = None
 ) -> np.ndarray:

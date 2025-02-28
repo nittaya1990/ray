@@ -14,7 +14,12 @@
 
 #include "ray/core_worker/core_worker.h"
 #include "ray/stats/stats.h"
+#include "ray/util/compat.h"
+#include "ray/util/env.h"
 #include "ray/util/event.h"
+#include "ray/util/process.h"
+#include "ray/util/stream_redirection_options.h"
+#include "ray/util/stream_redirection_utils.h"
 #include "ray/util/util.h"
 
 namespace ray {
@@ -23,12 +28,42 @@ namespace {
 
 std::unique_ptr<CoreWorkerProcessImpl> core_worker_process;
 
+// Get out and error filepath for worker.
+// It's worth noticing that filepath format should be kept in sync with function
+// `get_worker_log_file_name` under file
+// "ray/python/ray/_private/ray_logging/__init__.py".
+std::string GetWorkerOutputFilepath(WorkerType worker_type,
+                                    const JobID &job_id,
+                                    const WorkerID &worker_id,
+                                    const std::string &suffix) {
+  std::string parsed_job_id = "";
+  if (job_id.IsNil()) {
+    char *job_id_env = ::getenv("RAY_JOB_ID");
+    if (job_id_env != nullptr) {
+      parsed_job_id = job_id_env;
+    }
+  }
+  std::string worker_name;
+  if (worker_type == WorkerType::WORKER) {
+    worker_name = "worker";
+  } else {
+    parsed_job_id = "";
+    worker_name = "io_worker";
+  }
+
+  if (!parsed_job_id.empty()) {
+    return absl::StrFormat(
+        "%s-%s-%s-%d.%s", worker_name, worker_id.Hex(), parsed_job_id, GetPID(), suffix);
+  }
+  return absl::StrFormat("%s-%s-%d.%s", worker_name, worker_id.Hex(), GetPID(), suffix);
+}
+
 }  // namespace
 
 void CoreWorkerProcess::Initialize(const CoreWorkerOptions &options) {
   RAY_CHECK(!core_worker_process)
       << "The process is already initialized for core worker.";
-  core_worker_process.reset(new CoreWorkerProcessImpl(options));
+  core_worker_process = std::make_unique<CoreWorkerProcessImpl>(options);
 
 #ifndef _WIN32
   // NOTE(kfstorm): std::atexit should be put at the end of `CoreWorkerProcess`
@@ -57,12 +92,7 @@ void CoreWorkerProcess::HandleAtExit() { core_worker_process.reset(); }
 
 CoreWorker &CoreWorkerProcess::GetCoreWorker() {
   EnsureInitialized(/*quick_exit*/ true);
-  return core_worker_process->GetCoreWorkerForCurrentThread();
-}
-
-void CoreWorkerProcess::SetCurrentThreadWorkerId(const WorkerID &worker_id) {
-  EnsureInitialized(/*quick_exit*/ false);
-  core_worker_process->SetThreadLocalWorkerById(worker_id);
+  return *core_worker_process->GetCoreWorker();
 }
 
 void CoreWorkerProcess::RunTaskExecutionLoop() {
@@ -71,29 +101,71 @@ void CoreWorkerProcess::RunTaskExecutionLoop() {
   core_worker_process.reset();
 }
 
-std::shared_ptr<CoreWorker> CoreWorkerProcess::TryGetWorker(const WorkerID &worker_id) {
+std::shared_ptr<CoreWorker> CoreWorkerProcess::TryGetWorker() {
   if (!core_worker_process) {
     return nullptr;
   }
-  return core_worker_process->GetWorker(worker_id);
+  return core_worker_process->TryGetCoreWorker();
 }
-
-thread_local std::weak_ptr<CoreWorker> CoreWorkerProcessImpl::thread_local_core_worker_;
 
 CoreWorkerProcessImpl::CoreWorkerProcessImpl(const CoreWorkerOptions &options)
     : options_(options),
-      global_worker_id_(
-          options.worker_type == WorkerType::DRIVER
-              ? ComputeDriverIdFromJob(options_.job_id)
-              : (options_.num_workers == 1 ? WorkerID::FromRandom() : WorkerID::Nil())) {
+      worker_id_(options.worker_type == WorkerType::DRIVER
+                     ? ComputeDriverIdFromJob(options_.job_id)
+                     : WorkerID::FromRandom()) {
   if (options_.enable_logging) {
-    std::stringstream app_name;
-    app_name << LanguageString(options_.language) << "-core-"
-             << WorkerTypeString(options_.worker_type);
-    if (!global_worker_id_.IsNil()) {
-      app_name << "-" << global_worker_id_;
+    // Setup logging for worker system logging.
+    {
+      std::stringstream app_name_ss;
+      app_name_ss << LanguageString(options_.language) << "-core-"
+                  << WorkerTypeString(options_.worker_type);
+      if (!worker_id_.IsNil()) {
+        app_name_ss << "-" << worker_id_;
+      }
+      const std::string app_name = app_name_ss.str();
+      const std::string log_filepath =
+          RayLog::GetLogFilepathFromDirectory(options_.log_dir, /*app_name=*/app_name);
+      RayLog::StartRayLog(app_name,
+                          RayLogLevel::INFO,
+                          log_filepath,
+                          /*err_log_filepath=*/"",
+                          ray::RayLog::GetRayLogRotationMaxBytesOrDefault(),
+                          ray::RayLog::GetRayLogRotationBackupCountOrDefault());
     }
-    RayLog::StartRayLog(app_name.str(), RayLogLevel::INFO, options_.log_dir);
+
+    // Setup logging for worker application logging.
+    if (options_.worker_type != WorkerType::DRIVER && !IsEnvTrue("RAY_LOG_TO_STDERR")) {
+      // Setup redirection for stdout.
+      {
+        const std::string fname = GetWorkerOutputFilepath(
+            options_.worker_type, options_.job_id, worker_id_, /*suffix=*/"out");
+        const std::string worker_output_filepath = JoinPaths(options_.log_dir, fname);
+
+        ray::StreamRedirectionOption stdout_redirection_options;
+        stdout_redirection_options.file_path = worker_output_filepath;
+        stdout_redirection_options.rotation_max_size =
+            ray::RayLog::GetRayLogRotationMaxBytesOrDefault();
+        stdout_redirection_options.rotation_max_file_count =
+            ray::RayLog::GetRayLogRotationBackupCountOrDefault();
+        ray::RedirectStdout(stdout_redirection_options);
+      }
+
+      // Setup redirection for stderr.
+      {
+        const std::string fname = GetWorkerOutputFilepath(
+            options_.worker_type, options_.job_id, worker_id_, /*suffix=*/"err");
+        const std::string worker_error_filepath = JoinPaths(options_.log_dir, fname);
+
+        ray::StreamRedirectionOption stderr_redirection_options;
+        stderr_redirection_options.file_path = worker_error_filepath;
+        stderr_redirection_options.rotation_max_size =
+            ray::RayLog::GetRayLogRotationMaxBytesOrDefault();
+        stderr_redirection_options.rotation_max_file_count =
+            ray::RayLog::GetRayLogRotationBackupCountOrDefault();
+        ray::RedirectStderr(stderr_redirection_options);
+      }
+    }
+
     if (options_.install_failure_signal_handler) {
       // Core worker is loaded as a dynamic library from Python or other languages.
       // We are not sure if the default argv[0] would be suitable for loading symbols
@@ -103,6 +175,7 @@ CoreWorkerProcessImpl::CoreWorkerProcessImpl(const CoreWorkerOptions &options)
       // Also, call the previous crash handler, e.g. the one installed by the Python
       // worker.
       RayLog::InstallFailureSignalHandler(nullptr, /*call_previous_handler=*/true);
+      RayLog::InstallTerminateHandler();
     }
   } else {
     RAY_CHECK(options_.log_dir.empty())
@@ -111,47 +184,52 @@ CoreWorkerProcessImpl::CoreWorkerProcessImpl(const CoreWorkerOptions &options)
         << "install_failure_signal_handler must be false because ray log is disabled.";
   }
 
-  RAY_CHECK(options_.num_workers > 0);
-  if (options_.worker_type == WorkerType::DRIVER) {
-    // Driver process can only contain one worker.
-    RAY_CHECK(options_.num_workers == 1);
-  }
-
   RAY_LOG(INFO) << "Constructing CoreWorkerProcess. pid: " << getpid();
 
-  // NOTE(kfstorm): any initialization depending on RayConfig must happen after this line.
+  // NOTE(kfstorm): any initialization depending on RayConfig must happen after this
+  // line.
   InitializeSystemConfig();
-
-  if (ShouldCreateGlobalWorkerOnConstruction()) {
-    CreateWorker();
-  }
 
   // Assume stats module will be initialized exactly once in once process.
   // So it must be called in CoreWorkerProcess constructor and will be reused
   // by all of core worker.
-  RAY_LOG(DEBUG) << "Stats setup in core worker.";
   // Initialize stats in core worker global tags.
   const ray::stats::TagsType global_tags = {
       {ray::stats::ComponentKey, "core_worker"},
+      {ray::stats::WorkerIdKey, worker_id_.Hex()},
       {ray::stats::VersionKey, kRayVersion},
-      {ray::stats::NodeAddressKey, options_.node_ip_address}};
+      {ray::stats::NodeAddressKey, options_.node_ip_address},
+      {ray::stats::SessionNameKey, options_.session_name}};
 
   // NOTE(lingxuan.zlx): We assume RayConfig is initialized before it's used.
   // RayConfig is generated in Java_io_ray_runtime_RayNativeRuntime_nativeInitialize
   // for java worker or in constructor of CoreWorker for python worker.
-  stats::Init(global_tags, options_.metrics_agent_port);
+
+  // We need init stats before using it/spawning threads.
+  stats::Init(global_tags, options_.metrics_agent_port, worker_id_);
+
+  {
+    // Initialize global worker instance.
+    auto worker = std::make_shared<CoreWorker>(options_, worker_id_);
+    auto write_locked = core_worker_.LockForWrite();
+    write_locked.Get() = worker;
+  }
 
   // Initialize event framework.
   if (RayConfig::instance().event_log_reporter_enabled() && !options_.log_dir.empty()) {
-    RayEventInit(ray::rpc::Event_SourceType::Event_SourceType_CORE_WORKER,
-                 std::unordered_map<std::string, std::string>(), options_.log_dir,
-                 RayConfig::instance().event_level());
+    const std::vector<SourceTypeVariant> source_types = {
+        ray::rpc::Event_SourceType::Event_SourceType_CORE_WORKER,
+        ray::rpc::ExportEvent_SourceType::ExportEvent_SourceType_EXPORT_TASK};
+    RayEventInit(source_types,
+                 absl::flat_hash_map<std::string, std::string>(),
+                 options_.log_dir,
+                 RayConfig::instance().event_level(),
+                 RayConfig::instance().emit_event_to_log_file());
   }
 }
 
 CoreWorkerProcessImpl::~CoreWorkerProcessImpl() {
   RAY_LOG(INFO) << "Destructing CoreWorkerProcessImpl. pid: " << getpid();
-  RAY_LOG(DEBUG) << "Stats stop in core worker.";
   // Shutdown stats module if worker process exits.
   stats::Shutdown();
   if (options_.enable_logging) {
@@ -176,9 +254,9 @@ void CoreWorkerProcess::EnsureInitialized(bool quick_exit) {
 }
 
 void CoreWorkerProcessImpl::InitializeSystemConfig() {
-  // We have to create a short-time thread here because the RPC request to get the system
-  // config from Raylet is asynchronous, and we need to synchronously initialize the
-  // system config in the constructor of `CoreWorkerProcessImpl`.
+  // We have to create a short-time thread here because the RPC request to get the
+  // system config from Raylet is asynchronous, and we need to synchronously initialize
+  // the system config in the constructor of `CoreWorkerProcessImpl`.
   std::promise<std::string> promise;
   std::thread thread([&] {
     instrumented_io_context io_service;
@@ -188,7 +266,10 @@ void CoreWorkerProcessImpl::InitializeSystemConfig() {
         options_.raylet_ip_address, options_.node_manager_port, client_call_manager);
     raylet::RayletClient raylet_client(grpc_client);
 
-    std::function<void(int64_t)> get_once = [this, &get_once, &raylet_client, &promise,
+    std::function<void(int64_t)> get_once = [this,
+                                             &get_once,
+                                             &raylet_client,
+                                             &promise,
                                              &io_service](int64_t num_attempts) {
       raylet_client.GetSystemConfig(
           [this, num_attempts, &get_once, &promise, &io_service](
@@ -209,10 +290,12 @@ void CoreWorkerProcessImpl::InitializeSystemConfig() {
             }
 
             // If there's no more attempt to try.
-            if (status.IsGrpcUnavailable()) {
+            if (status.IsRpcError() &&
+                status.rpc_code() == grpc::StatusCode::UNAVAILABLE) {
               std::ostringstream ss;
               ss << "Failed to get the system config from raylet because "
-                 << "it is dead. Worker will terminate. Status: " << status;
+                 << "it is dead. Worker will terminate. Status: " << status
+                 << " .Please see `raylet.out` for more details.";
               if (options_.worker_type == WorkerType::DRIVER) {
                 // If it is the driver, surface the issue to the user.
                 RAY_LOG(ERROR) << ss.str();
@@ -235,144 +318,61 @@ void CoreWorkerProcessImpl::InitializeSystemConfig() {
   thread.join();
 
   RayConfig::instance().initialize(promise.get_future().get());
-}
-
-bool CoreWorkerProcessImpl::ShouldCreateGlobalWorkerOnConstruction() const {
-  // We need to create the worker instance here if:
-  // 1. This is a driver process. In this case, the driver is ready to use right after
-  // the CoreWorkerProcess::Initialize.
-  // 2. This is a Python worker process. In this case, Python will invoke some core
-  // worker APIs before `CoreWorkerProcess::RunTaskExecutionLoop` is called. So we need
-  // to create the worker instance here. One example of invocations is
-  // https://github.com/ray-project/ray/blob/45ce40e5d44801193220d2c546be8de0feeef988/python/ray/worker.py#L1281.
-  return options_.num_workers == 1 && (options_.worker_type == WorkerType::DRIVER ||
-                                       options_.language == Language::PYTHON);
-}
-
-std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::GetWorker(
-    const WorkerID &worker_id) const {
-  absl::ReaderMutexLock lock(&mutex_);
-  auto it = workers_.find(worker_id);
-  if (it != workers_.end()) {
-    return it->second;
-  }
-  return nullptr;
-}
-
-std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::GetGlobalWorker() {
-  absl::ReaderMutexLock lock(&mutex_);
-  return global_worker_;
-}
-
-std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::CreateWorker() {
-  auto worker = std::make_shared<CoreWorker>(
-      options_,
-      global_worker_id_ != WorkerID::Nil() ? global_worker_id_ : WorkerID::FromRandom());
-  RAY_LOG(DEBUG) << "Worker " << worker->GetWorkerID() << " is created.";
-  absl::WriterMutexLock lock(&mutex_);
-  if (options_.num_workers == 1) {
-    global_worker_ = worker;
-  }
-  thread_local_core_worker_ = worker;
-
-  workers_.emplace(worker->GetWorkerID(), worker);
-  RAY_CHECK(workers_.size() <= static_cast<size_t>(options_.num_workers));
-  return worker;
-}
-
-void CoreWorkerProcessImpl::RemoveWorker(std::shared_ptr<CoreWorker> worker) {
-  absl::WriterMutexLock lock(&mutex_);
-  if (global_worker_) {
-    RAY_CHECK(global_worker_ == worker);
-  } else {
-    RAY_CHECK(thread_local_core_worker_.lock() == worker);
-  }
-  thread_local_core_worker_.reset();
-  {
-    workers_.erase(worker->GetWorkerID());
-    RAY_LOG(INFO) << "Removed worker " << worker->GetWorkerID();
-  }
-  if (global_worker_ == worker) {
-    global_worker_ = nullptr;
-  }
+  ray::asio::testing::init();
+  ray::rpc::testing::init();
 }
 
 void CoreWorkerProcessImpl::RunWorkerTaskExecutionLoop() {
   RAY_CHECK(options_.worker_type == WorkerType::WORKER);
-  if (options_.num_workers == 1) {
-    // Run the task loop in the current thread only if the number of workers is 1.
-    auto worker = GetGlobalWorker();
-    if (!worker) {
-      worker = CreateWorker();
-    }
-    worker->RunTaskExecutionLoop();
-    RAY_LOG(INFO) << "Task execution loop terminated. Removing the global worker.";
-    RemoveWorker(worker);
-  } else {
-    std::vector<std::thread> worker_threads;
-    for (int i = 0; i < options_.num_workers; i++) {
-      worker_threads.emplace_back([this, i] {
-        SetThreadName("worker.task" + std::to_string(i));
-        auto worker = CreateWorker();
-        worker->RunTaskExecutionLoop();
-        RAY_LOG(INFO) << "Task execution loop terminated for a thread "
-                      << std::to_string(i) << ". Removing a worker.";
-        RemoveWorker(worker);
-      });
-    }
-    for (auto &thread : worker_threads) {
-      thread.join();
-    }
+  auto core_worker = GetCoreWorker();
+  RAY_CHECK(core_worker != nullptr);
+  core_worker->RunTaskExecutionLoop();
+  RAY_LOG(INFO) << "Task execution loop terminated. Removing the global worker.";
+  {
+    auto write_locked = core_worker_.LockForWrite();
+    write_locked.Get().reset();
   }
 }
 
 void CoreWorkerProcessImpl::ShutdownDriver() {
   RAY_CHECK(options_.worker_type == WorkerType::DRIVER)
       << "The `Shutdown` interface is for driver only.";
-  auto global_worker = GetGlobalWorker();
+  auto global_worker = GetCoreWorker();
   RAY_CHECK(global_worker);
-  global_worker->Disconnect();
+  global_worker->Disconnect(/*exit_type*/ rpc::WorkerExitType::INTENDED_USER_EXIT,
+                            /*exit_detail*/ "Shutdown by ray.shutdown().");
   global_worker->Shutdown();
-  RemoveWorker(global_worker);
+  {
+    auto write_locked = core_worker_.LockForWrite();
+    write_locked.Get().reset();
+  }
 }
 
-CoreWorker &CoreWorkerProcessImpl::GetCoreWorkerForCurrentThread() {
-  if (options_.num_workers == 1) {
-    auto global_worker = GetGlobalWorker();
-    if (ShouldCreateGlobalWorkerOnConstruction() && !global_worker) {
-      // This could only happen when the worker has already been shutdown.
-      // In this case, we should exit without crashing.
-      // TODO (scv119): A better solution could be returning error code
-      // and handling it at language frontend.
-      if (options_.worker_type == WorkerType::DRIVER) {
-        RAY_LOG(ERROR)
-            << "The global worker has already been shutdown. This happens when "
-               "the language frontend accesses the Ray's worker after it is "
-               "shutdown. The process will exit";
-      } else {
-        RAY_LOG(INFO) << "The global worker has already been shutdown. This happens when "
-                         "the language frontend accesses the Ray's worker after it is "
-                         "shutdown. The process will exit";
-      }
-      QuickExit();
+std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::TryGetCoreWorker() const {
+  const auto read_locked = core_worker_.LockForRead();
+  return read_locked.Get();
+}
+
+std::shared_ptr<CoreWorker> CoreWorkerProcessImpl::GetCoreWorker() const {
+  const auto read_locked = core_worker_.LockForRead();
+  if (!read_locked.Get()) {
+    // This could only happen when the worker has already been shutdown.
+    // In this case, we should exit without crashing.
+    // TODO (scv119): A better solution could be returning error code
+    // and handling it at language frontend.
+    if (options_.worker_type == WorkerType::DRIVER) {
+      RAY_LOG(ERROR) << "The core worker has already been shutdown. This happens when "
+                        "the language frontend accesses the Ray's worker after it is "
+                        "shutdown. The process will exit";
+    } else {
+      RAY_LOG(INFO) << "The core worker has already been shutdown. This happens when "
+                       "the language frontend accesses the Ray's worker after it is "
+                       "shutdown. The process will exit";
     }
-    RAY_CHECK(global_worker) << "global_worker_ must not be NULL";
-    return *global_worker;
+    QuickExit();
   }
-  auto ptr = thread_local_core_worker_.lock();
-  RAY_CHECK(ptr != nullptr)
-      << "The current thread is not bound with a core worker instance.";
-  return *ptr;
-}
-
-void CoreWorkerProcessImpl::SetThreadLocalWorkerById(const WorkerID &worker_id) {
-  if (options_.num_workers == 1) {
-    RAY_CHECK(GetGlobalWorker()->GetWorkerID() == worker_id);
-    return;
-  }
-  auto worker = GetWorker(worker_id);
-  RAY_CHECK(worker) << "Worker " << worker_id << " not found.";
-  thread_local_core_worker_ = GetWorker(worker_id);
+  RAY_CHECK(read_locked.Get()) << "core_worker_ must not be NULL";
+  return read_locked.Get();
 }
 
 }  // namespace core

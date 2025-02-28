@@ -1,5 +1,4 @@
 import copy
-from concurrent.futures import ThreadPoolExecutor
 import datetime
 import hashlib
 import json
@@ -7,60 +6,22 @@ import logging
 import os
 import random
 import shutil
-import sys
 import subprocess
+import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import ModuleType
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import click
-import redis
 import yaml
 
-try:  # py3
-    from shlex import quote
-except ImportError:  # py2
-    from pipes import quote
-
 import ray
-from ray.experimental.internal_kv import _internal_kv_put
-import ray._private.services as services
-from ray.autoscaler.node_provider import NodeProvider
-from ray.autoscaler._private.constants import (
-    AUTOSCALER_RESOURCE_REQUEST_CHANNEL,
-    MAX_PARALLEL_SHUTDOWN_WORKERS,
-)
-from ray.autoscaler._private.util import (
-    validate_config,
-    hash_runtime_conf,
-    hash_launch_conf,
-    prepare_config,
-)
-from ray.autoscaler._private.providers import (
-    _get_node_provider,
-    _NODE_PROVIDERS,
-    _PROVIDER_PRETTY_NAMES,
-)
-from ray.autoscaler.tags import (
-    TAG_RAY_NODE_KIND,
-    TAG_RAY_LAUNCH_CONFIG,
-    TAG_RAY_NODE_NAME,
-    NODE_KIND_WORKER,
-    NODE_KIND_HEAD,
-    TAG_RAY_USER_NODE_TYPE,
-    STATUS_UNINITIALIZED,
-    STATUS_UP_TO_DATE,
-    TAG_RAY_NODE_STATUS,
-)
-from ray.autoscaler._private.cli_logger import cli_logger, cf
-from ray.autoscaler._private.updater import NodeUpdaterThread
-from ray.autoscaler._private.command_runner import (
-    set_using_login_shells,
-    set_rsync_silent,
-)
-from ray.autoscaler._private.event_system import CreateClusterEvent, global_event_system
-from ray.autoscaler._private.log_timer import LogTimer
+from ray._private.usage import usage_lib
+from ray.autoscaler._private import subprocess_output_util as cmd_output_util
+from ray.autoscaler._private.autoscaler import AutoscalerSummary
+from ray.autoscaler._private.cli_logger import cf, cli_logger
 from ray.autoscaler._private.cluster_dump import (
     Archive,
     GetParameters,
@@ -70,33 +31,61 @@ from ray.autoscaler._private.cluster_dump import (
     create_archive_for_remote_nodes,
     get_all_local_data,
 )
-
-from ray.worker import global_worker  # type: ignore
+from ray.autoscaler._private.command_runner import (
+    set_rsync_silent,
+    set_using_login_shells,
+)
+from ray.autoscaler._private.constants import (
+    AUTOSCALER_RESOURCE_REQUEST_CHANNEL,
+    MAX_PARALLEL_SHUTDOWN_WORKERS,
+)
+from ray.autoscaler._private.event_system import CreateClusterEvent, global_event_system
+from ray.autoscaler._private.log_timer import LogTimer
+from ray.autoscaler._private.node_provider_availability_tracker import (
+    NodeAvailabilitySummary,
+)
+from ray.autoscaler._private.providers import (
+    _NODE_PROVIDERS,
+    _PROVIDER_PRETTY_NAMES,
+    _get_node_provider,
+)
+from ray.autoscaler._private.updater import NodeUpdaterThread
+from ray.autoscaler._private.util import (
+    LoadMetricsSummary,
+    format_info_string,
+    hash_launch_conf,
+    hash_runtime_conf,
+    prepare_config,
+    validate_config,
+)
+from ray.autoscaler.node_provider import NodeProvider
+from ray.autoscaler.tags import (
+    NODE_KIND_HEAD,
+    NODE_KIND_WORKER,
+    STATUS_UNINITIALIZED,
+    STATUS_UP_TO_DATE,
+    TAG_RAY_LAUNCH_CONFIG,
+    TAG_RAY_NODE_KIND,
+    TAG_RAY_NODE_NAME,
+    TAG_RAY_NODE_STATUS,
+    TAG_RAY_USER_NODE_TYPE,
+)
+from ray.experimental.internal_kv import _internal_kv_put, internal_kv_get_gcs_client
 from ray.util.debug import log_once
 
-from ray.autoscaler._private import subprocess_output_util as cmd_output_util
-from ray.autoscaler._private.util import LoadMetricsSummary
-from ray.autoscaler._private.autoscaler import AutoscalerSummary
-from ray.autoscaler._private.util import format_info_string
+try:  # py3
+    from shlex import quote
+except ImportError:  # py2
+    from pipes import quote
+
 
 logger = logging.getLogger(__name__)
-
-redis_client = None
 
 RUN_ENV_TYPES = ["auto", "host", "docker"]
 
 POLL_INTERVAL = 5
 
 Port_forward = Union[Tuple[int, int], List[Tuple[int, int]]]
-
-
-def _redis() -> redis.StrictRedis:
-    global redis_client
-    if redis_client is None:
-        redis_client = services.create_redis_client(
-            global_worker.node.redis_address, password=global_worker.node.redis_password
-        )
-    return redis_client
 
 
 def try_logging_config(config: Dict[str, Any]) -> None:
@@ -123,25 +112,68 @@ def try_reload_log_state(provider_config: Dict[str, Any], log_state: dict) -> No
         return reload_log_state(log_state)
 
 
-def debug_status(status, error) -> str:
-    """Return a debug string for the autoscaler."""
-    if status:
+def debug_status(
+    status, error, verbose: bool = False, address: Optional[str] = None
+) -> str:
+    """
+    Return a debug string for the autoscaler.
+
+    Args:
+        status: The autoscaler status string for v1
+        error: The autoscaler error string for v1
+        verbose: Whether to print verbose information.
+        address: The address of the cluster (gcs address).
+
+    Returns:
+        str: A debug string for the cluster's status.
+    """
+    from ray.autoscaler.v2.utils import is_autoscaler_v2
+
+    if is_autoscaler_v2():
+        from ray.autoscaler.v2.sdk import get_cluster_status
+        from ray.autoscaler.v2.utils import ClusterStatusFormatter
+
+        cluster_status = get_cluster_status(address)
+        status = ClusterStatusFormatter.format(cluster_status, verbose=verbose)
+    elif status:
         status = status.decode("utf-8")
         status_dict = json.loads(status)
         lm_summary_dict = status_dict.get("load_metrics_report")
         autoscaler_summary_dict = status_dict.get("autoscaler_report")
         timestamp = status_dict.get("time")
+        gcs_request_time = status_dict.get("gcs_request_time")
+        non_terminated_nodes_time = status_dict.get("non_terminated_nodes_time")
         if lm_summary_dict and autoscaler_summary_dict and timestamp:
             lm_summary = LoadMetricsSummary(**lm_summary_dict)
-            autoscaler_summary = AutoscalerSummary(**autoscaler_summary_dict)
+            node_availability_summary_dict = autoscaler_summary_dict.pop(
+                "node_availability_summary", {}
+            )
+            node_availability_summary = NodeAvailabilitySummary.from_fields(
+                **node_availability_summary_dict
+            )
+            autoscaler_summary = AutoscalerSummary(
+                node_availability_summary=node_availability_summary,
+                **autoscaler_summary_dict,
+            )
             report_time = datetime.datetime.fromtimestamp(timestamp)
             status = format_info_string(
-                lm_summary, autoscaler_summary, time=report_time
+                lm_summary,
+                autoscaler_summary,
+                time=report_time,
+                gcs_request_time=gcs_request_time,
+                non_terminated_nodes_time=non_terminated_nodes_time,
+                verbose=verbose,
             )
         else:
-            status = "No cluster status."
+            status = (
+                "No cluster status. It may take a few seconds "
+                "for the Ray internal services to start up."
+            )
     else:
-        status = "No cluster status."
+        status = (
+            "No cluster status. It may take a few seconds "
+            "for the Ray internal services to start up."
+        )
 
     if error:
         status += "\n"
@@ -159,7 +191,7 @@ def request_resources(
     ray.remote calls to ensure that resources rapidly become available.
 
     Args:
-        num_cpus (int): Scale the cluster to ensure this number of CPUs are
+        num_cpus: Scale the cluster to ensure this number of CPUs are
             available. This request is persistent until another call to
             request_resources() is made.
         bundles (List[ResourceDict]): Scale the cluster to ensure this set of
@@ -176,6 +208,14 @@ def request_resources(
     _internal_kv_put(
         AUTOSCALER_RESOURCE_REQUEST_CHANNEL, json.dumps(to_request), overwrite=True
     )
+
+    from ray.autoscaler.v2.utils import is_autoscaler_v2
+
+    if is_autoscaler_v2():
+        from ray.autoscaler.v2.sdk import request_cluster_resources
+
+        gcs_address = internal_kv_get_gcs_client().address
+        request_cluster_resources(gcs_address, to_request)
 
 
 def create_or_update_cluster(
@@ -315,7 +355,7 @@ def _bootstrap_config(
 
             if log_once("_printed_cached_config_warning"):
                 cli_logger.verbose_warning(
-                    "Loaded cached provider configuration " "from " + cf.bold("{}"),
+                    "Loaded cached provider configuration from " + cf.bold("{}"),
                     cache_key,
                 )
                 if cli_logger.verbosity == 0:
@@ -490,7 +530,6 @@ def teardown_cluster(
 
     container_name = config.get("docker", {}).get("container_name")
     if container_name:
-
         # This is to ensure that the parallel SSH calls below do not mess with
         # the users terminal.
         output_redir = cmd_output_util.is_output_redirected()
@@ -565,7 +604,7 @@ def kill_node(
 
     time.sleep(POLL_INTERVAL)
 
-    if config.get("provider", {}).get("use_internal_ips", False) is True:
+    if config.get("provider", {}).get("use_internal_ips", False):
         node_ip = provider.internal_ip(node)
     else:
         node_ip = provider.external_ip(node)
@@ -647,8 +686,10 @@ def get_or_create_head_node(
 
     if not head_node:
         cli_logger.confirm(
-            yes, "No head node found. " "Launching a new cluster.", _abort=True
+            yes, "No head node found. Launching a new cluster.", _abort=True
         )
+        cli_logger.newline()
+        usage_lib.show_usage_stats_prompt(cli=True)
 
     if head_node:
         if restart_only:
@@ -660,14 +701,16 @@ def get_or_create_head_node(
                 cf.bold("--restart-only"),
                 _abort=True,
             )
+            cli_logger.newline()
+            usage_lib.show_usage_stats_prompt(cli=True)
         elif no_restart:
             cli_logger.print(
-                "Cluster Ray runtime will not be restarted due " "to `{}`.",
+                "Cluster Ray runtime will not be restarted due to `{}`.",
                 cf.bold("--no-restart"),
             )
             cli_logger.confirm(
                 yes,
-                "Updating cluster configuration and " "running setup commands.",
+                "Updating cluster configuration and running setup commands.",
                 _abort=True,
             )
         else:
@@ -675,6 +718,8 @@ def get_or_create_head_node(
             cli_logger.confirm(
                 yes, cf.bold("Cluster Ray runtime will be restarted."), _abort=True
             )
+            cli_logger.newline()
+            usage_lib.show_usage_stats_prompt(cli=True)
 
     cli_logger.newline()
     # TODO(ekl) this logic is duplicated in node_launcher.py (keep in sync)
@@ -682,6 +727,7 @@ def get_or_create_head_node(
     # The above `head_node` field is deprecated in favor of per-node-type
     # node_configs. We allow it for backwards-compatibility.
     head_node_resources = None
+    head_node_labels = None
     head_node_type = config.get("head_node_type")
     if head_node_type:
         head_node_tags[TAG_RAY_USER_NODE_TYPE] = head_node_type
@@ -691,6 +737,7 @@ def get_or_create_head_node(
         # Not necessary to keep in sync with node_launcher.py
         # Keep in sync with autoscaler.py _node_resources
         head_node_resources = head_config.get("resources")
+        head_node_labels = head_config.get("labels")
 
     launch_hash = hash_launch_conf(head_node_config, config["auth"])
     creating_new_head = _should_create_new_head(
@@ -721,7 +768,7 @@ def get_or_create_head_node(
                 while True:
                     if time.time() - start > 50:
                         cli_logger.abort(
-                            "Head node fetch timed out. " "Failed to create head node."
+                            "Head node fetch timed out. Failed to create head node."
                         )
                     nodes = provider.non_terminated_nodes(head_node_tags)
                     if len(nodes) == 1:
@@ -738,7 +785,6 @@ def get_or_create_head_node(
         # cf.bold(provider.node_tags(head_node)[TAG_RAY_NODE_NAME]),
         _tags=dict(),
     ):  # add id, ARN to tags?
-
         # TODO(ekl) right now we always update the head node even if the
         # hash matches.
         # We could prompt the user for what they want to do here.
@@ -790,6 +836,7 @@ def get_or_create_head_node(
             file_mounts_contents_hash=file_mounts_contents_hash,
             is_head_node=True,
             node_resources=head_node_resources,
+            node_labels=head_node_labels,
             rsync_options={
                 "rsync_exclude": config.get("rsync_exclude"),
                 "rsync_filter": config.get("rsync_filter"),
@@ -822,22 +869,48 @@ def get_or_create_head_node(
         modifiers = ""
 
     cli_logger.newline()
-    with cli_logger.group("Useful commands"):
+    with cli_logger.group("Useful commands:"):
         printable_config_file = os.path.abspath(printable_config_file)
-        cli_logger.print("Monitor autoscaling with")
+
+        cli_logger.print("To terminate the cluster:")
+        cli_logger.print(cf.bold(f"  ray down {printable_config_file}{modifiers}"))
+        cli_logger.newline()
+
+        cli_logger.print("To retrieve the IP address of the cluster head:")
         cli_logger.print(
-            cf.bold("  ray exec {}{} {}"),
-            printable_config_file,
-            modifiers,
-            quote(monitor_str),
+            cf.bold(f"  ray get-head-ip {printable_config_file}{modifiers}")
         )
+        cli_logger.newline()
 
-        cli_logger.print("Connect to a terminal on the cluster head:")
-        cli_logger.print(cf.bold("  ray attach {}{}"), printable_config_file, modifiers)
+        cli_logger.print(
+            "To port-forward the cluster's Ray Dashboard to the local machine:"
+        )
+        cli_logger.print(cf.bold(f"  ray dashboard {printable_config_file}{modifiers}"))
+        cli_logger.newline()
 
-        remote_shell_str = updater.cmd_runner.remote_shell_command_str()
-        cli_logger.print("Get a remote shell to the cluster manually:")
-        cli_logger.print("  {}", remote_shell_str.strip())
+        cli_logger.print(
+            "To submit a job to the cluster, port-forward the "
+            "Ray Dashboard in another terminal and run:"
+        )
+        cli_logger.print(
+            cf.bold(
+                "  ray job submit --address http://localhost:<dashboard-port> "
+                "--working-dir . -- python my_script.py"
+            )
+        )
+        cli_logger.newline()
+
+        cli_logger.print("To connect to a terminal on the cluster head for debugging:")
+        cli_logger.print(cf.bold(f"  ray attach {printable_config_file}{modifiers}"))
+        cli_logger.newline()
+
+        cli_logger.print("To monitor autoscaling:")
+        cli_logger.print(
+            cf.bold(
+                f"  ray exec {printable_config_file}{modifiers} {quote(monitor_str)}"
+            )
+        )
+        cli_logger.newline()
 
 
 def _should_create_new_head(
@@ -857,8 +930,8 @@ def _should_create_new_head(
 
     Args:
         head_node_id (Optional[str]): head node id if a head exists, else None
-        new_launch_hash (str): hash of current user-submitted head config
-        new_head_node_type (str): current user-submitted head node-type key
+        new_launch_hash: hash of current user-submitted head config
+        new_head_node_type: current user-submitted head node-type key
 
     Returns:
         bool: True if a new Ray head node should be launched, False otherwise
@@ -881,9 +954,8 @@ def _should_create_new_head(
     # Warn user
     if new_head_required:
         with cli_logger.group(
-            "Currently running head node is out-of-date with cluster " "configuration"
+            "Currently running head node is out-of-date with cluster configuration"
         ):
-
             if hashes_mismatch:
                 cli_logger.print(
                     "Current hash is {}, expected {}",
@@ -917,6 +989,13 @@ def _set_up_config_for_head_node(
     # drop proxy options if they exist, otherwise
     # head node won't be able to connect to workers
     remote_config["auth"].pop("ssh_proxy_command", None)
+
+    # Drop the head_node field if it was introduced. It is technically not a
+    # valid field in the config, but it may have been introduced after
+    # validation (see _bootstrap_config() call to
+    # provider_cls.bootstrap_config(config)). The head node will never try to
+    # launch a head node so it doesn't need these defaults.
+    remote_config.pop("head_node", None)
 
     if "ssh_private_key" in config["auth"]:
         remote_key_path = "~/ray_bootstrap_key.pem"
@@ -1004,7 +1083,7 @@ def attach_cluster(
 def exec_cluster(
     config_file: str,
     *,
-    cmd: str = None,
+    cmd: Optional[str] = None,
     run_env: str = "auto",
     screen: bool = False,
     tmux: bool = False,
@@ -1015,6 +1094,7 @@ def exec_cluster(
     port_forward: Optional[Port_forward] = None,
     with_output: bool = False,
     _allow_uninitialized_state: bool = False,
+    extra_screen_args: Optional[str] = None,
 ) -> str:
     """Runs a command on the specified cluster.
 
@@ -1024,6 +1104,7 @@ def exec_cluster(
         run_env: whether to run the command on the host or in a container.
             Select between "auto", "host" and "docker"
         screen: whether to run in a screen
+        extra_screen_args: optional custom additional args to screen command
         tmux: whether to run in a tmux session
         stop: whether to stop the cluster after command run
         start: whether to start the cluster if it isn't up
@@ -1072,16 +1153,15 @@ def exec_cluster(
         },
         docker_config=config.get("docker"),
     )
-    shutdown_after_run = False
     if cmd and stop:
         cmd = "; ".join(
             [
                 cmd,
                 "ray stop",
                 "ray teardown ~/ray_bootstrap_config.yaml --yes --workers-only",
+                "sudo shutdown -h now",
             ]
         )
-        shutdown_after_run = True
 
     result = _exec(
         updater,
@@ -1091,7 +1171,8 @@ def exec_cluster(
         port_forward=port_forward,
         with_output=with_output,
         run_env=run_env,
-        shutdown_after_run=shutdown_after_run,
+        shutdown_after_run=False,
+        extra_screen_args=extra_screen_args,
     )
     if tmux or screen:
         attach_command_parts = ["ray attach", config_file]
@@ -1118,6 +1199,7 @@ def _exec(
     with_output: bool = False,
     run_env: str = "auto",
     shutdown_after_run: bool = False,
+    extra_screen_args: Optional[str] = None,
 ) -> str:
     if cmd:
         if screen:
@@ -1125,6 +1207,12 @@ def _exec(
                 "screen",
                 "-L",
                 "-dm",
+            ]
+
+            if extra_screen_args is not None and len(extra_screen_args) > 0:
+                wrapped_cmd += [extra_screen_args]
+
+            wrapped_cmd += [
                 "bash",
                 "-c",
                 quote(cmd + "; exec bash"),
@@ -1172,9 +1260,9 @@ def rsync(
         target: target dir
         override_cluster_name: set the name of the cluster
         down: whether we're syncing remote -> local
-        ip_address (str): Address of node. Raise Exception
+        ip_address: Address of node. Raise Exception
             if both ip_address and 'all_nodes' are provided.
-        use_internal_ip (bool): Whether the provided ip_address is
+        use_internal_ip: Whether the provided ip_address is
             public or private.
         all_nodes: whether to sync worker nodes in addition to the head node
         should_bootstrap: whether to bootstrap cluster config before syncing
@@ -1266,7 +1354,12 @@ def get_head_node_ip(
 
     provider = _get_node_provider(config["provider"], config["cluster_name"])
     head_node = _get_running_head_node(config, config_file, override_cluster_name)
-    if config.get("provider", {}).get("use_internal_ips", False):
+    provider_cfg = config.get("provider", {})
+    # Get internal IP if using internal IPs and
+    # use_external_head_ip is not specified
+    if provider_cfg.get("use_internal_ips", False) and not provider_cfg.get(
+        "use_external_head_ip", False
+    ):
         head_node_ip = provider.internal_ip(head_node)
     else:
         head_node_ip = provider.external_ip(head_node)
@@ -1286,7 +1379,7 @@ def get_worker_node_ips(
     provider = _get_node_provider(config["provider"], config["cluster_name"])
     nodes = provider.non_terminated_nodes({TAG_RAY_NODE_KIND: NODE_KIND_WORKER})
 
-    if config.get("provider", {}).get("use_internal_ips", False) is True:
+    if config.get("provider", {}).get("use_internal_ips", False):
         return [provider.internal_ip(node) for node in nodes]
     else:
         return [provider.external_ip(node) for node in nodes]
@@ -1315,12 +1408,12 @@ def _get_running_head_node(
     """Get a valid, running head node.
     Args:
         config (Dict[str, Any]): Cluster Config dictionary
-        printable_config_file (str): Used for printing formatted CLI commands.
-        override_cluster_name (str): Passed to `get_or_create_head_node` to
+        printable_config_file: Used for printing formatted CLI commands.
+        override_cluster_name: Passed to `get_or_create_head_node` to
             override the cluster name present in `config`.
-        create_if_needed (bool): Create a head node if one is not present.
-        _provider (NodeProvider): [For testing], a Node Provider to use.
-        _allow_uninitialized_state (bool): Whether to return a head node that
+        create_if_needed: Create a head node if one is not present.
+        _provider: [For testing], a Node Provider to use.
+        _allow_uninitialized_state: Whether to return a head node that
             is not 'UP TO DATE'. This is used to allow `ray attach` and
             `ray exec` to debug a cluster in a bad state.
 
@@ -1435,7 +1528,6 @@ def get_cluster_dump_archive(
     processes_verbose: bool = False,
     tempfile: Optional[str] = None,
 ) -> Optional[str]:
-
     # Inform the user what kind of logs are collected (before actually
     # collecting, so they can abort)
     content_str = ""

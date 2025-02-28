@@ -1,7 +1,9 @@
+# @OldAPIStack
+
 """
-Adapted (time-dependent) GAE for PPO algorithm can be activated by setting
-use_adapted_gae=True in the policy config. Additionally, it is required that
-"callbacks" include the custom callback class in the Trainer's config.
+Adapted (time-dependent) GAE for PPO algorithm that you can activate by setting
+use_adapted_gae=True in the policy config. Additionally, it's required that
+"callbacks" include the custom callback class in the Algorithm's config.
 Furthermore, the env must return in its info dictionary a key-value pair of
 the form "d_ts": ... where the value is the length (time) of recent agent step.
 
@@ -10,15 +12,15 @@ where agent's actions take various times and thus time steps are not
 equidistant (https://docdro.id/400TvlR)
 """
 
-from ray.rllib.agents.callbacks import DefaultCallbacks
+from ray.rllib.callbacks.callbacks import RLlibCallback
 from ray.rllib.policy.sample_batch import SampleBatch
 from ray.rllib.evaluation.postprocessing import Postprocessing
 from ray.rllib.utils.annotations import override
 import numpy as np
 
 
-class MyCallbacks(DefaultCallbacks):
-    @override(DefaultCallbacks)
+class MyCallbacks(RLlibCallback):
+    @override(RLlibCallback)
     def on_postprocess_trajectory(
         self,
         *,
@@ -62,7 +64,7 @@ class MyCallbacks(DefaultCallbacks):
             ), "Elements of 'd_ts' (length of time steps) must be integer!"
 
             # Trajectory is actually complete -> last r=0.0.
-            if postprocessed_batch[SampleBatch.DONES][-1]:
+            if postprocessed_batch[SampleBatch.TERMINATEDS][-1]:
                 last_r = 0.0
             # Trajectory has been truncated -> last r=VF estimate of last obs.
             else:
@@ -83,7 +85,7 @@ class MyCallbacks(DefaultCallbacks):
             )
             delta_t = (
                 postprocessed_batch[SampleBatch.REWARDS]
-                + gamma ** d_ts * vpred_t[1:]
+                + gamma**d_ts * vpred_t[1:]
                 - vpred_t[:-1]
             )
             # This formula for the advantage is an adaption of
@@ -121,22 +123,27 @@ def generalized_discount_cumsum(
         x (np.ndarray): A sequence of rewards or one-step TD residuals.
         deltas (np.ndarray): A sequence of time step deltas (length of time
             steps).
-        gamma (float): The discount factor gamma.
+        gamma: The discount factor gamma.
 
     Returns:
         np.ndarray: The sequence containing the 'time-dependent' discounted
             cumulative sums for each individual element in `x` till the end of
             the trajectory.
 
-    Examples:
-        >>> x = np.array([0.0, 1.0, 2.0, 3.0])
-        >>> deltas = np.array([1.0, 4.0, 15.0])
-        >>> gamma = 0.9
-        >>> generalized_discount_cumsum(x, deltas, gamma)
-        ... array([0.0 + 0.9^1.0*1.0 + 0.9^4.0*2.0 + 0.9^15.0*3.0,
-        ...        1.0 + 0.9^4.0*2.0 + 0.9^15.0*3.0,
-        ...        2.0 + 0.9^15.0*3.0,
-        ...        3.0])
+    .. testcode::
+        :skipif: True
+
+        x = np.array([0.0, 1.0, 2.0, 3.0])
+        deltas = np.array([1.0, 4.0, 15.0])
+        gamma = 0.9
+        generalized_discount_cumsum(x, deltas, gamma)
+
+    .. testoutput::
+
+        array([0.0 + 0.9^1.0*1.0 + 0.9^4.0*2.0 + 0.9^15.0*3.0,
+               1.0 + 0.9^4.0*2.0 + 0.9^15.0*3.0,
+               2.0 + 0.9^15.0*3.0,
+               3.0])
     """
     reversed_x = x[::-1]
     reversed_deltas = deltas[::-1]

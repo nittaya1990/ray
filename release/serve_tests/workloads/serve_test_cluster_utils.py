@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
+import logging
+
 import ray
 import requests
+from ray._private.test_utils import monitor_memory_usage
+from ray.cluster_utils import Cluster
 
 from ray import serve
-from ray.cluster_utils import Cluster
-from ray.serve.utils import logger
 from ray.serve.config import DeploymentMode
-from ray.serve.constants import DEFAULT_CHECKPOINT_PATH
+from ray.serve.context import _get_global_client
+
+logger = logging.getLogger(__file__)
 
 # Cluster setup configs
 NUM_CPU_PER_NODE = 10
@@ -14,7 +18,9 @@ NUM_CONNECTIONS = 10
 
 
 def setup_local_single_node_cluster(
-    num_nodes: int, checkpoint_path: str = DEFAULT_CHECKPOINT_PATH, namespace="serve"
+    num_nodes: int,
+    num_cpu_per_node=NUM_CPU_PER_NODE,
+    namespace="serve",
 ):
     """Setup ray cluster locally via ray.init() and Cluster()
 
@@ -25,21 +31,17 @@ def setup_local_single_node_cluster(
     for i in range(num_nodes):
         cluster.add_node(
             redis_port=6380 if i == 0 else None,
-            num_cpus=NUM_CPU_PER_NODE,
+            num_cpus=num_cpu_per_node,
             num_gpus=0,
-            resources={str(i): 2},
+            resources={str(i): 2, "proxy": 1},
         )
     ray.init(address=cluster.address, dashboard_host="0.0.0.0", namespace=namespace)
-    serve_client = serve.start(
-        detached=True,
-        http_options={"location": DeploymentMode.EveryNode},
-        _checkpoint_path=checkpoint_path,
-    )
+    serve.start(proxy_location=DeploymentMode.EveryNode)
 
-    return serve_client, cluster
+    return _get_global_client(), cluster
 
 
-def setup_anyscale_cluster(checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
+def setup_anyscale_cluster():
     """Setup ray cluster at anyscale via ray.client()
 
     Note this is by default large scale and should be kicked off
@@ -49,14 +51,18 @@ def setup_anyscale_cluster(checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
     # we cannot connect to anyscale cluster from its headnode
     # ray.client().env({}).connect()
     ray.init(
-        address="auto", runtime_env={"env_vars": {"SERVE_ENABLE_SCALING_LOG": "1"}}
+        address="auto",
+        # This flag can be enabled to debug node autoscaler events.
+        # But the cluster scaling has been stable for now, so we turn it off
+        # to reduce spam.
+        runtime_env={"env_vars": {"SERVE_ENABLE_SCALING_LOG": "0"}},
     )
-    serve_client = serve.start(
-        http_options={"location": DeploymentMode.EveryNode},
-        _checkpoint_path=checkpoint_path,
-    )
+    serve.start(proxy_location=DeploymentMode.EveryNode)
 
-    return serve_client
+    # Print memory usage on the head node to help diagnose/debug memory leaks.
+    monitor_memory_usage()
+
+    return _get_global_client()
 
 
 @ray.remote

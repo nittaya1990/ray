@@ -13,12 +13,11 @@ import ray
 from ray.tests.test_autoscaler import (
     MockProvider,
     MockProcessRunner,
-    MockNodeInfoStub,
+    MockGcsClient,
     mock_raylet_id,
     MockAutoscaler,
 )
 from ray.tests.test_resource_demand_scheduler import MULTI_WORKER_CLUSTER
-from ray.autoscaler._private.event_summarizer import EventSummarizer
 from ray.autoscaler._private.providers import (
     _NODE_PROVIDERS,
     _clear_provider_cache,
@@ -191,7 +190,7 @@ class Simulator:
         self.autoscaler = MockAutoscaler(
             self.config_path,
             self.load_metrics,
-            MockNodeInfoStub(),
+            MockGcsClient(),
             # Don't let the autoscaler start any node launchers. Instead, we
             # will launch nodes ourself after every update call.
             max_concurrent_launches=0,
@@ -203,11 +202,12 @@ class Simulator:
         # Manually create a node launcher. Note that we won't start it as a
         # separate thread.
         self.node_launcher = NodeLauncher(
-            event_summarizer=EventSummarizer(),
             provider=self.autoscaler.provider,
+            pending=self.autoscaler.pending_launches,
+            event_summarizer=self.autoscaler.event_summarizer,
+            node_provider_availability_tracker=self.autoscaler.node_provider_availability_tracker,  # noqa: E501 Flake and black disagree how to format this.
             queue=self.autoscaler.launch_queue,
             index=0,
-            pending=self.autoscaler.pending_launches,
             node_types=self.autoscaler.available_node_types,
         )
 
@@ -372,7 +372,7 @@ class Simulator:
                 raylet_id=node.raylet_id,
                 static_resources=node.total_resources,
                 dynamic_resources=node.available_resources,
-                resource_load={},
+                node_idle_duration_s=0,
                 waiting_bundles=waiting_bundles,
                 infeasible_bundles=infeasible_bundles,
                 pending_placement_groups=placement_groups,
@@ -619,6 +619,10 @@ class AutoscalingPolicyTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    import os
     import sys
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

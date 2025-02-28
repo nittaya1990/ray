@@ -7,19 +7,25 @@ Supports color, bold text, italics, underlines, etc.
 (depending on TTY features)
 as well as indentation and other structured output.
 """
-from contextlib import contextmanager
-from functools import wraps
 import inspect
 import logging
 import os
 import sys
-from typing import Any, Callable, Dict, Tuple, Optional, List
+import time
+from contextlib import contextmanager
+from functools import wraps
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import click
+import colorama
 
 # Import ray first to use the bundled colorama
 import ray  # noqa: F401
-import colorama
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import select
 
 
 class _ColorfulMock:
@@ -107,35 +113,6 @@ cf = _ColorfulProxy()
 colorama.init(strip=False)
 
 
-def _patched_makeRecord(
-    self, name, level, fn, lno, msg, args, exc_info, func=None, extra=None, sinfo=None
-):
-    """Monkey-patched version of logging.Logger.makeRecord
-    We have to patch default loggers so they use the proper frame for
-    line numbers and function names (otherwise everything shows up as
-    e.g. cli_logger:info() instead of as where it was called from).
-
-    In Python 3.8 we could just use stacklevel=2, but we have to support
-    Python 3.6 and 3.7 as well.
-
-    The solution is this Python magic superhack.
-
-    The default makeRecord will deliberately check that we don't override
-    any existing property on the LogRecord using `extra`,
-    so we remove that check.
-
-    This patched version is otherwise identical to the one in the standard
-    library.
-    """
-    rv = logging.LogRecord(name, level, fn, lno, msg, args, exc_info, func, sinfo)
-    if extra is not None:
-        rv.__dict__.update(extra)
-    return rv
-
-
-logging.Logger.makeRecord = _patched_makeRecord
-
-
 def _external_caller_info():
     """Get the info from the caller frame.
 
@@ -161,7 +138,7 @@ def _format_msg(
     no_format: bool = None,
     _tags: Dict[str, Any] = None,
     _numbered: Tuple[str, int, int] = None,
-    **kwargs: Any
+    **kwargs: Any,
 ):
     """Formats a message for printing.
 
@@ -399,7 +376,7 @@ class _CliLogger:
         """Proxy for printing messages.
 
         Args:
-            msg (str): Message to print.
+            msg: Message to print.
             linefeed (bool):
                 If `linefeed` is `False` no linefeed is printed at the
                 end of the message.
@@ -491,7 +468,7 @@ class _CliLogger:
         """Displays a key-value pair with special formatting.
 
         Args:
-            key (str): Label that is prepended to the message.
+            key: Label that is prepended to the message.
 
         For other arguments, see `_format_msg`.
         """
@@ -570,13 +547,16 @@ class _CliLogger:
         *args: Any,
         _level_str: str = "INFO",
         end: str = None,
-        **kwargs: Any
+        **kwargs: Any,
     ):
         """Prints a message.
 
         For arguments, see `_format_msg`.
         """
         self._print(_format_msg(msg, *args, **kwargs), _level_str=_level_str, end=end)
+
+    def info(self, msg: str, no_format=True, *args, **kwargs):
+        self.print(msg, no_format=no_format, *args, **kwargs)
 
     def abort(
         self, msg: Optional[str] = None, *args: Any, exc: Any = None, **kwargs: Any
@@ -604,7 +584,7 @@ class _CliLogger:
         """Handle assertion without throwing a scary exception.
 
         Args:
-            val (bool): Value to check.
+            val: Value to check.
 
         For other arguments, see `_format_msg`.
         """
@@ -630,14 +610,15 @@ class _CliLogger:
         *args: Any,
         _abort: bool = False,
         _default: bool = False,
-        **kwargs: Any
+        _timeout_s: Optional[float] = None,
+        **kwargs: Any,
     ):
         """Display a confirmation dialog.
 
         Valid answers are "y/yes/true/1" and "n/no/false/0".
 
         Args:
-            yes (bool): If `yes` is `True` the dialog will default to "yes"
+            yes: If `yes` is `True` the dialog will default to "yes"
                         and continue without waiting for user input.
             _abort (bool):
                 If `_abort` is `True`,
@@ -645,6 +626,9 @@ class _CliLogger:
             _default (bool):
                 The default action to take if the user just presses enter
                 with no input.
+            _timeout_s (float):
+                If user has no input within _timeout_s seconds, the default
+                action is taken. None means no timeout.
         """
         should_abort = _abort
         default = _default
@@ -683,7 +667,41 @@ class _CliLogger:
         no_answers = ["n", "no", "false", "0"]
         try:
             while True:
-                ans = sys.stdin.readline()
+                if _timeout_s is None:
+                    ans = sys.stdin.readline()
+                elif sys.platform == "win32":
+                    # Windows doesn't support select
+                    start_time = time.time()
+                    ans = ""
+                    while True:
+                        if (time.time() - start_time) >= _timeout_s:
+                            self.newline()
+                            ans = "\n"
+                            break
+                        elif msvcrt.kbhit():
+                            ch = msvcrt.getwch()
+                            if ch in ("\n", "\r"):
+                                self.newline()
+                                ans = ans + "\n"
+                                break
+                            elif ch == "\b":
+                                if ans:
+                                    ans = ans[:-1]
+                                    # Emulate backspace erasing
+                                    print("\b \b", end="", flush=True)
+                            else:
+                                ans = ans + ch
+                                print(ch, end="", flush=True)
+                        else:
+                            time.sleep(0.1)
+                else:
+                    ready, _, _ = select.select([sys.stdin], [], [], _timeout_s)
+                    if not ready:
+                        self.newline()
+                        ans = "\n"
+                    else:
+                        ans = sys.stdin.readline()
+
                 ans = ans.lower()
 
                 if ans == "\n":
@@ -700,7 +718,7 @@ class _CliLogger:
 
                 indent = " " * msg_len
                 self.error(
-                    "{}Invalid answer: {}. " "Expected {} or {}",
+                    "{}Invalid answer: {}. Expected {} or {}",
                     indent,
                     cf.bold(ans.strip()),
                     self.render_list(yes_answers, "/"),
@@ -725,7 +743,7 @@ class _CliLogger:
         """Prompt the user for some text input.
 
         Args:
-            msg (str): The mesage to display to the user before the prompt.
+            msg: The mesage to display to the user before the prompt.
 
         Returns:
             The string entered by the user.
@@ -789,7 +807,7 @@ CLICK_LOGGING_OPTIONS = [
         required=False,
         type=click.Choice(["auto", "false", "true"], case_sensitive=False),
         default="auto",
-        help=("Use color logging. " "Auto enables color logging if stdout is a TTY."),
+        help=("Use color logging. Auto enables color logging if stdout is a TTY."),
     ),
     click.option("-v", "--verbose", default=None, count=True),
 ]

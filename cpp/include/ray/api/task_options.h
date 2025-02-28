@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <ray/api/ray_exception.h>
+
 #include <cmath>
 
 namespace ray {
@@ -49,9 +51,10 @@ enum class PlacementStrategy {
 
 enum PlacementGroupState {
   PENDING = 0,
-  CREATED = 1,
-  REMOVED = 2,
-  RESCHEDULING = 3,
+  PREPARED = 1,
+  CREATED = 2,
+  REMOVED = 3,
+  RESCHEDULING = 4,
   UNRECOGNIZED = -1,
 };
 
@@ -64,7 +67,8 @@ struct PlacementGroupCreationOptions {
 class PlacementGroup {
  public:
   PlacementGroup() = default;
-  PlacementGroup(std::string id, PlacementGroupCreationOptions options,
+  PlacementGroup(std::string id,
+                 PlacementGroupCreationOptions options,
                  PlacementGroupState state = PlacementGroupState::UNRECOGNIZED)
       : id_(std::move(id)), options_(std::move(options)), state_(state) {}
   std::string GetID() const { return id_; }
@@ -94,15 +98,18 @@ struct CallOptions {
   std::unordered_map<std::string, double> resources;
   PlacementGroup group;
   int bundle_index;
+  std::string serialized_runtime_env_info;
 };
 
 struct ActorCreationOptions {
   std::string name;
+  std::string ray_namespace;
   std::unordered_map<std::string, double> resources;
   int max_restarts = 0;
   int max_concurrency = 1;
   PlacementGroup group;
   int bundle_index;
+  std::string serialized_runtime_env_info;
 };
 }  // namespace internal
 

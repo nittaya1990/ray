@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 
 import ray
+import ray._private.ray_constants as ray_constants
 from ray._private.test_utils import get_other_nodes
-import ray.ray_constants as ray_constants
 
 
 @pytest.mark.skip(reason="No reconstruction for objects placed in plasma yet")
@@ -19,8 +19,6 @@ import ray.ray_constants as ray_constants
             "num_nodes": 4,
             "object_store_memory": 1000 * 1024 * 1024,
             "_system_config": {
-                # Raylet codepath is not stable with a shorter timeout.
-                "num_heartbeats_timeout": 10,
                 "object_manager_pull_timeout_ms": 1000,
                 "object_manager_push_timeout_ms": 1000,
             },
@@ -58,14 +56,14 @@ def test_object_reconstruction(ray_start_cluster):
         # node.
         for x in xs:
             ray.get(x)
-            ray.internal.free([x], local_only=True)
+            ray._private.internal_api.free([x], local_only=True)
 
         # Kill a component on one of the nodes.
         process.terminate()
         time.sleep(1)
         process.kill()
         process.wait()
-        assert not process.poll() is None
+        assert process.poll() is not None
 
         # Make sure that we can still get the objects after the
         # executing tasks died.
@@ -125,6 +123,10 @@ def test_actor_creation_node_failure(ray_start_cluster):
 
 
 if __name__ == "__main__":
+    import os
     import pytest
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

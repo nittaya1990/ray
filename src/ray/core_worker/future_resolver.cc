@@ -30,8 +30,9 @@ void FutureResolver::ResolveFutureAsync(const ObjectID &object_id,
   request.set_object_id(object_id.Binary());
   request.set_owner_worker_id(owner_address.worker_id());
   conn->GetObjectStatus(
-      request, [this, object_id, owner_address](const Status &status,
-                                                const rpc::GetObjectStatusReply &reply) {
+      request,
+      [this, object_id, owner_address](const Status &status,
+                                       const rpc::GetObjectStatusReply &reply) {
         ProcessResolvedObject(object_id, owner_address, status, reply);
       });
 }
@@ -76,7 +77,7 @@ void FutureResolver::ProcessResolvedObject(const ObjectID &object_id,
     // Put the RayObject into the in-memory store.
     const auto &data = reply.object().data();
     std::shared_ptr<LocalMemoryBuffer> data_buffer;
-    if (data.size() > 0) {
+    if (!data.empty()) {
       RAY_LOG(DEBUG) << "Object returned directly in GetObjectStatus reply, putting "
                      << object_id << " in memory store";
       data_buffer = std::make_shared<LocalMemoryBuffer>(
@@ -88,7 +89,7 @@ void FutureResolver::ProcessResolvedObject(const ObjectID &object_id,
     }
     const auto &metadata = reply.object().metadata();
     std::shared_ptr<LocalMemoryBuffer> metadata_buffer;
-    if (metadata.size() > 0) {
+    if (!metadata.empty()) {
       metadata_buffer = std::make_shared<LocalMemoryBuffer>(
           const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(metadata.data())),
           metadata.size());
@@ -97,7 +98,8 @@ void FutureResolver::ProcessResolvedObject(const ObjectID &object_id,
         VectorFromProtobuf<rpc::ObjectReference>(reply.object().nested_inlined_refs());
     for (const auto &inlined_ref : inlined_refs) {
       reference_counter_->AddBorrowedObject(ObjectID::FromBinary(inlined_ref.object_id()),
-                                            object_id, inlined_ref.owner_address());
+                                            object_id,
+                                            inlined_ref.owner_address());
     }
     RAY_UNUSED(in_memory_store_->Put(
         RayObject(data_buffer, metadata_buffer, inlined_refs), object_id));

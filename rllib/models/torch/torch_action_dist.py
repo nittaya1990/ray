@@ -1,5 +1,5 @@
 import functools
-import gym
+import gymnasium as gym
 from math import log
 import numpy as np
 import tree  # pip install dm_tree
@@ -7,7 +7,7 @@ from typing import Optional
 
 from ray.rllib.models.action_dist import ActionDistribution
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
-from ray.rllib.utils.annotations import override, DeveloperAPI, ExperimentalAPI
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.framework import try_import_torch
 from ray.rllib.utils.numpy import SMALL_NUMBER, MIN_LOG_NN_OUTPUT, MAX_LOG_NN_OUTPUT
 from ray.rllib.utils.spaces.space_utils import get_base_struct_from_space
@@ -16,7 +16,7 @@ from ray.rllib.utils.typing import TensorType, List, Union, Tuple, ModelConfigDi
 torch, nn = try_import_torch()
 
 
-@DeveloperAPI
+@OldAPIStack
 class TorchDistributionWrapper(ActionDistribution):
     """Wrapper class for torch.distributions."""
 
@@ -55,7 +55,7 @@ class TorchDistributionWrapper(ActionDistribution):
         return self.logp(self.last_sample)
 
 
-@DeveloperAPI
+@OldAPIStack
 class TorchCategorical(TorchDistributionWrapper):
     """Wrapper class for PyTorch Categorical distribution."""
 
@@ -85,7 +85,18 @@ class TorchCategorical(TorchDistributionWrapper):
         return action_space.n
 
 
-@DeveloperAPI
+@OldAPIStack
+def get_torch_categorical_class_with_temperature(t: float):
+    """TorchCategorical distribution class that has customized default temperature."""
+
+    class TorchCategoricalWithTemperature(TorchCategorical):
+        def __init__(self, inputs, model=None, temperature=t):
+            super().__init__(inputs, model, temperature)
+
+    return TorchCategoricalWithTemperature
+
+
+@OldAPIStack
 class TorchMultiCategorical(TorchDistributionWrapper):
     """MultiCategorical distribution for MultiDiscrete action spaces."""
 
@@ -131,7 +142,7 @@ class TorchMultiCategorical(TorchDistributionWrapper):
         if isinstance(actions, torch.Tensor):
             if isinstance(self.action_space, gym.spaces.Box):
                 actions = torch.reshape(
-                    actions, [-1, int(np.product(self.action_space.shape))]
+                    actions, [-1, int(np.prod(self.action_space.shape))]
                 )
             actions = torch.unbind(actions, dim=1)
         logps = torch.stack([cat.log_prob(act) for cat, act in zip(self.cats, actions)])
@@ -171,13 +182,14 @@ class TorchMultiCategorical(TorchDistributionWrapper):
             high_ = np.max(action_space.high)
             assert np.all(action_space.low == low_)
             assert np.all(action_space.high == high_)
-            np.product(action_space.shape) * (high_ - low_ + 1)
+            return np.prod(action_space.shape, dtype=np.int32) * (high_ - low_ + 1)
         # MultiDiscrete space.
         else:
+            # `nvec` is already integer. No need to cast.
             return np.sum(action_space.nvec)
 
 
-@ExperimentalAPI
+@OldAPIStack
 class TorchSlateMultiCategorical(TorchCategorical):
     """MultiCategorical distribution for MultiDiscrete action spaces.
 
@@ -220,7 +232,7 @@ class TorchSlateMultiCategorical(TorchCategorical):
         return torch.ones_like(self.inputs[:, 0])
 
 
-@DeveloperAPI
+@OldAPIStack
 class TorchDiagGaussian(TorchDistributionWrapper):
     """Wrapper class for PyTorch Normal distribution."""
 
@@ -268,10 +280,10 @@ class TorchDiagGaussian(TorchDistributionWrapper):
     def required_model_output_shape(
         action_space: gym.Space, model_config: ModelConfigDict
     ) -> Union[int, np.ndarray]:
-        return np.prod(action_space.shape) * 2
+        return np.prod(action_space.shape, dtype=np.int32) * 2
 
 
-@DeveloperAPI
+@OldAPIStack
 class TorchSquashedGaussian(TorchDistributionWrapper):
     """A tanh-squashed Gaussian distribution defined by: mean, std, low, high.
 
@@ -289,9 +301,9 @@ class TorchSquashedGaussian(TorchDistributionWrapper):
         """Parameterizes the distribution via `inputs`.
 
         Args:
-            low (float): The lowest possible sampling value
+            low: The lowest possible sampling value
                 (excluding this value).
-            high (float): The highest possible sampling value
+            high: The highest possible sampling value
                 (excluding this value).
         """
         super().__init__(inputs, model)
@@ -333,7 +345,7 @@ class TorchSquashedGaussian(TorchDistributionWrapper):
         # Get log-prob for squashed Gaussian.
         unsquashed_values_tanhd = torch.tanh(unsquashed_values)
         log_prob = log_prob_gaussian - torch.sum(
-            torch.log(1 - unsquashed_values_tanhd ** 2 + SMALL_NUMBER), dim=-1
+            torch.log(1 - unsquashed_values_tanhd**2 + SMALL_NUMBER), dim=-1
         )
         return log_prob
 
@@ -374,10 +386,10 @@ class TorchSquashedGaussian(TorchDistributionWrapper):
     def required_model_output_shape(
         action_space: gym.Space, model_config: ModelConfigDict
     ) -> Union[int, np.ndarray]:
-        return np.prod(action_space.shape) * 2
+        return np.prod(action_space.shape, dtype=np.int32) * 2
 
 
-@DeveloperAPI
+@OldAPIStack
 class TorchBeta(TorchDistributionWrapper):
     """
     A Beta distribution is defined on the interval [0, 1] and parameterized by
@@ -434,10 +446,10 @@ class TorchBeta(TorchDistributionWrapper):
     def required_model_output_shape(
         action_space: gym.Space, model_config: ModelConfigDict
     ) -> Union[int, np.ndarray]:
-        return np.prod(action_space.shape) * 2
+        return np.prod(action_space.shape, dtype=np.int32) * 2
 
 
-@DeveloperAPI
+@OldAPIStack
 class TorchDeterministic(TorchDistributionWrapper):
     """Action distribution that returns the input values directly.
 
@@ -462,10 +474,10 @@ class TorchDeterministic(TorchDistributionWrapper):
     def required_model_output_shape(
         action_space: gym.Space, model_config: ModelConfigDict
     ) -> Union[int, np.ndarray]:
-        return np.prod(action_space.shape)
+        return np.prod(action_space.shape, dtype=np.int32)
 
 
-@DeveloperAPI
+@OldAPIStack
 class TorchMultiActionDistribution(TorchDistributionWrapper):
     """Action distribution that operates on multiple, possibly nested actions."""
 
@@ -582,10 +594,10 @@ class TorchMultiActionDistribution(TorchDistributionWrapper):
 
     @override(ActionDistribution)
     def required_model_output_shape(self, action_space, model_config):
-        return np.sum(self.input_lens)
+        return np.sum(self.input_lens, dtype=np.int32)
 
 
-@DeveloperAPI
+@OldAPIStack
 class TorchDirichlet(TorchDistributionWrapper):
     """Dirichlet distribution for continuous actions that are between
     [0,1] and sum to 1.
@@ -610,7 +622,7 @@ class TorchDirichlet(TorchDistributionWrapper):
 
     @override(ActionDistribution)
     def deterministic_sample(self) -> TensorType:
-        self.last_sample = nn.functional.softmax(self.dist.concentration)
+        self.last_sample = nn.functional.softmax(self.dist.concentration, dim=-1)
         return self.last_sample
 
     @override(ActionDistribution)
@@ -626,11 +638,7 @@ class TorchDirichlet(TorchDistributionWrapper):
     def entropy(self):
         return self.dist.entropy()
 
-    @override(ActionDistribution)
-    def kl(self, other):
-        return self.dist.kl_divergence(other.dist)
-
     @staticmethod
     @override(ActionDistribution)
     def required_model_output_shape(action_space, model_config):
-        return np.prod(action_space.shape)
+        return np.prod(action_space.shape, dtype=np.int32)

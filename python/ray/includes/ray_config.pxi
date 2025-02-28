@@ -1,6 +1,11 @@
+from libcpp.string cimport string as c_string
 from ray.includes.ray_config cimport RayConfig
 
 cdef class Config:
+    @staticmethod
+    def initialize(c_string config_list):
+        return RayConfig.instance().initialize(config_list)
+
     @staticmethod
     def ray_cookie():
         return RayConfig.instance().ray_cookie()
@@ -10,37 +15,13 @@ cdef class Config:
         return RayConfig.instance().handler_warning_timeout_ms()
 
     @staticmethod
-    def raylet_heartbeat_period_milliseconds():
-        return RayConfig.instance().raylet_heartbeat_period_milliseconds()
-
-    @staticmethod
     def debug_dump_period_milliseconds():
         return RayConfig.instance().debug_dump_period_milliseconds()
-
-    @staticmethod
-    def num_heartbeats_timeout():
-        return RayConfig.instance().num_heartbeats_timeout()
-
-    @staticmethod
-    def num_heartbeats_warning():
-        return RayConfig.instance().num_heartbeats_warning()
 
     @staticmethod
     def object_timeout_milliseconds():
         return (RayConfig.instance()
                 .object_timeout_milliseconds())
-
-    @staticmethod
-    def get_timeout_milliseconds():
-        return RayConfig.instance().get_timeout_milliseconds()
-
-    @staticmethod
-    def worker_get_request_size():
-        return RayConfig.instance().worker_get_request_size()
-
-    @staticmethod
-    def worker_fetch_request_size():
-        return RayConfig.instance().worker_fetch_request_size()
 
     @staticmethod
     def raylet_client_num_connect_attempts():
@@ -105,9 +86,77 @@ cdef class Config:
         return RayConfig.instance().record_ref_creation_sites()
 
     @staticmethod
-    def gcs_grpc_based_pubsub():
-        return RayConfig.instance().gcs_grpc_based_pubsub()
+    def REDIS_CA_CERT():
+        return RayConfig.instance().REDIS_CA_CERT()
 
     @staticmethod
-    def bootstrap_with_gcs():
-        return RayConfig.instance().bootstrap_with_gcs()
+    def REDIS_CA_PATH():
+        return RayConfig.instance().REDIS_CA_PATH()
+
+    @staticmethod
+    def REDIS_CLIENT_CERT():
+        return RayConfig.instance().REDIS_CLIENT_CERT()
+
+    @staticmethod
+    def REDIS_CLIENT_KEY():
+        return RayConfig.instance().REDIS_CLIENT_KEY()
+
+    @staticmethod
+    def REDIS_SERVER_NAME():
+        return RayConfig.instance().REDIS_SERVER_NAME()
+
+    @staticmethod
+    def health_check_initial_delay_ms():
+        return RayConfig.instance().health_check_initial_delay_ms()
+
+    @staticmethod
+    def health_check_period_ms():
+        return RayConfig.instance().health_check_period_ms()
+
+    @staticmethod
+    def health_check_timeout_ms():
+        return RayConfig.instance().health_check_timeout_ms()
+
+    @staticmethod
+    def health_check_failure_threshold():
+        return RayConfig.instance().health_check_failure_threshold()
+
+    @staticmethod
+    def memory_monitor_refresh_ms():
+        return (RayConfig.instance().memory_monitor_refresh_ms())
+
+    @staticmethod
+    def grpc_keepalive_time_ms():
+        return RayConfig.instance().grpc_keepalive_time_ms()
+
+    @staticmethod
+    def grpc_keepalive_timeout_ms():
+        return RayConfig.instance().grpc_keepalive_timeout_ms()
+
+    @staticmethod
+    def grpc_client_keepalive_time_ms():
+        return RayConfig.instance().grpc_client_keepalive_time_ms()
+
+    @staticmethod
+    def grpc_client_keepalive_timeout_ms():
+        return RayConfig.instance().grpc_client_keepalive_timeout_ms()
+
+    @staticmethod
+    def enable_autoscaler_v2():
+        return RayConfig.instance().enable_autoscaler_v2()
+
+    @staticmethod
+    def nums_py_gcs_reconnect_retry():
+        return RayConfig.instance().nums_py_gcs_reconnect_retry()
+
+    @staticmethod
+    def py_gcs_connect_timeout_s():
+        return RayConfig.instance().py_gcs_connect_timeout_s()
+
+    @staticmethod
+    def gcs_rpc_server_reconnect_timeout_s():
+        return RayConfig.instance().gcs_rpc_server_reconnect_timeout_s()
+
+    @staticmethod
+    def maximum_gcs_destroyed_actor_cached_count():
+        return RayConfig.instance().maximum_gcs_destroyed_actor_cached_count()

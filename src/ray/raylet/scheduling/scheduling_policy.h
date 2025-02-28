@@ -17,8 +17,8 @@
 #include <vector>
 
 #include "ray/common/ray_config.h"
+#include "ray/common/scheduling/cluster_resource_data.h"
 #include "ray/gcs/gcs_client/gcs_client.h"
-#include "ray/raylet/scheduling/cluster_resource_data.h"
 
 namespace ray {
 namespace raylet_scheduling_policy {
@@ -64,16 +64,20 @@ class SchedulingPolicy {
   /// \return -1 if the task is unfeasible, otherwise the node id (key in `nodes`) to
   /// schedule on.
   scheduling::NodeID HybridPolicy(
-      const ResourceRequest &resource_request, float spread_threshold,
-      bool force_spillback, bool require_available,
+      const ResourceRequest &resource_request,
+      float spread_threshold,
+      bool force_spillback,
+      bool require_available,
       std::function<bool(scheduling::NodeID)> is_node_available,
       bool scheduler_avoid_gpu_nodes = RayConfig::instance().scheduler_avoid_gpu_nodes());
 
   /// Round robin among available nodes.
   /// If there are no available nodes, fallback to hybrid policy.
   scheduling::NodeID SpreadPolicy(
-      const ResourceRequest &resource_request, bool force_spillback,
-      bool require_available, std::function<bool(scheduling::NodeID)> is_node_available);
+      const ResourceRequest &resource_request,
+      bool force_spillback,
+      bool require_available,
+      std::function<bool(scheduling::NodeID)> is_node_available);
 
   /// Policy that "randomly" picks a node that could fulfil the request.
   /// TODO(scv119): if there are a lot of nodes died or can't fulfill the resource
@@ -85,8 +89,7 @@ class SchedulingPolicy {
  private:
   /// Identifier of local node.
   const scheduling::NodeID local_node_id_;
-  /// List of nodes in the clusters and their resources organized as a map.
-  /// The key of the map is the node ID.
+  /// Map of all nodes in the clusters to their resources.
   const absl::flat_hash_map<scheduling::NodeID, Node> &nodes_;
   // The node to start round robin if it's spread scheduling.
   // The index may be inaccurate when nodes are added or removed dynamically,
@@ -101,21 +104,22 @@ class SchedulingPolicy {
     /// Schedule on GPU only nodes.
     kGPU,
     /// Schedule on nodes that don't have GPU. Since GPUs are more scarce resources, we
-    /// need
-    /// special handling for this.
+    /// need special handling for this.
     kNonGpu
   };
 
-  /// \param resource_request: The resource request we're attempting to schedule.
-  /// \param node_filter: defines the subset of nodes were are allowed to schedule on.
-  /// can be one of kAny (can schedule on all nodes), kGPU (can only schedule on kGPU
+  /// \param resource_request: The resource request we are attempting to schedule.
+  /// \param node_filter: Defines the subset of nodes we are are allowed to schedule on.
+  /// Can be one of kAny (can schedule on all nodes), kGPU (can only schedule on kGPU
   /// nodes), kNonGpu (can only schedule on non-GPU nodes.
   ///
   /// \return -1 if the task is unfeasible, otherwise the node id (key in `nodes`) to
   /// schedule on.
   scheduling::NodeID HybridPolicyWithFilter(
-      const ResourceRequest &resource_request, float spread_threshold,
-      bool force_spillback, bool require_available,
+      const ResourceRequest &resource_request,
+      float spread_threshold,
+      bool force_spillback,
+      bool require_available,
       std::function<bool(scheduling::NodeID)> is_node_available,
       NodeFilter node_filter = NodeFilter::kAny);
 };

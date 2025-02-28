@@ -1,40 +1,48 @@
 import dis
+import sys
 import hashlib
-import os
 import importlib
 import inspect
 import json
 import logging
-import sys
-import time
-from typing import Optional
+import os
 import threading
+import time
 import traceback
-from collections import (
-    namedtuple,
-    defaultdict,
-)
+from collections import defaultdict, namedtuple
+from typing import Optional, Callable
 
 import ray
+from ray.remote_function import RemoteFunction
 import ray._private.profiling as profiling
-from ray import ray_constants
 from ray import cloudpickle as pickle
-from ray._raylet import PythonFunctionDescriptor, JobID
+from ray._private import ray_constants
+from ray._private.inspect_util import (
+    is_class_method,
+    is_function_or_method,
+    is_static_method,
+)
+from ray._private.ray_constants import KV_NAMESPACE_FUNCTION_TABLE
 from ray._private.utils import (
     check_oversized_function,
     ensure_str,
     format_error_message,
 )
-from ray.ray_constants import KV_NAMESPACE_FUNCTION_TABLE
-from ray.util.inspect import (
-    is_function_or_method,
-    is_class_method,
-    is_static_method,
+from ray._private.serialization import pickle_dumps
+from ray._raylet import (
+    JobID,
+    PythonFunctionDescriptor,
+    WORKER_PROCESS_SETUP_HOOK_KEY_NAME_GCS,
 )
 
 FunctionExecutionInfo = namedtuple(
     "FunctionExecutionInfo", ["function", "function_name", "max_calls"]
 )
+ImportedFunctionInfo = namedtuple(
+    "ImportedFunctionInfo",
+    ["job_id", "function_id", "function_name", "function", "module", "max_calls"],
+)
+
 """FunctionExecutionInfo: A named tuple storing remote function information."""
 
 logger = logging.getLogger(__name__)
@@ -45,15 +53,6 @@ def make_function_table_key(key_type: bytes, job_id: JobID, key: Optional[bytes]
         return b":".join([key_type, job_id.hex().encode()])
     else:
         return b":".join([key_type, job_id.hex().encode(), key])
-
-
-def make_exports_prefix(job_id: JobID) -> bytes:
-    return make_function_table_key(b"IsolatedExports", job_id)
-
-
-def make_export_key(pos: int, job_id: JobID) -> bytes:
-    # big-endian for ordering in binary
-    return make_function_table_key(b"IsolatedExports", job_id, pos.to_bytes(8, "big"))
 
 
 class FunctionActorManager:
@@ -89,12 +88,10 @@ class FunctionActorManager:
         # Deserialize an ActorHandle will call load_actor_class(). If a
         # function closure captured an ActorHandle, the deserialization of the
         # function will be:
-        #     import_thread.py
         #         -> fetch_and_register_remote_function (acquire lock)
         #         -> _load_actor_class_from_gcs (acquire lock, too)
         # So, the lock should be a reentrant lock.
         self.lock = threading.RLock()
-        self.cv = threading.Condition(lock=self.lock)
 
         self.execution_infos = {}
         # This is the counter to keep track of how many keys have already
@@ -130,10 +127,7 @@ class FunctionActorManager:
         import io
 
         string_file = io.StringIO()
-        if sys.version_info[1] >= 7:
-            dis.dis(function_or_class, file=string_file, depth=2)
-        else:
-            dis.dis(function_or_class, file=string_file)
+        dis.dis(function_or_class, file=string_file, depth=2)
         collision_identifier = function_or_class.__name__ + ":" + string_file.getvalue()
 
         # Return a hash of the identifier in case it is too large.
@@ -151,40 +145,53 @@ class FunctionActorManager:
         except Exception:
             return None
 
-    def export_key(self, key):
-        """Export a key so it can be imported by other workers"""
+    def export_setup_func(
+        self, setup_func: Callable, timeout: Optional[int] = None
+    ) -> bytes:
+        """Export the setup hook function and return the key."""
+        pickled_function = pickle_dumps(
+            setup_func,
+            "Cannot serialize the worker_process_setup_hook " f"{setup_func.__name__}",
+        )
 
-        # It's going to check all the keys until if reserve one key not
-        # existing in the cluster.
-        # One optimization is that we can use importer counter since
-        # it's sure keys before this counter has been allocated.
-        with self._export_lock:
-            self._num_exported = max(
-                self._num_exported, self._worker.import_thread.num_imported
+        function_to_run_id = hashlib.shake_128(pickled_function).digest(
+            ray_constants.ID_SIZE
+        )
+        key = make_function_table_key(
+            # This value should match with gcs_function_manager.h.
+            # Otherwise, it won't be GC'ed.
+            WORKER_PROCESS_SETUP_HOOK_KEY_NAME_GCS.encode(),
+            # b"FunctionsToRun",
+            self._worker.current_job_id.binary(),
+            function_to_run_id,
+        )
+
+        check_oversized_function(
+            pickled_function, setup_func.__name__, "function", self._worker
+        )
+
+        try:
+            self._worker.gcs_client.internal_kv_put(
+                key,
+                pickle.dumps(
+                    {
+                        "job_id": self._worker.current_job_id.binary(),
+                        "function_id": function_to_run_id,
+                        "function": pickled_function,
+                    }
+                ),
+                # overwrite
+                True,
+                ray_constants.KV_NAMESPACE_FUNCTION_TABLE,
+                timeout=timeout,
             )
-            while True:
-                self._num_exported += 1
-                holder = make_export_key(
-                    self._num_exported, self._worker.current_job_id
-                )
-                # This step is atomic since internal kv is a single thread
-                # atomic db.
-                if (
-                    self._worker.gcs_client.internal_kv_put(
-                        holder, key, False, KV_NAMESPACE_FUNCTION_TABLE
-                    )
-                    > 0
-                ):
-                    break
-        # Notify all subscribers that there is a new function exported. Note
-        # that the notification doesn't include any actual data.
-        if self._worker.gcs_pubsub_enabled:
-            # TODO(mwtian) implement per-job notification here.
-            self._worker.gcs_publisher.publish_function_key(key)
-        else:
-            self._worker.redis_client.lpush(
-                make_exports_prefix(self._worker.current_job_id), "a"
+        except Exception as e:
+            logger.exception(
+                "Failed to export the setup hook " f"{setup_func.__name__}."
             )
+            raise e
+
+        return key
 
     def export(self, remote_function):
         """Pickle a remote function and export it to redis.
@@ -234,23 +241,32 @@ class FunctionActorManager:
         self._worker.gcs_client.internal_kv_put(
             key, val, True, KV_NAMESPACE_FUNCTION_TABLE
         )
-        self.export_key(key)
+
+    def fetch_registered_method(
+        self, key: str, timeout: Optional[int] = None
+    ) -> Optional[ImportedFunctionInfo]:
+        vals = self._worker.gcs_client.internal_kv_get(
+            key, KV_NAMESPACE_FUNCTION_TABLE, timeout=timeout
+        )
+        if vals is None:
+            return None
+        else:
+            vals = pickle.loads(vals)
+            fields = [
+                "job_id",
+                "function_id",
+                "function_name",
+                "function",
+                "module",
+                "max_calls",
+            ]
+            return ImportedFunctionInfo._make(vals.get(field) for field in fields)
 
     def fetch_and_register_remote_function(self, key):
         """Import a remote function."""
-        vals = self._worker.gcs_client.internal_kv_get(key, KV_NAMESPACE_FUNCTION_TABLE)
-        if vals is None:
-            vals = {}
-        else:
-            vals = pickle.loads(vals)
-        fields = [
-            "job_id",
-            "function_id",
-            "function_name",
-            "function",
-            "module",
-            "max_calls",
-        ]
+        remote_function_info = self.fetch_registered_method(key)
+        if not remote_function_info:
+            return False
         (
             job_id_str,
             function_id_str,
@@ -258,7 +274,7 @@ class FunctionActorManager:
             serialized_function,
             module,
             max_calls,
-        ) = (vals.get(field) for field in fields)
+        ) = remote_function_info
 
         function_id = ray.FunctionID(function_id_str)
         job_id = ray.JobID(job_id_str)
@@ -273,7 +289,6 @@ class FunctionActorManager:
             try:
                 function = pickle.loads(serialized_function)
             except Exception:
-
                 # If an exception was thrown when the remote function was
                 # imported, we record the traceback and notify the scheduler
                 # of the failure.
@@ -284,7 +299,8 @@ class FunctionActorManager:
                         "The remote function failed to import on the "
                         "worker. This may be because needed library "
                         "dependencies are not installed in the worker "
-                        "environment:\n\n{}".format(traceback_str)
+                        "environment or cannot be found from sys.path "
+                        f"{sys.path}:\n\n{traceback_str}"
                     )
 
                 # Use a placeholder method when function pickled failed
@@ -312,6 +328,7 @@ class FunctionActorManager:
                 self._function_execution_info[function_id] = FunctionExecutionInfo(
                     function=function, function_name=function_name, max_calls=max_calls
                 )
+        return True
 
     def get_execution_info(self, job_id, function_descriptor):
         """Get the FunctionExecutionInfo of a remote function.
@@ -365,7 +382,12 @@ class FunctionActorManager:
 
         object = self.load_function_or_class_from_local(module_name, function_name)
         if object is not None:
-            function = object._function
+            # Directly importing from local may break function with dynamic ray.remote,
+            # such as the _start_controller function utilized for the Ray service.
+            if isinstance(object, RemoteFunction):
+                function = object._function
+            else:
+                function = object
             self._function_execution_info[function_id] = FunctionExecutionInfo(
                 function=function,
                 function_name=function_name,
@@ -376,7 +398,7 @@ class FunctionActorManager:
         else:
             return False
 
-    def _wait_for_function(self, function_descriptor, job_id, timeout=10):
+    def _wait_for_function(self, function_descriptor, job_id: str, timeout=10):
         """Wait until the function to be executed is present on this worker.
         This method will simply loop until the import thread has imported the
         relevant function. If we spend too long in this loop, that may indicate
@@ -386,7 +408,7 @@ class FunctionActorManager:
         Args:
             function_descriptor : The FunctionDescriptor of the function that
                 we want to execute.
-            job_id (str): The ID of the job to push the error message to
+            job_id: The ID of the job to push the error message to
                 if this times out.
         """
         start_time = time.time()
@@ -394,25 +416,33 @@ class FunctionActorManager:
         warning_sent = False
         while True:
             with self.lock:
-                if self._worker.actor_id.is_nil() and (
-                    function_descriptor.function_id in self._function_execution_info
-                ):
+                if self._worker.actor_id.is_nil():
+                    if function_descriptor.function_id in self._function_execution_info:
+                        break
+                    else:
+                        key = make_function_table_key(
+                            b"RemoteFunction",
+                            job_id,
+                            function_descriptor.function_id.binary(),
+                        )
+                        if self.fetch_and_register_remote_function(key) is True:
+                            break
+                else:
+                    assert not self._worker.actor_id.is_nil()
+                    # Actor loading will happen when execute_task is called.
+                    assert self._worker.actor_id in self._worker.actors
                     break
-                elif not self._worker.actor_id.is_nil() and (
-                    self._worker.actor_id in self._worker.actors
-                ):
-                    break
+
             if time.time() - start_time > timeout:
                 warning_message = (
-                    "This worker was asked to execute a "
-                    "function that it does not have "
-                    f"registered ({function_descriptor}, "
+                    "This worker was asked to execute a function "
+                    f"that has not been registered ({function_descriptor}, "
                     f"node={self._worker.node_ip_address}, "
                     f"worker_id={self._worker.worker_id.hex()}, "
-                    f"pid={os.getpid()}). You may have to restart "
-                    "Ray."
+                    f"pid={os.getpid()}). You may have to restart Ray."
                 )
                 if not warning_sent:
+                    logger.error(warning_message)
                     ray._private.utils.push_error_to_driver(
                         self._worker,
                         ray_constants.WAIT_FOR_FUNCTION_PUSH_ERROR,
@@ -421,22 +451,6 @@ class FunctionActorManager:
                     )
                 warning_sent = True
             time.sleep(0.001)
-
-    def _publish_actor_class_to_key(self, key, actor_class_info):
-        """Push an actor class definition to Redis.
-        The is factored out as a separate function because it is also called
-        on cached actor class definitions when a worker connects for the first
-        time.
-        Args:
-            key: The key to store the actor class info at.
-            actor_class_info: Information about the actor class.
-        """
-        # We set the driver ID here because it may not have been available when
-        # the actor class was defined.
-        self._worker.gcs_client.internal_kv_put(
-            key, pickle.dumps(actor_class_info), True, KV_NAMESPACE_FUNCTION_TABLE
-        )
-        self.export_key(key)
 
     def export_actor_class(
         self, Class, actor_creation_function_descriptor, actor_method_names
@@ -470,16 +484,11 @@ class FunctionActorManager:
             job_id,
             actor_creation_function_descriptor.function_id.binary(),
         )
-        try:
-            serialized_actor_class = pickle.dumps(Class)
-        except TypeError as e:
-            msg = (
-                "Could not serialize the actor class "
-                f"{actor_creation_function_descriptor.repr}. "
-                "Check https://docs.ray.io/en/master/serialization.html#troubleshooting "  # noqa
-                "for more information."
-            )
-            raise TypeError(msg) from e
+        serialized_actor_class = pickle_dumps(
+            Class,
+            f"Could not serialize the actor class "
+            f"{actor_creation_function_descriptor.repr}",
+        )
         actor_class_info = {
             "class_name": actor_creation_function_descriptor.class_name.split(".")[-1],
             "module": actor_creation_function_descriptor.module_name,
@@ -496,7 +505,9 @@ class FunctionActorManager:
             self._worker,
         )
 
-        self._publish_actor_class_to_key(key, actor_class_info)
+        self._worker.gcs_client.internal_kv_put(
+            key, pickle.dumps(actor_class_info), True, KV_NAMESPACE_FUNCTION_TABLE
+        )
         # TODO(rkn): Currently we allow actor classes to be defined
         # within tasks. I tried to disable this, but it may be necessary
         # because of https://github.com/ray-project/ray/issues/1146.
@@ -613,27 +624,6 @@ class FunctionActorManager:
             job_id,
             actor_creation_function_descriptor.function_id.binary(),
         )
-        # Only wait for the actor class if it was exported from the same job.
-        # It will hang if the job id mismatches, since we isolate actor class
-        # exports from the import thread. It's important to wait since this
-        # guarantees import order, though we fetch the actor class directly.
-        # Import order isn't important across jobs, as we only need to fetch
-        # the class for `ray.get_actor()`.
-        if job_id.binary() == self._worker.current_job_id.binary():
-            # Wait for the actor class key to have been imported by the
-            # import thread. TODO(rkn): It shouldn't be possible to end
-            # up in an infinite loop here, but we should push an error to
-            # the driver if too much time is spent here.
-            while key not in self.imported_actor_classes:
-                try:
-                    # If we're in the process of deserializing an ActorHandle
-                    # and we hold the function_manager lock, we may be blocking
-                    # the import_thread from loading the actor class. Use wait
-                    # to temporarily yield control to the import thread.
-                    self.cv.wait()
-                except RuntimeError:
-                    # We don't hold the function_manager lock, just sleep
-                    time.sleep(0.001)
 
         # Fetch raw data from GCS.
         vals = self._worker.gcs_client.internal_kv_get(key, KV_NAMESPACE_FUNCTION_TABLE)
@@ -675,16 +665,18 @@ class FunctionActorManager:
         actor_class.__module__ = module_name
         return actor_class
 
-    def _make_actor_method_executor(self, method_name, method, actor_imported):
+    def _make_actor_method_executor(
+        self, method_name: str, method, actor_imported: bool
+    ):
         """Make an executor that wraps a user-defined actor method.
         The wrapped method updates the worker's internal state and performs any
         necessary checkpointing operations.
         Args:
-            method_name (str): The name of the actor method.
-            method (instancemethod): The actor method to wrap. This should be a
+            method_name: The name of the actor method.
+            method: The actor method to wrap. This should be a
                 method defined on the actor class and should therefore take an
                 instance of the actor as the first argument.
-            actor_imported (bool): Whether the actor has been imported.
+            actor_imported: Whether the actor has been imported.
                 Checkpointing operations will not be run if this is set to
                 False.
         Returns:

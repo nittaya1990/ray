@@ -14,220 +14,158 @@
 
 #include "ray/gcs/store_client/in_memory_store_client.h"
 
-namespace ray {
-
-namespace gcs {
+namespace ray::gcs {
 
 Status InMemoryStoreClient::AsyncPut(const std::string &table_name,
-                                     const std::string &key, const std::string &data,
-                                     const StatusCallback &callback) {
-  auto table = GetOrCreateTable(table_name);
-  absl::MutexLock lock(&(table->mutex_));
-  table->records_[key] = data;
-  if (callback != nullptr) {
-    main_io_service_.post([callback]() { callback(Status::OK()); },
-                          "GcsInMemoryStore.Put");
-  }
-  return Status::OK();
-}
-
-Status InMemoryStoreClient::AsyncPutWithIndex(const std::string &table_name,
-                                              const std::string &key,
-                                              const std::string &index_key,
-                                              const std::string &data,
-                                              const StatusCallback &callback) {
-  auto table = GetOrCreateTable(table_name);
-  absl::MutexLock lock(&(table->mutex_));
-  table->records_[key] = data;
-  table->index_keys_[index_key].emplace_back(key);
-  if (callback != nullptr) {
-    main_io_service_.post([callback]() { callback(Status::OK()); },
-                          "GcsInMemoryStore.PutWithIndex");
-  }
-  return Status::OK();
-}
-
-Status InMemoryStoreClient::AsyncGet(const std::string &table_name,
                                      const std::string &key,
-                                     const OptionalItemCallback<std::string> &callback) {
-  RAY_CHECK(callback != nullptr);
-  auto table = GetOrCreateTable(table_name);
-  absl::MutexLock lock(&(table->mutex_));
-  auto iter = table->records_.find(key);
-  boost::optional<std::string> data;
-  if (iter != table->records_.end()) {
-    data = iter->second;
+                                     std::string data,
+                                     bool overwrite,
+                                     Postable<void(bool)> callback) {
+  auto &table = GetOrCreateMutableTable(table_name);
+  absl::WriterMutexLock lock(&(table.mutex_));
+  auto it = table.records_.find(key);
+  bool inserted = false;
+  if (it != table.records_.end()) {
+    if (overwrite) {
+      it->second = std::move(data);
+    }
+  } else {
+    table.records_[key] = std::move(data);
+    inserted = true;
   }
+  std::move(callback).Post("GcsInMemoryStore.Put", inserted);
+  return Status::OK();
+}
 
-  main_io_service_.post(
-      [callback, data = std::move(data)]() { callback(Status::OK(), data); },
-      "GcsInMemoryStore.Get");
-
+Status InMemoryStoreClient::AsyncGet(
+    const std::string &table_name,
+    const std::string &key,
+    ToPostable<OptionalItemCallback<std::string>> callback) {
+  auto table = GetTable(table_name);
+  std::optional<std::string> data;
+  if (table != nullptr) {
+    absl::ReaderMutexLock lock(&(table->mutex_));
+    auto iter = table->records_.find(key);
+    if (iter != table->records_.end()) {
+      data = iter->second;
+    }
+  }
+  std::move(callback).Post("GcsInMemoryStore.Get", Status::OK(), std::move(data));
   return Status::OK();
 }
 
 Status InMemoryStoreClient::AsyncGetAll(
     const std::string &table_name,
-    const MapCallback<std::string, std::string> &callback) {
-  RAY_CHECK(callback);
-  auto table = GetOrCreateTable(table_name);
-  absl::MutexLock lock(&(table->mutex_));
-  auto result = std::unordered_map<std::string, std::string>();
-  result.insert(table->records_.begin(), table->records_.end());
-  main_io_service_.post(
-      [result = std::move(result), callback]() mutable { callback(std::move(result)); },
-      "GcsInMemoryStore.GetAll");
+    Postable<void(absl::flat_hash_map<std::string, std::string>)> callback) {
+  auto result = absl::flat_hash_map<std::string, std::string>();
+  auto table = GetTable(table_name);
+  if (table != nullptr) {
+    absl::ReaderMutexLock lock(&(table->mutex_));
+    result = table->records_;
+  }
+  std::move(callback).Post("GcsInMemoryStore.GetAll", std::move(result));
+  return Status::OK();
+}
+
+Status InMemoryStoreClient::AsyncMultiGet(
+    const std::string &table_name,
+    const std::vector<std::string> &keys,
+    Postable<void(absl::flat_hash_map<std::string, std::string>)> callback) {
+  auto result = absl::flat_hash_map<std::string, std::string>();
+  auto table = GetTable(table_name);
+  if (table != nullptr) {
+    absl::ReaderMutexLock lock(&(table->mutex_));
+    for (const auto &key : keys) {
+      auto it = table->records_.find(key);
+      if (it == table->records_.end()) {
+        continue;
+      }
+      result.emplace(key, it->second);
+    }
+  }
+  std::move(callback).Post("GcsInMemoryStore.GetAll", std::move(result));
   return Status::OK();
 }
 
 Status InMemoryStoreClient::AsyncDelete(const std::string &table_name,
                                         const std::string &key,
-                                        const StatusCallback &callback) {
-  auto table = GetOrCreateTable(table_name);
-  absl::MutexLock lock(&(table->mutex_));
-  table->records_.erase(key);
-  if (callback != nullptr) {
-    main_io_service_.post([callback]() { callback(Status::OK()); },
-                          "GcsInMemoryStore.Delete");
-  }
-  return Status::OK();
-}
-
-Status InMemoryStoreClient::AsyncDeleteWithIndex(const std::string &table_name,
-                                                 const std::string &key,
-                                                 const std::string &index_key,
-                                                 const StatusCallback &callback) {
-  auto table = GetOrCreateTable(table_name);
-  absl::MutexLock lock(&(table->mutex_));
-  // Remove key-value data.
-  table->records_.erase(key);
-
-  // Remove index-key data.
-  auto iter = table->index_keys_.find(index_key);
-  if (iter != table->index_keys_.end()) {
-    auto it = std::find(iter->second.begin(), iter->second.end(), key);
-    if (it != iter->second.end()) {
-      iter->second.erase(it);
-      if (iter->second.size() == 0) {
-        table->index_keys_.erase(iter);
-      }
-    }
-  }
-  if (callback != nullptr) {
-    main_io_service_.post([callback]() { callback(Status::OK()); },
-                          "GcsInMemoryStore.DeleteWithIndex");
-  }
+                                        Postable<void(bool)> callback) {
+  auto &table = GetOrCreateMutableTable(table_name);
+  absl::WriterMutexLock lock(&(table.mutex_));
+  auto num = table.records_.erase(key);
+  std::move(callback).Post("GcsInMemoryStore.Delete", num > 0);
   return Status::OK();
 }
 
 Status InMemoryStoreClient::AsyncBatchDelete(const std::string &table_name,
                                              const std::vector<std::string> &keys,
-                                             const StatusCallback &callback) {
-  auto table = GetOrCreateTable(table_name);
-  absl::MutexLock lock(&(table->mutex_));
+                                             Postable<void(int64_t)> callback) {
+  auto &table = GetOrCreateMutableTable(table_name);
+  absl::WriterMutexLock lock(&(table.mutex_));
+  int64_t num = 0;
   for (auto &key : keys) {
-    table->records_.erase(key);
+    num += table.records_.erase(key);
   }
-  if (callback != nullptr) {
-    main_io_service_.post([callback]() { callback(Status::OK()); },
-                          "GcsInMemoryStore.BatchDelete");
-  }
+  std::move(callback).Post("GcsInMemoryStore.BatchDelete", num);
   return Status::OK();
 }
 
-Status InMemoryStoreClient::AsyncBatchDeleteWithIndex(
-    const std::string &table_name, const std::vector<std::string> &keys,
-    const std::vector<std::string> &index_keys, const StatusCallback &callback) {
-  RAY_CHECK(keys.size() == index_keys.size());
-
-  auto table = GetOrCreateTable(table_name);
-  absl::MutexLock lock(&(table->mutex_));
-
-  for (size_t i = 0; i < keys.size(); ++i) {
-    const std::string &key = keys[i];
-    const std::string &index_key = index_keys[i];
-    table->records_.erase(key);
-
-    auto iter = table->index_keys_.find(index_key);
-    if (iter != table->index_keys_.end()) {
-      auto it = std::find(iter->second.begin(), iter->second.end(), key);
-      if (it != iter->second.end()) {
-        iter->second.erase(it);
-        if (iter->second.size() == 0) {
-          table->index_keys_.erase(iter);
-        }
-      }
-    }
-  }
-
-  if (callback != nullptr) {
-    main_io_service_.post([callback]() { callback(Status::OK()); },
-                          "GcsInMemoryStore.BatchDeleteWithIndex");
-  }
-
+Status InMemoryStoreClient::AsyncGetNextJobID(Postable<void(int)> callback) {
+  auto job_id = job_id_.fetch_add(1, std::memory_order_acq_rel);
+  std::move(callback).Post("GcsInMemoryStore.GetNextJobID", job_id);
   return Status::OK();
 }
 
-Status InMemoryStoreClient::AsyncGetByIndex(
-    const std::string &table_name, const std::string &index_key,
-    const MapCallback<std::string, std::string> &callback) {
-  RAY_CHECK(callback);
-  auto table = GetOrCreateTable(table_name);
-  absl::MutexLock lock(&(table->mutex_));
-  auto iter = table->index_keys_.find(index_key);
-  auto result = std::unordered_map<std::string, std::string>();
-  if (iter != table->index_keys_.end()) {
-    for (auto &key : iter->second) {
-      auto kv_iter = table->records_.find(key);
-      if (kv_iter != table->records_.end()) {
-        result[kv_iter->first] = kv_iter->second;
-      }
-    }
-  }
-  main_io_service_.post(
-      [result = std::move(result), callback]() mutable { callback(std::move(result)); },
-      "GcsInMemoryStore.GetByIndex");
-
-  return Status::OK();
-}
-
-Status InMemoryStoreClient::AsyncDeleteByIndex(const std::string &table_name,
-                                               const std::string &index_key,
-                                               const StatusCallback &callback) {
-  auto table = GetOrCreateTable(table_name);
-  absl::MutexLock lock(&(table->mutex_));
-  auto iter = table->index_keys_.find(index_key);
-  if (iter != table->index_keys_.end()) {
-    for (auto &key : iter->second) {
-      table->records_.erase(key);
-    }
-    table->index_keys_.erase(iter);
-  }
-  if (callback != nullptr) {
-    main_io_service_.post([callback]() { callback(Status::OK()); },
-                          "GcsInMemoryStore.DeleteByIndex");
-  }
-  return Status::OK();
-}
-
-int InMemoryStoreClient::GetNextJobID() {
-  job_id_ += 1;
-  return job_id_;
-}
-
-std::shared_ptr<InMemoryStoreClient::InMemoryTable> InMemoryStoreClient::GetOrCreateTable(
+InMemoryStoreClient::InMemoryTable &InMemoryStoreClient::GetOrCreateMutableTable(
     const std::string &table_name) {
-  absl::MutexLock lock(&mutex_);
+  absl::WriterMutexLock lock(&mutex_);
   auto iter = tables_.find(table_name);
   if (iter != tables_.end()) {
     return iter->second;
-  } else {
-    auto table = std::make_shared<InMemoryTable>();
-    tables_[table_name] = table;
-    return table;
   }
+  return tables_[table_name];
 }
 
-}  // namespace gcs
+const InMemoryStoreClient::InMemoryTable *InMemoryStoreClient::GetTable(
+    const std::string &table_name) {
+  absl::ReaderMutexLock lock(&mutex_);
+  auto iter = tables_.find(table_name);
+  if (iter != tables_.end()) {
+    return &iter->second;
+  }
+  return nullptr;
+}
 
-}  // namespace ray
+Status InMemoryStoreClient::AsyncGetKeys(
+    const std::string &table_name,
+    const std::string &prefix,
+    Postable<void(std::vector<std::string>)> callback) {
+  std::vector<std::string> result;
+  auto table = GetTable(table_name);
+  if (table != nullptr) {
+    absl::ReaderMutexLock lock(&(table->mutex_));
+    for (const auto &[key, value] : table->records_) {
+      if (absl::StartsWith(key, prefix)) {
+        result.push_back(key);
+      }
+    }
+  }
+  std::move(callback).Post("GcsInMemoryStore.Keys", std::move(result));
+
+  return Status::OK();
+}
+
+Status InMemoryStoreClient::AsyncExists(const std::string &table_name,
+                                        const std::string &key,
+                                        Postable<void(bool)> callback) {
+  bool result = false;
+  auto table = GetTable(table_name);
+  if (table != nullptr) {
+    absl::ReaderMutexLock lock(&(table->mutex_));
+    result = table->records_.contains(key);
+  }
+  std::move(callback).Post("GcsInMemoryStore.Exists", result);
+  return Status::OK();
+}
+
+}  // namespace ray::gcs

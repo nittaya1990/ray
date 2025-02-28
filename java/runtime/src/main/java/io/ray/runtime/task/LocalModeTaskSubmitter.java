@@ -14,8 +14,8 @@ import io.ray.api.options.ActorCreationOptions;
 import io.ray.api.options.CallOptions;
 import io.ray.api.options.PlacementGroupCreationOptions;
 import io.ray.api.placementgroup.PlacementGroup;
+import io.ray.runtime.AbstractRayRuntime;
 import io.ray.runtime.ConcurrencyGroupImpl;
-import io.ray.runtime.RayRuntimeInternal;
 import io.ray.runtime.actor.LocalModeActorHandle;
 import io.ray.runtime.context.LocalModeWorkerContext;
 import io.ray.runtime.functionmanager.FunctionDescriptor;
@@ -59,7 +59,7 @@ public class LocalModeTaskSubmitter implements TaskSubmitter {
 
   private final Map<ObjectId, Set<TaskSpec>> waitingTasks = new HashMap<>();
   private final Object taskAndObjectLock = new Object();
-  private final RayRuntimeInternal runtime;
+  private final AbstractRayRuntime runtime;
   private final TaskExecutor taskExecutor;
   private final LocalModeObjectStore objectStore;
 
@@ -169,7 +169,7 @@ public class LocalModeTaskSubmitter implements TaskSubmitter {
   }
 
   public LocalModeTaskSubmitter(
-      RayRuntimeInternal runtime, TaskExecutor taskExecutor, LocalModeObjectStore objectStore) {
+      AbstractRayRuntime runtime, TaskExecutor taskExecutor, LocalModeObjectStore objectStore) {
     this.runtime = runtime;
     this.taskExecutor = taskExecutor;
     this.objectStore = objectStore;
@@ -205,14 +205,7 @@ public class LocalModeTaskSubmitter implements TaskSubmitter {
         }
       }
     }
-    if (taskSpec.getType() == TaskType.ACTOR_TASK && !isConcurrentActor(taskSpec)) {
-      ObjectId dummyObjectId =
-          new ObjectId(
-              taskSpec.getActorTaskSpec().getPreviousActorTaskDummyObjectId().toByteArray());
-      if (!objectStore.isObjectReady(dummyObjectId)) {
-        unreadyObjects.add(dummyObjectId);
-      }
-    } else if (taskSpec.getType() == TaskType.ACTOR_TASK) {
+    if (taskSpec.getType() == TaskType.ACTOR_TASK) {
       // Code path of concurrent actors.
       // For concurrent actors, we should make sure the actor created
       // before we submit the following actor tasks.
@@ -332,19 +325,13 @@ public class LocalModeTaskSubmitter implements TaskSubmitter {
     Preconditions.checkState(numReturns <= 1);
     TaskSpec.Builder builder = getTaskSpecBuilder(TaskType.ACTOR_TASK, functionDescriptor, args);
     List<ObjectId> returnIds =
-        getReturnIds(TaskId.fromBytes(builder.getTaskId().toByteArray()), numReturns + 1);
+        getReturnIds(TaskId.fromBytes(builder.getTaskId().toByteArray()), numReturns);
     TaskSpec taskSpec =
         builder
-            .setNumReturns(numReturns + 1)
+            .setNumReturns(numReturns)
             .setActorTaskSpec(
                 ActorTaskSpec.newBuilder()
                     .setActorId(ByteString.copyFrom(actor.getId().getBytes()))
-                    .setPreviousActorTaskDummyObjectId(
-                        ByteString.copyFrom(
-                            ((LocalModeActorHandle) actor)
-                                .exchangePreviousActorTaskDummyObjectId(
-                                    returnIds.get(returnIds.size() - 1))
-                                .getBytes()))
                     .build())
             .setConcurrencyGroupName(options.concurrencyGroupName)
             .build();
@@ -496,7 +483,6 @@ public class LocalModeTaskSubmitter implements TaskSubmitter {
                         ? objectStore.getRaw(Collections.singletonList(arg.id), -1).get(0)
                         : arg.value)
             .collect(Collectors.toList());
-    runtime.setIsContextSet(true);
     ((LocalModeWorkerContext) runtime.getWorkerContext()).setCurrentTask(taskSpec);
 
     ((LocalModeWorkerContext) runtime.getWorkerContext()).setCurrentWorkerId(workerId);
@@ -513,9 +499,7 @@ public class LocalModeTaskSubmitter implements TaskSubmitter {
     // Set this flag to true is necessary because at the end of `taskExecutor.execute()`,
     // this flag will be set to false. And `runtime.getWorkerContext()` requires it to be
     // true.
-    runtime.setIsContextSet(true);
     ((LocalModeWorkerContext) runtime.getWorkerContext()).setCurrentTask(null);
-    runtime.setIsContextSet(false);
     List<ObjectId> returnIds = getReturnIds(taskSpec);
     for (int i = 0; i < returnIds.size(); i++) {
       NativeRayObject putObject;

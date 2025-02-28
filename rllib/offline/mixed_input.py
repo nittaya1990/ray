@@ -14,11 +14,16 @@ from ray.tune.registry import registry_get_input, registry_contains_input
 class MixedInput(InputReader):
     """Mixes input from a number of other input sources.
 
-    Examples:
-        >>> MixedInput({
-            "sampler": 0.4,
-            "/tmp/experiences/*.json": 0.4,
-            "s3://bucket/expert.json": 0.2,
+    .. testcode::
+        :skipif: True
+
+        from ray.rllib.offline.io_context import IOContext
+        from ray.rllib.offline.mixed_input import MixedInput
+        ioctx = IOContext(...)
+        MixedInput({
+           "sampler": 0.4,
+           "/tmp/experiences/*.json": 0.4,
+           "s3://bucket/expert.json": 0.2,
         }, ioctx)
     """
 
@@ -27,9 +32,9 @@ class MixedInput(InputReader):
         """Initialize a MixedInput.
 
         Args:
-            dist (dict): dict mapping JSONReader paths or "sampler" to
+            dist: dict mapping JSONReader paths or "sampler" to
                 probabilities. The probabilities must sum to 1.0.
-            ioctx (IOContext): current IO context object.
+            ioctx: current IO context object.
         """
         if sum(dist.values()) != 1.0:
             raise ValueError("Values must sum to 1.0: {}".format(dist))

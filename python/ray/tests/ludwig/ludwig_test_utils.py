@@ -143,7 +143,7 @@ def random_string(length=5):
 def numerical_feature(normalization=None, **kwargs):
     feature = {
         "name": "num_" + random_string(),
-        "type": "numerical",
+        "type": "number",
         "preprocessing": {"normalization": normalization},
     }
     feature.update(kwargs)
@@ -521,7 +521,7 @@ def create_data_set_to_use(data_format, raw_data):
 
     # support for writing to a fwf dataset based on this stackoverflow posting:
     # https://stackoverflow.com/questions/16490261/python-pandas-write-dataframe-to-fixed-width-file-to-fwf
-    from tabulate import tabulate
+    from ray._private.thirdparty.tabulate.tabulate import tabulate
 
     def to_fwf(df, fname):
         content = tabulate(df.values.tolist(), list(df.columns), tablefmt="plain")
@@ -602,6 +602,7 @@ def train_with_backend(
     model = LudwigModel(config, backend=backend)
     output_dir = None
 
+    ret = False
     try:
         _, _, output_dir = model.train(
             dataset=dataset,
@@ -624,7 +625,8 @@ def train_with_backend(
             _, eval_preds, _ = model.evaluate(dataset=dataset)
             assert backend.df_engine.compute(eval_preds) is not None
 
-        return model.model.get_weights()
+        ret = True
     finally:
         # Remove results/intermediate data saved to disk
         shutil.rmtree(output_dir, ignore_errors=True)
+    return ret

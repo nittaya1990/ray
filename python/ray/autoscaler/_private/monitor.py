@@ -1,54 +1,51 @@
 """Autoscaler monitoring loop daemon."""
 
 import argparse
-from dataclasses import asdict
-import logging.handlers
-import os
-import sys
-import signal
-import time
-from typing import Any, Callable, Dict, Union
-import traceback
 import json
-from multiprocessing.synchronize import Event
-from typing import Optional
+import logging
+import os
+import signal
+import sys
+import time
+import traceback
+from collections import Counter
+from dataclasses import asdict
+from typing import Any, Callable, Dict, Optional, Union
+
+import ray
+import ray._private.ray_constants as ray_constants
+import ray._private.utils
+from ray._private.event.event_logger import get_event_logger
+from ray._private.ray_logging import setup_component_logger
+from ray._raylet import GcsClient
+from ray.autoscaler._private.autoscaler import StandardAutoscaler
+from ray.autoscaler._private.commands import teardown_cluster
+from ray.autoscaler._private.constants import (
+    AUTOSCALER_MAX_RESOURCE_DEMAND_VECTOR_SIZE,
+    AUTOSCALER_METRIC_PORT,
+    AUTOSCALER_UPDATE_INTERVAL_S,
+    DISABLE_LAUNCH_CONFIG_CHECK_KEY,
+)
+from ray.autoscaler._private.event_summarizer import EventSummarizer
+from ray.autoscaler._private.load_metrics import LoadMetrics
+from ray.autoscaler._private.prom_metrics import AutoscalerPrometheusMetrics
+from ray.autoscaler._private.util import format_readonly_node_type
+from ray.autoscaler.v2.sdk import get_cluster_resource_state
+from ray.core.generated import gcs_pb2
+from ray.core.generated.event_pb2 import Event as RayEvent
+from ray.experimental.internal_kv import (
+    _initialize_internal_kv,
+    _internal_kv_del,
+    _internal_kv_get,
+    _internal_kv_initialized,
+    _internal_kv_put,
+)
 
 try:
     import prometheus_client
 except ImportError:
     prometheus_client = None
 
-import ray
-from ray.autoscaler._private.autoscaler import StandardAutoscaler
-from ray.autoscaler._private.commands import teardown_cluster
-from ray.autoscaler._private.constants import (
-    AUTOSCALER_UPDATE_INTERVAL_S,
-    AUTOSCALER_METRIC_PORT,
-)
-from ray.autoscaler._private.event_summarizer import EventSummarizer
-from ray.autoscaler._private.prom_metrics import AutoscalerPrometheusMetrics
-from ray.autoscaler._private.load_metrics import LoadMetrics
-from ray.autoscaler._private.constants import AUTOSCALER_MAX_RESOURCE_DEMAND_VECTOR_SIZE
-from ray.autoscaler._private.util import format_readonly_node_type
-
-from ray.core.generated import gcs_service_pb2, gcs_service_pb2_grpc
-from ray.core.generated import gcs_pb2
-import ray.ray_constants as ray_constants
-from ray._private.ray_logging import setup_component_logger
-from ray._private.gcs_pubsub import gcs_pubsub_enabled, GcsPublisher
-from ray._private.gcs_utils import (
-    GcsClient,
-    get_gcs_address_from_redis,
-    use_gcs_for_bootstrap,
-)
-from ray.experimental.internal_kv import (
-    _initialize_internal_kv,
-    _internal_kv_put,
-    _internal_kv_initialized,
-    _internal_kv_get,
-    _internal_kv_del,
-)
-import ray._private.utils
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +103,7 @@ BASE_READONLY_CONFIG = {
     "provider": {
         "type": "readonly",
         "use_node_id_as_ip": True,  # For emulated multi-node on laptop.
+        DISABLE_LAUNCH_CONFIG_CHECK_KEY: True,  # No launch check.
     },
     "auth": {},
     "available_node_types": {
@@ -123,8 +121,6 @@ BASE_READONLY_CONFIG = {
     "worker_setup_commands": [],
     "head_start_ray_commands": [],
     "worker_start_ray_commands": [],
-    "head_node": {},
-    "worker_nodes": {},
 }
 
 
@@ -133,83 +129,42 @@ class Monitor:
 
     This process periodically collects stats from the GCS and triggers
     autoscaler updates.
-
-    Attributes:
-        redis: A connection to the Redis server.
     """
 
     def __init__(
         self,
         address: str,
         autoscaling_config: Union[str, Callable[[], Dict[str, Any]]],
-        redis_password: Optional[str] = None,
+        log_dir: str = None,
         prefix_cluster_info: bool = False,
         monitor_ip: Optional[str] = None,
-        stop_event: Optional[Event] = None,
         retry_on_failure: bool = True,
     ):
-        if not use_gcs_for_bootstrap():
-            # Initialize the Redis clients.
-            redis_address = address
-            self.redis = ray._private.services.create_redis_client(
-                redis_address, password=redis_password
+        self.gcs_address = address
+        worker = ray._private.worker.global_worker
+        # TODO: eventually plumb ClusterID through to here
+        self.gcs_client = GcsClient(address=self.gcs_address)
+
+        if monitor_ip:
+            monitor_addr = f"{monitor_ip}:{AUTOSCALER_METRIC_PORT}"
+            self.gcs_client.internal_kv_put(
+                b"AutoscalerMetricsAddress", monitor_addr.encode(), True, None
             )
-            (ip, port) = address.split(":")
-            # Initialize the gcs stub for getting all node resource usage.
-            gcs_address = get_gcs_address_from_redis(self.redis)
-        else:
-            gcs_address = address
-            redis_address = None
-
-        options = (("grpc.enable_http_proxy", 0),)
-        gcs_channel = ray._private.utils.init_grpc_channel(gcs_address, options)
-        # TODO: Use gcs client for this
-        self.gcs_node_resources_stub = (
-            gcs_service_pb2_grpc.NodeResourceInfoGcsServiceStub(gcs_channel)
-        )
-        self.gcs_node_info_stub = gcs_service_pb2_grpc.NodeInfoGcsServiceStub(
-            gcs_channel
-        )
-
-        # Set the redis client and mode so _internal_kv works for autoscaler.
-        worker = ray.worker.global_worker
-        if use_gcs_for_bootstrap():
-            gcs_client = GcsClient(address=gcs_address)
-        else:
-            worker.redis_client = self.redis
-            gcs_client = GcsClient.create_from_redis(self.redis)
-
+        _initialize_internal_kv(self.gcs_client)
         if monitor_ip:
             monitor_addr = f"{monitor_ip}:{AUTOSCALER_METRIC_PORT}"
-            if use_gcs_for_bootstrap():
-                gcs_client.internal_kv_put(
-                    b"AutoscalerMetricsAddress", monitor_addr.encode(), True, None
-                )
-            else:
-                self.redis.set("AutoscalerMetricsAddress", monitor_addr)
-        _initialize_internal_kv(gcs_client)
-        if monitor_ip:
-            monitor_addr = f"{monitor_ip}:{AUTOSCALER_METRIC_PORT}"
-            if use_gcs_for_bootstrap():
-                gcs_client.internal_kv_put(
-                    b"AutoscalerMetricsAddress", monitor_addr.encode(), True, None
-                )
-            else:
-                self.redis.set("AutoscalerMetricsAddress", monitor_addr)
+            self.gcs_client.internal_kv_put(
+                b"AutoscalerMetricsAddress", monitor_addr.encode(), True, None
+            )
+        self._session_name = self.get_session_name(self.gcs_client)
+        logger.info(f"session_name: {self._session_name}")
         worker.mode = 0
-        if use_gcs_for_bootstrap():
-            head_node_ip = gcs_address.split(":")[0]
-        else:
-            head_node_ip = redis_address.split(":")[0]
-            self.redis_address = redis_address
-            self.redis_password = redis_password
+        head_node_ip = self.gcs_address.split(":")[0]
 
         self.load_metrics = LoadMetrics()
         self.last_avail_resources = None
         self.event_summarizer = EventSummarizer()
         self.prefix_cluster_info = prefix_cluster_info
-        # Can be used to signal graceful exit from monitor loop.
-        self.stop_event = stop_event  # type: Optional[Event]
         self.retry_on_failure = retry_on_failure
         self.autoscaling_config = autoscaling_config
         self.autoscaler = None
@@ -217,7 +172,18 @@ class Monitor:
         # simply mirroring what the GCS tells us the cluster node types are.
         self.readonly_config = None
 
-        self.prom_metrics = AutoscalerPrometheusMetrics()
+        if log_dir:
+            try:
+                self.event_logger = get_event_logger(
+                    RayEvent.SourceType.AUTOSCALER, log_dir
+                )
+            except Exception:
+                self.event_logger = None
+        else:
+            self.event_logger = None
+
+        self.prom_metrics = AutoscalerPrometheusMetrics(session_name=self._session_name)
+
         if monitor_ip and prometheus_client:
             # If monitor_ip wasn't passed in, then don't attempt to start the
             # metric server to keep behavior identical to before metrics were
@@ -228,18 +194,24 @@ class Monitor:
                         AUTOSCALER_METRIC_PORT
                     )
                 )
+                kwargs = {"addr": "127.0.0.1"} if head_node_ip == "127.0.0.1" else {}
                 prometheus_client.start_http_server(
                     port=AUTOSCALER_METRIC_PORT,
-                    addr="127.0.0.1" if head_node_ip == "127.0.0.1" else "",
                     registry=self.prom_metrics.registry,
+                    **kwargs,
                 )
+
+                # Reset some gauges, since we don't know which labels have
+                # leaked if the autoscaler was restarted.
+                self.prom_metrics.pending_nodes.clear()
+                self.prom_metrics.active_nodes.clear()
             except Exception:
                 logger.exception(
                     "An exception occurred while starting the metrics server."
                 )
         elif not prometheus_client:
             logger.warning(
-                "`prometheus_client` not found, so metrics will " "not be exported."
+                "`prometheus_client` not found, so metrics will not be exported."
             )
 
         logger.info("Monitor: Started")
@@ -260,7 +232,8 @@ class Monitor:
         self.autoscaler = StandardAutoscaler(
             autoscaling_config,
             self.load_metrics,
-            self.gcs_node_info_stub,
+            self.gcs_client,
+            self._session_name,
             prefix_cluster_info=self.prefix_cluster_info,
             event_summarizer=self.event_summarizer,
             prom_metrics=self.prom_metrics,
@@ -269,10 +242,18 @@ class Monitor:
     def update_load_metrics(self):
         """Fetches resource usage data from GCS and updates load metrics."""
 
-        request = gcs_service_pb2.GetAllResourceUsageRequest()
-        response = self.gcs_node_resources_stub.GetAllResourceUsage(request, timeout=60)
+        response = self.gcs_client.get_all_resource_usage(timeout=60)
         resources_batch_data = response.resource_usage_data
         log_resource_batch_data_if_desired(resources_batch_data)
+
+        # This is a workaround to get correct idle_duration_ms
+        # from "get_cluster_resource_state"
+        # ref: https://github.com/ray-project/ray/pull/48519#issuecomment-2481659346
+        cluster_resource_state = get_cluster_resource_state(self.gcs_client)
+        ray_node_states = cluster_resource_state.node_states
+        ray_nodes_idle_duration_ms_by_id = {
+            node.node_id: node.idle_duration_ms for node in ray_node_states
+        }
 
         # Tell the readonly node provider what nodes to report.
         if self.readonly_config:
@@ -284,6 +265,12 @@ class Monitor:
 
         mirror_node_types = {}
         cluster_full = False
+        if (
+            hasattr(response, "cluster_full_of_actors_detected_by_gcs")
+            and response.cluster_full_of_actors_detected_by_gcs
+        ):
+            # GCS has detected the cluster full of actors.
+            cluster_full = True
         for resource_message in resources_batch_data.batch:
             node_id = resource_message.node_id
             # Generate node type config based on GCS reported node list.
@@ -302,9 +289,8 @@ class Monitor:
                 hasattr(resource_message, "cluster_full_of_actors_detected")
                 and resource_message.cluster_full_of_actors_detected
             ):
-                # Aggregate this flag across all batches.
+                # A worker node has detected the cluster full of actors.
                 cluster_full = True
-            resource_load = dict(resource_message.resource_load)
             total_resources = dict(resource_message.resources_total)
             available_resources = dict(resource_message.resources_available)
 
@@ -333,12 +319,21 @@ class Monitor:
                     ip = node_id.hex()
             else:
                 ip = resource_message.node_manager_address
+
+            idle_duration_s = 0.0
+            if node_id in ray_nodes_idle_duration_ms_by_id:
+                idle_duration_s = ray_nodes_idle_duration_ms_by_id[node_id] / 1000
+            else:
+                logger.warning(
+                    f"node_id {node_id} not found in ray_nodes_idle_duration_ms_by_id"
+                )
+
             self.load_metrics.update(
                 ip,
                 node_id,
                 total_resources,
                 available_resources,
-                resource_load,
+                idle_duration_s,
                 waiting_bundles,
                 infeasible_bundles,
                 pending_placement_groups,
@@ -347,11 +342,34 @@ class Monitor:
         if self.readonly_config:
             self.readonly_config["available_node_types"].update(mirror_node_types)
 
+    def get_session_name(self, gcs_client: GcsClient) -> Optional[str]:
+        """Obtain the session name from the GCS.
+
+        If the GCS doesn't respond, session name is considered None.
+        In this case, the metrics reported from the monitor won't have
+        the correct session name.
+        """
+        if not _internal_kv_initialized():
+            return None
+
+        session_name = gcs_client.internal_kv_get(
+            b"session_name",
+            ray_constants.KV_NAMESPACE_SESSION,
+            timeout=10,
+        )
+
+        if session_name:
+            session_name = session_name.decode()
+
+        return session_name
+
     def update_resource_requests(self):
         """Fetches resource requests from the internal KV and updates load."""
         if not _internal_kv_initialized():
             return
-        data = _internal_kv_get(ray.ray_constants.AUTOSCALER_RESOURCE_REQUEST_CHANNEL)
+        data = _internal_kv_get(
+            ray._private.ray_constants.AUTOSCALER_RESOURCE_REQUEST_CHANNEL
+        )
         if data:
             try:
                 resource_request = json.loads(data)
@@ -361,15 +379,17 @@ class Monitor:
 
     def _run(self):
         """Run the monitor loop."""
+
         while True:
             try:
-                if self.stop_event and self.stop_event.is_set():
-                    break
+                gcs_request_start_time = time.time()
                 self.update_load_metrics()
+                gcs_request_time = time.time() - gcs_request_start_time
                 self.update_resource_requests()
                 self.update_event_summary()
+                load_metrics_summary = self.load_metrics.summary()
                 status = {
-                    "load_metrics_report": asdict(self.load_metrics.summary()),
+                    "gcs_request_time": gcs_request_time,
                     "time": time.time(),
                     "monitor_pid": os.getpid(),
                 }
@@ -385,10 +405,26 @@ class Monitor:
                     )
                 elif self.autoscaler:
                     # Process autoscaling actions
+                    update_start_time = time.time()
                     self.autoscaler.update()
+                    status["autoscaler_update_time"] = time.time() - update_start_time
                     autoscaler_summary = self.autoscaler.summary()
+                    try:
+                        self.emit_metrics(
+                            load_metrics_summary,
+                            autoscaler_summary,
+                            self.autoscaler.all_node_types,
+                        )
+                    except Exception:
+                        logger.exception("Error emitting metrics")
+
                     if autoscaler_summary:
                         status["autoscaler_report"] = asdict(autoscaler_summary)
+                        status[
+                            "non_terminated_nodes_time"
+                        ] = (
+                            self.autoscaler.non_terminated_nodes.non_terminated_nodes_time  # noqa: E501
+                        )
 
                     for msg in self.event_summarizer.summary():
                         # Need to prefix each line of the message for the lines to
@@ -399,8 +435,12 @@ class Monitor:
                                     ray_constants.LOG_PREFIX_EVENT_SUMMARY, line
                                 )
                             )
+                            if self.event_logger:
+                                self.event_logger.info(line)
+
                     self.event_summarizer.clear()
 
+                status["load_metrics_report"] = asdict(load_metrics_summary)
                 as_json = json.dumps(status)
                 if _internal_kv_initialized():
                     _internal_kv_put(
@@ -417,17 +457,68 @@ class Monitor:
             # round of messages.
             time.sleep(AUTOSCALER_UPDATE_INTERVAL_S)
 
+    def emit_metrics(self, load_metrics_summary, autoscaler_summary, node_types):
+        if autoscaler_summary is None:
+            return None
+
+        for resource_name in ["CPU", "GPU", "TPU"]:
+            _, total = load_metrics_summary.usage.get(resource_name, (0, 0))
+            pending = autoscaler_summary.pending_resources.get(resource_name, 0)
+            self.prom_metrics.cluster_resources.labels(
+                resource=resource_name,
+                SessionName=self.prom_metrics.session_name,
+            ).set(total)
+            self.prom_metrics.pending_resources.labels(
+                resource=resource_name,
+                SessionName=self.prom_metrics.session_name,
+            ).set(pending)
+
+        pending_node_count = Counter()
+        for _, node_type, _ in autoscaler_summary.pending_nodes:
+            pending_node_count[node_type] += 1
+
+        for node_type, count in autoscaler_summary.pending_launches.items():
+            pending_node_count[node_type] += count
+
+        for node_type in node_types:
+            count = pending_node_count[node_type]
+            self.prom_metrics.pending_nodes.labels(
+                SessionName=self.prom_metrics.session_name,
+                NodeType=node_type,
+            ).set(count)
+
+        for node_type in node_types:
+            count = autoscaler_summary.active_nodes.get(node_type, 0)
+            self.prom_metrics.active_nodes.labels(
+                SessionName=self.prom_metrics.session_name,
+                NodeType=node_type,
+            ).set(count)
+
+        failed_node_counts = Counter()
+        for _, node_type in autoscaler_summary.failed_nodes:
+            failed_node_counts[node_type] += 1
+
+        # NOTE: This metric isn't reset with monitor resets. This means it will
+        # only be updated when the autoscaler' node tracker remembers failed
+        # nodes. If the node type failure is evicted from the autoscaler, the
+        # metric may not update for a while.
+        for node_type, count in failed_node_counts.items():
+            self.prom_metrics.recently_failed_nodes.labels(
+                SessionName=self.prom_metrics.session_name,
+                NodeType=node_type,
+            ).set(count)
+
     def update_event_summary(self):
         """Report the current size of the cluster.
 
-        To avoid log spam, only cluster size changes (CPU or GPU count change)
+        To avoid log spam, only cluster size changes (CPU, GPU or TPU count change)
         are reported to the event summarizer. The event summarizer will report
         only the latest cluster size per batch.
         """
         avail_resources = self.load_metrics.resources_avail_summary()
         if not self.readonly_config and avail_resources != self.last_avail_resources:
             self.event_summarizer.add(
-                "Resized to {}.",  # e.g., Resized to 100 CPUs, 4 GPUs.
+                "Resized to {}.",  # e.g., Resized to 100 CPUs, 4 GPUs, 4 TPUs.
                 quantity=avail_resources,
                 aggregate=lambda old, new: new,
             )
@@ -466,7 +557,6 @@ class Monitor:
                 time.sleep(2)
 
     def _handle_failure(self, error):
-        logger.exception("Error in monitor loop")
         if (
             self.autoscaler is not None
             and os.environ.get("RAY_AUTOSCALER_FATESHARE_WORKERS", "") == "1"
@@ -482,26 +572,12 @@ class Monitor:
             _internal_kv_put(
                 ray_constants.DEBUG_AUTOSCALING_ERROR, message, overwrite=True
             )
-        if not use_gcs_for_bootstrap():
-            redis_client = ray._private.services.create_redis_client(
-                self.redis_address, password=self.redis_password
-            )
-        else:
-            redis_client = None
-        gcs_publisher = None
-        if gcs_pubsub_enabled():
-            if use_gcs_for_bootstrap():
-                gcs_publisher = GcsPublisher(address=args.gcs_address)
-            else:
-                gcs_publisher = GcsPublisher(
-                    address=get_gcs_address_from_redis(redis_client)
-                )
+        gcs_publisher = ray._raylet.GcsPublisher(address=self.gcs_address)
         from ray._private.utils import publish_error_to_driver
 
         publish_error_to_driver(
             ray_constants.MONITOR_DIED_ERROR,
             message,
-            redis_client=redis_client,
             gcs_publisher=gcs_publisher,
         )
 
@@ -527,6 +603,7 @@ class Monitor:
             self._initialize_autoscaler()
             self._run()
         except Exception:
+            logger.exception("Error in monitor loop")
             self._handle_failure(traceback.format_exc())
             raise
 
@@ -542,26 +619,16 @@ def log_resource_batch_data_if_desired(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description=("Parse Redis server for the " "monitor to connect to.")
+        description=("Parse GCS server for the monitor to connect to.")
     )
     parser.add_argument(
         "--gcs-address", required=False, type=str, help="The address (ip:port) of GCS."
-    )
-    parser.add_argument(
-        "--redis-address", required=False, type=str, help="the address to use for Redis"
     )
     parser.add_argument(
         "--autoscaling-config",
         required=False,
         type=str,
         help="the path to the autoscaling config file",
-    )
-    parser.add_argument(
-        "--redis-password",
-        required=False,
-        type=str,
-        default=None,
-        help="the password to use for Redis",
     )
     parser.add_argument(
         "--logging-level",
@@ -591,7 +658,7 @@ if __name__ == "__main__":
         "--logs-dir",
         required=True,
         type=str,
-        help="Specify the path of the temporary directory used by Ray " "processes.",
+        help="Specify the path of the temporary directory used by Ray processes.",
     )
     parser.add_argument(
         "--logging-rotate-bytes",
@@ -617,6 +684,7 @@ if __name__ == "__main__":
         default=None,
         help="The IP address of the machine hosting the monitor process.",
     )
+
     args = parser.parse_args()
     setup_component_logger(
         logging_level=args.logging_level,
@@ -637,16 +705,14 @@ if __name__ == "__main__":
     else:
         autoscaling_config = None
 
-    bootstrap_address = (
-        args.gcs_address if use_gcs_for_bootstrap() else args.redis_address
-    )
+    bootstrap_address = args.gcs_address
     if bootstrap_address is None:
-        raise ValueError("One of --gcs-address or --redis-address must be set!")
+        raise ValueError("--gcs-address must be set!")
 
     monitor = Monitor(
         bootstrap_address,
         autoscaling_config,
-        redis_password=args.redis_password,
+        log_dir=args.logs_dir,
         monitor_ip=args.monitor_ip,
     )
 

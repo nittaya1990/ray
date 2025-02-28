@@ -11,30 +11,40 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include "gmock/gmock.h"
 
 namespace ray {
 namespace gcs {
 
 class MockGcsNodeManager : public GcsNodeManager {
  public:
-  MockGcsNodeManager() : GcsNodeManager(nullptr, nullptr, nullptr) {}
-  MOCK_METHOD(void, HandleRegisterNode,
-              (const rpc::RegisterNodeRequest &request, rpc::RegisterNodeReply *reply,
+  MockGcsNodeManager()
+      : GcsNodeManager(/*gcs_publisher=*/nullptr,
+                       /*gcs_table_storage=*/nullptr,
+                       /*io_context=*/mocked_io_context_not_used_,
+                       /*raylet_client_pool=*/nullptr,
+                       /*cluster_id=*/ClusterID::Nil()) {}
+  MOCK_METHOD(void,
+              HandleRegisterNode,
+              (rpc::RegisterNodeRequest request,
+               rpc::RegisterNodeReply *reply,
                rpc::SendReplyCallback send_reply_callback),
               (override));
-  MOCK_METHOD(void, HandleDrainNode,
-              (const rpc::DrainNodeRequest &request, rpc::DrainNodeReply *reply,
+  MOCK_METHOD(void,
+              HandleDrainNode,
+              (rpc::DrainNodeRequest request,
+               rpc::DrainNodeReply *reply,
                rpc::SendReplyCallback send_reply_callback),
               (override));
-  MOCK_METHOD(void, HandleGetAllNodeInfo,
-              (const rpc::GetAllNodeInfoRequest &request, rpc::GetAllNodeInfoReply *reply,
+  MOCK_METHOD(void,
+              HandleGetAllNodeInfo,
+              (rpc::GetAllNodeInfoRequest request,
+               rpc::GetAllNodeInfoReply *reply,
                rpc::SendReplyCallback send_reply_callback),
               (override));
-  MOCK_METHOD(void, HandleGetInternalConfig,
-              (const rpc::GetInternalConfigRequest &request,
-               rpc::GetInternalConfigReply *reply,
-               rpc::SendReplyCallback send_reply_callback),
-              (override));
+  MOCK_METHOD(void, DrainNode, (const NodeID &node_id), (override));
+
+  instrumented_io_context mocked_io_context_not_used_;
 };
 
 }  // namespace gcs

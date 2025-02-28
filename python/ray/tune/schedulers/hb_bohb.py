@@ -1,14 +1,18 @@
 import logging
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
-from ray.tune import trial_runner
-from ray.tune.schedulers.trial_scheduler import TrialScheduler
+from ray.tune.experiment import Trial
 from ray.tune.schedulers.hyperband import HyperBandScheduler
-from ray.tune.trial import Trial
+from ray.tune.schedulers.trial_scheduler import TrialScheduler
+from ray.util import PublicAPI
+
+if TYPE_CHECKING:
+    from ray.tune.execution.tune_controller import TuneController
 
 logger = logging.getLogger(__name__)
 
 
+@PublicAPI
 class HyperBandForBOHB(HyperBandScheduler):
     """Extends HyperBand early stopping algorithm for BOHB.
 
@@ -24,7 +28,7 @@ class HyperBandForBOHB(HyperBandScheduler):
     See ray.tune.schedulers.HyperBandScheduler for parameter docstring.
     """
 
-    def on_trial_add(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def on_trial_add(self, tune_controller: "TuneController", trial: Trial):
         """Adds new trial.
 
         On a new trial add, if current bracket is not filled, add to current
@@ -37,7 +41,7 @@ class HyperBandForBOHB(HyperBandScheduler):
                 "{} has been instantiated without a valid `metric` ({}) or "
                 "`mode` ({}) parameter. Either pass these parameters when "
                 "instantiating the scheduler, or pass them as parameters "
-                "to `tune.run()`".format(
+                "to `tune.TuneConfig()`".format(
                     self.__class__.__name__, self._metric, self._mode
                 )
             )
@@ -70,7 +74,7 @@ class HyperBandForBOHB(HyperBandScheduler):
         self._trial_info[trial] = cur_bracket, self._state["band_idx"]
 
     def on_trial_result(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ) -> str:
         """If bracket is finished, all trials will be stopped.
 
@@ -95,12 +99,33 @@ class HyperBandForBOHB(HyperBandScheduler):
         if not bracket.filled() or any(
             status != Trial.PAUSED for t, status in statuses if t is not trial
         ):
+            # BOHB Specific. This hack existed in old Ray versions
+            # and was removed, but it needs to be brought back
+            # as otherwise the BOHB doesn't behave as intended.
+            # The default concurrency limiter works by discarding
+            # new suggestions if there are more running trials
+            # than the limit. That doesn't take into account paused
+            # trials. With BOHB, this leads to N trials finishing
+            # completely and then another N trials starting,
+            # instead of trials being paused and resumed in brackets
+            # as intended.
+            # There should be a better API for this.
+            # TODO(team-ml): Refactor alongside HyperBandForBOHB
+            tune_controller.search_alg.searcher.on_pause(trial.trial_id)
             return TrialScheduler.PAUSE
-        action = self._process_bracket(trial_runner, bracket)
+
+        logger.debug(f"Processing bracket after trial {trial} result")
+        action = self._process_bracket(tune_controller, bracket)
+        if action == TrialScheduler.PAUSE:
+            tune_controller.search_alg.searcher.on_pause(trial.trial_id)
         return action
 
+    def _unpause_trial(self, tune_controller: "TuneController", trial: Trial):
+        # Hack. See comment in on_trial_result
+        tune_controller.search_alg.searcher.on_unpause(trial.trial_id)
+
     def choose_trial_to_run(
-        self, trial_runner: "trial_runner.TrialRunner", allow_recurse: bool = True
+        self, tune_controller: "TuneController", allow_recurse: bool = True
     ) -> Optional[Trial]:
         """Fair scheduling within iteration by completion percentage.
 
@@ -116,12 +141,12 @@ class HyperBandForBOHB(HyperBandScheduler):
             for bracket in scrubbed:
                 for trial in bracket.current_trials():
                     if (
-                        trial.status == Trial.PENDING
-                        and trial_runner.trial_executor.has_resources_for_trial(trial)
-                    ):
+                        trial.status == Trial.PAUSED
+                        and trial in bracket.trials_to_unpause
+                    ) or trial.status == Trial.PENDING:
                         return trial
         # MAIN CHANGE HERE!
-        if not any(t.status == Trial.RUNNING for t in trial_runner.get_trials()):
+        if not any(t.status == Trial.RUNNING for t in tune_controller.get_trials()):
             for hyperband in self._hyperbands:
                 for bracket in hyperband:
                     if bracket and any(
@@ -129,18 +154,23 @@ class HyperBandForBOHB(HyperBandScheduler):
                         for trial in bracket.current_trials()
                     ):
                         # This will change the trial state
-                        self._process_bracket(trial_runner, bracket)
+                        logger.debug("Processing bracket since no trial is running.")
+                        self._process_bracket(tune_controller, bracket)
 
                         # If there are pending trials now, suggest one.
                         # This is because there might be both PENDING and
                         # PAUSED trials now, and PAUSED trials will raise
                         # an error before the trial runner tries again.
                         if allow_recurse and any(
-                            trial.status == Trial.PENDING
+                            (
+                                trial.status == Trial.PAUSED
+                                and trial in bracket.trials_to_unpause
+                            )
+                            or trial.status == Trial.PENDING
                             for trial in bracket.current_trials()
                         ):
                             return self.choose_trial_to_run(
-                                trial_runner, allow_recurse=False
+                                tune_controller, allow_recurse=False
                             )
         # MAIN CHANGE HERE!
         return None

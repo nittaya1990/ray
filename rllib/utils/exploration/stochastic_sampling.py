@@ -1,11 +1,11 @@
 import functools
-import gym
+import gymnasium as gym
 import numpy as np
 from typing import Optional, Union
 
 from ray.rllib.models.action_dist import ActionDistribution
 from ray.rllib.models.modelv2 import ModelV2
-from ray.rllib.utils.annotations import override
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.exploration.exploration import Exploration
 from ray.rllib.utils.exploration.random import Random
 from ray.rllib.utils.framework import (
@@ -20,6 +20,7 @@ tf1, tf, tfv = try_import_tf()
 torch, _ = try_import_torch()
 
 
+@OldAPIStack
 class StochasticSampling(Exploration):
     """An exploration that simply samples from a distribution.
 
@@ -112,7 +113,7 @@ class StochasticSampling(Exploration):
         )
 
         # Increment `last_timestep` by 1 (or set to `timestep`).
-        if self.framework in ["tf2", "tfe"]:
+        if self.framework == "tf2":
             self.last_timestep.assign_add(1)
             return action, logp
         else:

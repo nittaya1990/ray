@@ -16,14 +16,21 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
 #include <boost/asio.hpp>
 #include <chrono>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "absl/synchronization/mutex.h"
+#include "ray/common/asio/asio_chaos.h"
 #include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/grpc_util.h"
+#include "ray/common/id.h"
 #include "ray/common/status.h"
-#include "ray/util/util.h"
+#include "ray/util/thread_utils.h"
 
 namespace ray {
 namespace rpc {
@@ -54,7 +61,7 @@ class ClientCallManager;
 ///
 /// \tparam Reply Type of the reply message.
 template <class Reply>
-using ClientCallback = std::function<void(const Status &status, const Reply &reply)>;
+using ClientCallback = std::function<void(const Status &status, Reply &&reply)>;
 
 /// Implementation of the `ClientCall`. It represents a `ClientCall` for a particular
 /// RPC method.
@@ -67,6 +74,7 @@ class ClientCallImpl : public ClientCall {
   ///
   /// \param[in] callback The callback function to handle the reply.
   explicit ClientCallImpl(const ClientCallback<Reply> &callback,
+                          const ClusterID &cluster_id,
                           std::shared_ptr<StatsHandle> stats_handle,
                           int64_t timeout_ms = -1)
       : callback_(std::move(const_cast<ClientCallback<Reply> &>(callback))),
@@ -75,6 +83,9 @@ class ClientCallImpl : public ClientCall {
       auto deadline =
           std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms);
       context_.set_deadline(deadline);
+    }
+    if (!cluster_id.IsNil()) {
+      context_.AddMetadata(kClusterIdKey, cluster_id.Hex());
     }
   }
 
@@ -95,7 +106,8 @@ class ClientCallImpl : public ClientCall {
       status = return_status_;
     }
     if (callback_ != nullptr) {
-      callback_(status, reply_);
+      // This should be only called once.
+      callback_(status, std::move(reply_));
     }
   }
 
@@ -125,7 +137,7 @@ class ClientCallImpl : public ClientCall {
   /// return_status_ = GrpcStatusToRayStatus(status_) but need
   /// a separate variable because status_ is set internally by
   /// GRPC and we cannot control it holding the lock.
-  ray::Status return_status_ GUARDED_BY(mutex_);
+  ray::Status return_status_ ABSL_GUARDED_BY(mutex_);
 
   /// Context for the client. It could be used to convey extra information to
   /// the server and/or tweak certain RPC behaviors.
@@ -167,7 +179,8 @@ class ClientCallTag {
 /// \tparam Reply Type of the reply message.
 template <class GrpcService, class Request, class Reply>
 using PrepareAsyncFunction = std::unique_ptr<grpc::ClientAsyncResponseReader<Reply>> (
-    GrpcService::Stub::*)(grpc::ClientContext *context, const Request &request,
+    GrpcService::Stub::*)(grpc::ClientContext *context,
+                          const Request &request,
                           grpc::CompletionQueue *cq);
 
 /// `ClientCallManager` is used to manage outgoing gRPC requests and the lifecycles of
@@ -183,19 +196,23 @@ class ClientCallManager {
   ///
   /// \param[in] main_service The main event loop, to which the callback functions will be
   /// posted.
-  explicit ClientCallManager(instrumented_io_context &main_service, int num_threads = 1,
+  ///
+  explicit ClientCallManager(instrumented_io_context &main_service,
+                             const ClusterID &cluster_id = ClusterID::Nil(),
+                             int num_threads = 1,
                              int64_t call_timeout_ms = -1)
-      : main_service_(main_service),
+      : cluster_id_(cluster_id),
+        main_service_(main_service),
         num_threads_(num_threads),
         shutdown_(false),
         call_timeout_ms_(call_timeout_ms) {
-    rr_index_ = rand() % num_threads_;
+    rr_index_ = std::rand() % num_threads_;
     // Start the polling threads.
     cqs_.reserve(num_threads_);
     for (int i = 0; i < num_threads_; i++) {
       cqs_.push_back(std::make_unique<grpc::CompletionQueue>());
-      polling_threads_.emplace_back(&ClientCallManager::PollEventsFromCompletionQueue,
-                                    this, i);
+      polling_threads_.emplace_back(
+          &ClientCallManager::PollEventsFromCompletionQueue, this, i);
     }
   }
 
@@ -229,14 +246,17 @@ class ClientCallManager {
   std::shared_ptr<ClientCall> CreateCall(
       typename GrpcService::Stub &stub,
       const PrepareAsyncFunction<GrpcService, Request, Reply> prepare_async_function,
-      const Request &request, const ClientCallback<Reply> &callback,
-      std::string call_name, int64_t method_timeout_ms = -1) {
+      const Request &request,
+      const ClientCallback<Reply> &callback,
+      std::string call_name,
+      int64_t method_timeout_ms = -1) {
     auto stats_handle = main_service_.stats().RecordStart(call_name);
     if (method_timeout_ms == -1) {
       method_timeout_ms = call_timeout_ms_;
     }
-    auto call = std::make_shared<ClientCallImpl<Reply>>(callback, std::move(stats_handle),
-                                                        method_timeout_ms);
+
+    auto call = std::make_shared<ClientCallImpl<Reply>>(
+        callback, cluster_id_, std::move(stats_handle), method_timeout_ms);
     // Send request.
     // Find the next completion queue to wait for response.
     call->response_reader_ = (stub.*prepare_async_function)(
@@ -250,9 +270,17 @@ class ClientCallManager {
     // `ClientCall` is safe to use. But `response_reader_->Finish` only accepts a raw
     // pointer.
     auto tag = new ClientCallTag(call);
-    call->response_reader_->Finish(&call->reply_, &call->status_, (void *)tag);
+    call->response_reader_->Finish(
+        &call->reply_, &call->status_, static_cast<void *>(tag));
     return call;
   }
+
+  /// Get the cluster ID.
+  const ClusterID &GetClusterId() const { return cluster_id_; }
+  void SetClusterId(const ClusterID &cluster_id) { cluster_id_ = cluster_id; }
+
+  /// Get the main service of this rpc.
+  instrumented_io_context &GetMainService() { return main_service_; }
 
  private:
   /// This function runs in a background thread. It keeps polling events from the
@@ -285,7 +313,7 @@ class ClientCallManager {
         got_tag = nullptr;
         tag->GetCall()->SetReturnStatus();
         std::shared_ptr<StatsHandle> stats_handle = tag->GetCall()->GetStatsHandle();
-        RAY_CHECK(stats_handle != nullptr);
+        RAY_CHECK_NE(stats_handle, nullptr);
         if (ok && !main_service_.stopped() && !shutdown_) {
           // Post the callback to the main event loop.
           main_service_.post(
@@ -294,13 +322,21 @@ class ClientCallManager {
                 // The call is finished, and we can delete this tag now.
                 delete tag;
               },
-              std::move(stats_handle));
+              stats_handle->event_name + ".OnReplyReceived",
+              // Implement the delay of the rpc client call as the
+              // delay of OnReplyReceived().
+              ray::asio::testing::get_delay_us(stats_handle->event_name));
+          EventTracker::RecordEnd(std::move(stats_handle));
         } else {
           delete tag;
         }
       }
     }
   }
+
+  /// UUID of the cluster. Potential race between creating a ClientCall object
+  /// and setting the cluster ID.
+  ClusterID cluster_id_;
 
   /// The main event loop, to which the callback functions will be posted.
   instrumented_io_context &main_service_;

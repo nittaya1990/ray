@@ -1,57 +1,68 @@
-import inspect
-import pickle
+import logging
+import warnings
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Union
 
-import pydantic
-from google.protobuf.json_format import MessageToDict
-from pydantic import (
+from ray import cloudpickle
+from ray._private.pydantic_compat import (
     BaseModel,
+    Field,
     NonNegativeFloat,
-    PositiveFloat,
     NonNegativeInt,
+    PositiveFloat,
     PositiveInt,
+    PrivateAttr,
     validator,
 )
-
-from ray import cloudpickle as cloudpickle
-from ray.serve.constants import (
-    DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_S,
-    DEFAULT_GRACEFUL_SHUTDOWN_WAIT_LOOP_S,
-    DEFAULT_HEALTH_CHECK_PERIOD_S,
-    DEFAULT_HEALTH_CHECK_TIMEOUT_S,
+from ray._private.utils import import_attr
+from ray.serve._private.constants import (
+    DEFAULT_AUTOSCALING_POLICY,
+    DEFAULT_GRPC_PORT,
     DEFAULT_HTTP_HOST,
     DEFAULT_HTTP_PORT,
+    DEFAULT_TARGET_ONGOING_REQUESTS,
+    DEFAULT_UVICORN_KEEP_ALIVE_TIMEOUT_S,
+    SERVE_LOGGER_NAME,
 )
-from ray.serve.generated.serve_pb2 import (
-    DeploymentConfig as DeploymentConfigProto,
-    DeploymentLanguage,
-    AutoscalingConfig as AutoscalingConfigProto,
-)
+from ray.util.annotations import Deprecated, PublicAPI
+
+logger = logging.getLogger(SERVE_LOGGER_NAME)
 
 
+@PublicAPI(stability="stable")
 class AutoscalingConfig(BaseModel):
+    """Config for the Serve Autoscaler."""
+
     # Please keep these options in sync with those in
     # `src/ray/protobuf/serve.proto`.
 
     # Publicly exposed options
     min_replicas: NonNegativeInt = 1
+    initial_replicas: Optional[NonNegativeInt] = None
     max_replicas: PositiveInt = 1
-    target_num_ongoing_requests_per_replica: NonNegativeInt = 1
 
-    # Private options below.
-
-    # Metrics scraping options
+    target_ongoing_requests: PositiveFloat = DEFAULT_TARGET_ONGOING_REQUESTS
 
     # How often to scrape for metrics
     metrics_interval_s: PositiveFloat = 10.0
     # Time window to average over for metrics.
     look_back_period_s: PositiveFloat = 30.0
 
-    # Internal autoscaling configuration options
+    # DEPRECATED
+    smoothing_factor: PositiveFloat = 1.0
+    # DEPRECATED: replaced by `downscaling_factor`
+    upscale_smoothing_factor: Optional[PositiveFloat] = Field(
+        default=None, description="[DEPRECATED] Please use `upscaling_factor` instead."
+    )
+    # DEPRECATED: replaced by `upscaling_factor`
+    downscale_smoothing_factor: Optional[PositiveFloat] = Field(
+        default=None,
+        description="[DEPRECATED] Please use `downscaling_factor` instead.",
+    )
 
     # Multiplicative "gain" factor to limit scaling decisions
-    smoothing_factor: PositiveFloat = 1.0
+    upscaling_factor: Optional[PositiveFloat] = None
+    downscaling_factor: Optional[PositiveFloat] = None
 
     # How frequently to make autoscaling decisions
     # loop_period_s: float = CONTROL_LOOP_PERIOD_S
@@ -60,241 +71,183 @@ class AutoscalingConfig(BaseModel):
     # How long to wait before scaling up replicas
     upscale_delay_s: NonNegativeFloat = 30.0
 
-    @validator("max_replicas")
-    def max_replicas_greater_than_or_equal_to_min_replicas(cls, v, values):
-        if "min_replicas" in values and v < values["min_replicas"]:
+    # Cloudpickled policy definition.
+    _serialized_policy_def: bytes = PrivateAttr(default=b"")
+
+    # Custom autoscaling config. Defaults to the request-based autoscaler.
+    _policy: Union[str, Callable] = PrivateAttr(default=DEFAULT_AUTOSCALING_POLICY)
+
+    @validator("max_replicas", always=True)
+    def replicas_settings_valid(cls, max_replicas, values):
+        min_replicas = values.get("min_replicas")
+        initial_replicas = values.get("initial_replicas")
+        if min_replicas is not None and max_replicas < min_replicas:
             raise ValueError(
-                f"""max_replicas ({v}) must be greater than """
-                f"""or equal to min_replicas """
-                f"""({values["min_replicas"]})!"""
+                f"max_replicas ({max_replicas}) must be greater than "
+                f"or equal to min_replicas ({min_replicas})!"
             )
-        return v
 
-    # TODO(architkulkarni): implement below
-    # The number of replicas to start with when creating the deployment
-    # initial_replicas: int = 1
-    # The num_ongoing_requests_per_replica error ratio (desired / current)
-    # threshold for overriding `upscale_delay_s`
-    # panic_mode_threshold: float = 2.0
+        if initial_replicas is not None:
+            if initial_replicas < min_replicas:
+                raise ValueError(
+                    f"min_replicas ({min_replicas}) must be less than "
+                    f"or equal to initial_replicas ({initial_replicas})!"
+                )
+            elif initial_replicas > max_replicas:
+                raise ValueError(
+                    f"max_replicas ({max_replicas}) must be greater than "
+                    f"or equal to initial_replicas ({initial_replicas})!"
+                )
 
-    # TODO(architkulkarni): Add reasonable defaults
+        return max_replicas
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.serialize_policy()
 
-class DeploymentConfig(BaseModel):
-    """Configuration options for a deployment, to be set by the user.
+    def serialize_policy(self) -> None:
+        """Serialize policy with cloudpickle.
 
-    Args:
-        num_replicas (Optional[int]): The number of processes to start up that
-            will handle requests to this deployment. Defaults to 1.
-        max_concurrent_queries (Optional[int]): The maximum number of queries
-            that will be sent to a replica of this deployment without receiving
-            a response. Defaults to 100.
-        user_config (Optional[Any]): Arguments to pass to the reconfigure
-            method of the deployment. The reconfigure method is called if
-            user_config is not None.
-        graceful_shutdown_wait_loop_s (Optional[float]): Duration
-            that deployment replicas will wait until there is no more work to
-            be done before shutting down.
-        graceful_shutdown_timeout_s (Optional[float]):
-            Controller waits for this duration to forcefully kill the replica
-            for shutdown.
-        health_check_period_s (Optional[float]):
-            Frequency at which the controller will health check replicas.
-        health_check_timeout_s (Optional[float]):
-            Timeout that the controller will wait for a response from the
-            replica's health check before marking it unhealthy.
-    """
+        Import the policy if it's passed in as a string import path. Then cloudpickle
+        the policy and set `serialized_policy_def` if it's empty.
+        """
+        values = self.dict()
+        policy = values.get("_policy")
+        if isinstance(policy, Callable):
+            policy = f"{policy.__module__}.{policy.__name__}"
 
-    num_replicas: PositiveInt = 1
-    max_concurrent_queries: Optional[int] = None
-    user_config: Any = None
+        if not policy:
+            policy = DEFAULT_AUTOSCALING_POLICY
 
-    graceful_shutdown_timeout_s: NonNegativeFloat = (
-        DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_S  # noqa: E501
-    )
-    graceful_shutdown_wait_loop_s: NonNegativeFloat = (
-        DEFAULT_GRACEFUL_SHUTDOWN_WAIT_LOOP_S  # noqa: E501
-    )
+        policy_path = policy
+        policy = import_attr(policy)
 
-    health_check_period_s: PositiveFloat = DEFAULT_HEALTH_CHECK_PERIOD_S
-    health_check_timeout_s: PositiveFloat = DEFAULT_HEALTH_CHECK_TIMEOUT_S
-
-    autoscaling_config: Optional[AutoscalingConfig] = None
-
-    # This flag is used to let replica know they are deplyed from
-    # a different language.
-    is_cross_language: bool = False
-
-    # This flag is used to let controller know which language does
-    # the deploymnent use.
-    deployment_language: Any = DeploymentLanguage.PYTHON
-
-    class Config:
-        validate_assignment = True
-        extra = "forbid"
-        arbitrary_types_allowed = True
-
-    # Dynamic default for max_concurrent_queries
-    @validator("max_concurrent_queries", always=True)
-    def set_max_queries_by_mode(cls, v, values):  # noqa 805
-        if v is None:
-            v = 100
-        else:
-            if v <= 0:
-                raise ValueError("max_concurrent_queries must be >= 0")
-        return v
-
-    def to_proto_bytes(self):
-        data = self.dict()
-        if data.get("user_config"):
-            data["user_config"] = pickle.dumps(data["user_config"])
-        if data.get("autoscaling_config"):
-            data["autoscaling_config"] = AutoscalingConfigProto(
-                **data["autoscaling_config"]
-            )
-        return DeploymentConfigProto(**data).SerializeToString()
+        if not values.get("_serialized_policy_def"):
+            self._serialized_policy_def = cloudpickle.dumps(policy)
+        self._policy = policy_path
 
     @classmethod
-    def from_proto_bytes(cls, proto_bytes: bytes):
-        proto = DeploymentConfigProto.FromString(proto_bytes)
-        data = MessageToDict(
-            proto,
-            including_default_value_fields=True,
-            preserving_proto_field_name=True,
-            use_integers_for_enums=True,
+    def default(cls):
+        return cls(
+            target_ongoing_requests=DEFAULT_TARGET_ONGOING_REQUESTS,
+            min_replicas=1,
+            max_replicas=100,
         )
-        if "user_config" in data:
-            if data["user_config"] != "":
-                data["user_config"] = pickle.loads(proto.user_config)
-            else:
-                data["user_config"] = None
-        if "autoscaling_config" in data:
-            data["autoscaling_config"] = AutoscalingConfig(**data["autoscaling_config"])
 
-        return cls(**data)
+    def get_policy(self) -> Callable:
+        """Deserialize policy from cloudpickled bytes."""
+        return cloudpickle.loads(self._serialized_policy_def)
 
+    def get_upscaling_factor(self) -> PositiveFloat:
+        if self.upscaling_factor:
+            return self.upscaling_factor
 
-class ReplicaConfig:
-    def __init__(
-        self,
-        deployment_def: Union[Callable, str],
-        init_args: Optional[Tuple[Any]] = None,
-        init_kwargs: Optional[Dict[Any, Any]] = None,
-        ray_actor_options=None,
-    ):
-        # Validate that deployment_def is an import path, function, or class.
-        self.import_path = None
-        if isinstance(deployment_def, str):
-            self.func_or_class_name = deployment_def
-            self.import_path = deployment_def
-        elif inspect.isfunction(deployment_def):
-            self.func_or_class_name = deployment_def.__name__
-            if init_args:
-                raise ValueError("init_args not supported for function deployments.")
-            if init_kwargs:
-                raise ValueError("init_kwargs not supported for function deployments.")
-        elif inspect.isclass(deployment_def):
-            self.func_or_class_name = deployment_def.__name__
-        else:
-            raise TypeError(
-                "Deployment must be a function or class, it is {}.".format(
-                    type(deployment_def)
-                )
-            )
+        return self.upscale_smoothing_factor or self.smoothing_factor
 
-        self.serialized_deployment_def = cloudpickle.dumps(deployment_def)
-        self.init_args = init_args if init_args is not None else ()
-        self.init_kwargs = init_kwargs if init_kwargs is not None else {}
-        if ray_actor_options is None:
-            self.ray_actor_options = {}
-        else:
-            self.ray_actor_options = ray_actor_options
+    def get_downscaling_factor(self) -> PositiveFloat:
+        if self.downscaling_factor:
+            return self.downscaling_factor
 
-        self.resource_dict = {}
-        self._validate()
+        return self.downscale_smoothing_factor or self.smoothing_factor
 
-    def _validate(self):
-        if not isinstance(self.ray_actor_options, dict):
-            raise TypeError("ray_actor_options must be a dictionary.")
-
-        disallowed_ray_actor_options = {
-            "args",
-            "kwargs",
-            "max_concurrency",
-            "max_restarts",
-            "max_task_retries",
-            "name",
-            "namespace",
-            "lifetime",
-            "placement_group",
-            "placement_group_bundle_index",
-            "placement_group_capture_child_tasks",
-            "max_pending_calls",
-            "scheduling_strategy",
-        }
-
-        for option in disallowed_ray_actor_options:
-            if option in self.ray_actor_options:
-                raise ValueError(
-                    f"Specifying {option} in ray_actor_options is not allowed."
-                )
-
-        # Ray defaults to zero CPUs for placement, we default to one here.
-        if self.ray_actor_options.get("num_cpus", None) is None:
-            self.ray_actor_options["num_cpus"] = 1
-        num_cpus = self.ray_actor_options["num_cpus"]
-        if not isinstance(num_cpus, (int, float)):
-            raise TypeError("num_cpus in ray_actor_options must be an int or a float.")
-        elif num_cpus < 0:
-            raise ValueError("num_cpus in ray_actor_options must be >= 0.")
-        self.resource_dict["CPU"] = num_cpus
-
-        if self.ray_actor_options.get("num_gpus", None) is None:
-            self.ray_actor_options["num_gpus"] = 0
-        num_gpus = self.ray_actor_options["num_gpus"]
-        if not isinstance(num_gpus, (int, float)):
-            raise TypeError("num_gpus in ray_actor_options must be an int or a float.")
-        elif num_gpus < 0:
-            raise ValueError("num_gpus in ray_actor_options must be >= 0.")
-        self.resource_dict["GPU"] = num_gpus
-
-        if self.ray_actor_options.get("memory", None) is None:
-            self.ray_actor_options["memory"] = 0
-        memory = self.ray_actor_options["memory"]
-        if not isinstance(memory, (int, float)):
-            raise TypeError("memory in ray_actor_options must be an int or a float.")
-        elif memory < 0:
-            raise ValueError("num_gpus in ray_actor_options must be >= 0.")
-        self.resource_dict["memory"] = memory
-
-        if self.ray_actor_options.get("object_store_memory", None) is None:
-            self.ray_actor_options["object_store_memory"] = 0
-        object_store_memory = self.ray_actor_options["object_store_memory"]
-        if not isinstance(object_store_memory, (int, float)):
-            raise TypeError(
-                "object_store_memory in ray_actor_options must be an int or a float."
-            )
-        elif object_store_memory < 0:
-            raise ValueError("object_store_memory in ray_actor_options must be >= 0.")
-        self.resource_dict["object_store_memory"] = object_store_memory
-
-        if self.ray_actor_options.get("resources", None) is None:
-            self.ray_actor_options["resources"] = {}
-        custom_resources = self.ray_actor_options["resources"]
-        if not isinstance(custom_resources, dict):
-            raise TypeError("resources in ray_actor_options must be a dictionary.")
-        self.resource_dict.update(custom_resources)
+    def get_target_ongoing_requests(self) -> PositiveFloat:
+        return self.target_ongoing_requests
 
 
+# Keep in sync with ServeDeploymentMode in dashboard/client/src/type/serve.ts
+@Deprecated
 class DeploymentMode(str, Enum):
     NoServer = "NoServer"
     HeadOnly = "HeadOnly"
     EveryNode = "EveryNode"
-    FixedNumber = "FixedNumber"
 
 
-class HTTPOptions(pydantic.BaseModel):
-    # Documentation inside serve.start for user's convenience.
+@PublicAPI(stability="stable")
+class ProxyLocation(str, Enum):
+    """Config for where to run proxies to receive ingress traffic to the cluster.
+
+    Options:
+
+        - Disabled: don't run proxies at all. This should be used if you are only
+          making calls to your applications via deployment handles.
+        - HeadOnly: only run a single proxy on the head node.
+        - EveryNode: run a proxy on every node in the cluster that has at least one
+          replica actor. This is the default.
+    """
+
+    Disabled = "Disabled"
+    HeadOnly = "HeadOnly"
+    EveryNode = "EveryNode"
+
+    @classmethod
+    def _to_deployment_mode(
+        cls, proxy_location: Union["ProxyLocation", str]
+    ) -> DeploymentMode:
+        if isinstance(proxy_location, str):
+            proxy_location = ProxyLocation(proxy_location)
+        elif not isinstance(proxy_location, ProxyLocation):
+            raise TypeError(
+                f"Must be a `ProxyLocation` or str, got: {type(proxy_location)}."
+            )
+
+        if proxy_location == ProxyLocation.Disabled:
+            return DeploymentMode.NoServer
+        else:
+            return DeploymentMode(proxy_location.value)
+
+    @classmethod
+    def _from_deployment_mode(
+        cls, deployment_mode: Optional[Union[DeploymentMode, str]]
+    ) -> Optional["ProxyLocation"]:
+        """Converts DeploymentMode enum into ProxyLocation enum.
+
+        DeploymentMode is a deprecated version of ProxyLocation that's still
+        used internally throughout Serve.
+        """
+
+        if deployment_mode is None:
+            return None
+        elif isinstance(deployment_mode, str):
+            deployment_mode = DeploymentMode(deployment_mode)
+        elif not isinstance(deployment_mode, DeploymentMode):
+            raise TypeError(
+                f"Must be a `DeploymentMode` or str, got: {type(deployment_mode)}."
+            )
+
+        if deployment_mode == DeploymentMode.NoServer:
+            return ProxyLocation.Disabled
+        else:
+            return ProxyLocation(deployment_mode.value)
+
+
+@PublicAPI(stability="stable")
+class HTTPOptions(BaseModel):
+    """HTTP options for the proxies. Supported fields:
+
+    - host: Host that the proxies listens for HTTP on. Defaults to
+      "127.0.0.1". To expose Serve publicly, you probably want to set
+      this to "0.0.0.0".
+    - port: Port that the proxies listen for HTTP on. Defaults to 8000.
+    - root_path: An optional root path to mount the serve application
+      (for example, "/prefix"). All deployment routes are prefixed
+      with this path.
+    - request_timeout_s: End-to-end timeout for HTTP requests.
+    - keep_alive_timeout_s: Duration to keep idle connections alive when no
+      requests are ongoing.
+
+    - location: [DEPRECATED: use `proxy_location` field instead] The deployment
+      location of HTTP servers:
+
+        - "HeadOnly": start one HTTP server on the head node. Serve
+          assumes the head node is the node you executed serve.start
+          on. This is the default.
+        - "EveryNode": start one HTTP server per node.
+        - "NoServer": disable HTTP server.
+
+    - num_cpus: [DEPRECATED] The number of CPU cores to reserve for each
+      internal Serve HTTP proxy actor.
+    """
+
     host: Optional[str] = DEFAULT_HTTP_HOST
     port: int = DEFAULT_HTTP_PORT
     middlewares: List[Any] = []
@@ -302,25 +255,85 @@ class HTTPOptions(pydantic.BaseModel):
     num_cpus: int = 0
     root_url: str = ""
     root_path: str = ""
-    fixed_number_replicas: Optional[int] = None
-    fixed_number_selection_seed: int = 0
+    request_timeout_s: Optional[float] = None
+    keep_alive_timeout_s: int = DEFAULT_UVICORN_KEEP_ALIVE_TIMEOUT_S
 
     @validator("location", always=True)
     def location_backfill_no_server(cls, v, values):
         if values["host"] is None or v is None:
             return DeploymentMode.NoServer
+
         return v
 
-    @validator("fixed_number_replicas", always=True)
-    def fixed_number_replicas_should_exist(cls, v, values):
-        if values["location"] == DeploymentMode.FixedNumber and v is None:
-            raise ValueError(
-                "When location='FixedNumber', you must specify "
-                "the `fixed_number_replicas` parameter."
+    @validator("middlewares", always=True)
+    def warn_for_middlewares(cls, v, values):
+        if v:
+            warnings.warn(
+                "Passing `middlewares` to HTTPOptions is deprecated and will be "
+                "removed in a future version. Consider using the FastAPI integration "
+                "to configure middlewares on your deployments: "
+                "https://docs.ray.io/en/latest/serve/http-guide.html#fastapi-http-deployments"  # noqa 501
+            )
+        return v
+
+    @validator("num_cpus", always=True)
+    def warn_for_num_cpus(cls, v, values):
+        if v:
+            warnings.warn(
+                "Passing `num_cpus` to HTTPOptions is deprecated and will be "
+                "removed in a future version."
             )
         return v
 
     class Config:
         validate_assignment = True
-        extra = "forbid"
         arbitrary_types_allowed = True
+
+
+@PublicAPI(stability="alpha")
+class gRPCOptions(BaseModel):
+    """gRPC options for the proxies. Supported fields:
+
+    Args:
+        port (int):
+            Port for gRPC server if started. Default to 9000. Cannot be
+            updated once Serve has started running. Serve must be shut down and
+            restarted with the new port instead.
+        grpc_servicer_functions (List[str]):
+            List of import paths for gRPC `add_servicer_to_server` functions to add to
+            Serve's gRPC proxy. Default to empty list, which means no gRPC methods will
+            be added and no gRPC server will be started. The servicer functions need to
+            be importable from the context of where Serve is running.
+    """
+
+    port: int = DEFAULT_GRPC_PORT
+    grpc_servicer_functions: List[str] = []
+
+    @property
+    def grpc_servicer_func_callable(self) -> List[Callable]:
+        """Return a list of callable functions from the grpc_servicer_functions.
+
+        If the function is not callable or not found, it will be ignored and a warning
+        will be logged.
+        """
+        callables = []
+        for func in self.grpc_servicer_functions:
+            try:
+                imported_func = import_attr(func)
+                if callable(imported_func):
+                    callables.append(imported_func)
+                else:
+                    message = (
+                        f"{func} is not a callable function! Please make sure "
+                        "the function is imported correctly."
+                    )
+                    raise ValueError(message)
+            except ModuleNotFoundError as e:
+                message = (
+                    f"{func} can't be imported! Please make sure there are no typo "
+                    "in those functions. Or you might want to rebuild service "
+                    "definitions if .proto file is changed."
+                )
+                raise ModuleNotFoundError(message) from e
+
+        return callables

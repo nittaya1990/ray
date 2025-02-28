@@ -2,7 +2,7 @@ import numpy as np
 from typing import Optional, Union
 
 from ray.rllib.models.action_dist import ActionDistribution
-from ray.rllib.utils.annotations import override
+from ray.rllib.utils.annotations import OldAPIStack, override
 from ray.rllib.utils.exploration.gaussian_noise import GaussianNoise
 from ray.rllib.utils.framework import (
     try_import_tf,
@@ -18,6 +18,7 @@ tf1, tf, tfv = try_import_tf()
 torch, _ = try_import_torch()
 
 
+@OldAPIStack
 class OrnsteinUhlenbeckNoise(GaussianNoise):
     """An exploration that adds Ornstein-Uhlenbeck noise to continuous actions.
 
@@ -113,7 +114,7 @@ class OrnsteinUhlenbeckNoise(GaussianNoise):
             shape=[self.action_space.low.size], stddev=self.stddev
         )
         ou_new = self.ou_theta * -self.ou_state + self.ou_sigma * gaussian_sample
-        if self.framework in ["tf2", "tfe"]:
+        if self.framework == "tf2":
             self.ou_state.assign_add(ou_new)
             ou_state_new = self.ou_state
         else:
@@ -151,7 +152,7 @@ class OrnsteinUhlenbeckNoise(GaussianNoise):
         logp = zero_logps_from_actions(deterministic_actions)
 
         # Increment `last_timestep` by 1 (or set to `timestep`).
-        if self.framework in ["tf2", "tfe"]:
+        if self.framework == "tf2":
             if timestep is None:
                 self.last_timestep.assign_add(1)
             else:

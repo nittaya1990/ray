@@ -72,14 +72,16 @@ define_java_module(
     test_deps = [
         ":io_ray_ray_api",
         ":io_ray_ray_runtime",
-        "@maven//:org_apache_commons_commons_lang3",
-        "@maven//:org_testng_testng",
         "@maven//:commons_io_commons_io",
         "@maven//:javax_xml_bind_jaxb_api",
+        "@maven//:org_apache_commons_commons_lang3",
+        "@maven//:org_testng_testng",
     ],
     visibility = ["//visibility:public"],
     deps = [
         ":io_ray_ray_api",
+        "@maven//:com_fasterxml_jackson_core_jackson_databind",
+        "@maven//:com_github_java_json_tools_json_schema_validator",
         "@maven//:com_google_code_gson_gson",
         "@maven//:com_google_guava_guava",
         "@maven//:com_google_protobuf_protobuf_java",
@@ -97,12 +99,13 @@ define_java_module(
         "@maven//:org_ow2_asm_asm",
         "@maven//:org_slf4j_slf4j_api",
         "@maven//:org_testng_testng",
-        "@maven//:org_yaml_snakeyaml",
     ],
 )
 
 define_java_module(
     name = "test",
+    # (WangTaoTheTonic)For cpp x-lang tests. See //cpp:cluster_mode_xlang_test.
+    visibility = ["//cpp:__subpackages__"],
     deps = [
         ":io_ray_ray_api",
         ":io_ray_ray_runtime",
@@ -156,8 +159,10 @@ define_java_module(
         "@maven//:com_google_code_gson_gson",
         "@maven//:com_google_guava_guava",
         "@maven//:com_google_protobuf_protobuf_java",
+        "@maven//:commons_io_commons_io",
         "@maven//:org_apache_commons_commons_lang3",
         "@maven//:org_apache_httpcomponents_client5_httpclient5",
+        "@maven//:org_apache_httpcomponents_client5_httpclient5_fluent",
         "@maven//:org_apache_httpcomponents_core5_httpcore5",
         "@maven//:org_slf4j_slf4j_api",
         "@maven//:org_testng_testng",
@@ -175,16 +180,51 @@ define_java_module(
     ],
 )
 
-java_binary(
-    name = "all_tests",
-    args = ["java/testng.xml"],
-    data = ["testng.xml"],
-    main_class = "org.testng.TestNG",
+java_library(
+    name = "all_tests_lib",
     runtime_deps = [
         ":io_ray_ray_performance_test",
         ":io_ray_ray_runtime_test",
         ":io_ray_ray_serve_test",
         ":io_ray_ray_test",
+    ],
+)
+
+java_test(
+    name = "all_tests",
+    testonly = True,
+    args = ["java/testng.xml"],
+    data = [
+        "testng.xml",
+        ":ray_java_pkg",
+        "//:ray_pkg",
+    ],
+    main_class = "org.testng.TestNG",
+    resources = [
+        "//cpp:counter.so",
+        "//cpp:plus.so",
+    ],
+    tags = ["local"],
+    runtime_deps = [
+        ":all_tests_lib",
+    ],
+)
+
+# 0. `cp testng_custom_template.xml testng_custom.xml`
+# 1. Specify test class/method in `testng_custom.xml`
+# 2. `bazel test //java:custom_test --test_output=streamed`
+java_test(
+    name = "custom_test",
+    args = ["java/testng_custom.xml"],
+    data = [
+        "testng_custom.xml",
+        ":ray_java_pkg",
+        "//:ray_pkg",
+    ],
+    main_class = "org.testng.TestNG",
+    tags = ["local"],
+    runtime_deps = [
+        ":all_tests_lib",
     ],
 )
 
@@ -241,14 +281,16 @@ genrule(
         WORK_DIR="$$(pwd)"
         # Copy protobuf-generated files.
         rm -rf "$$WORK_DIR/java/runtime/src/main/java/io/ray/runtime/generated"
+        echo "# cp_java_generated" > $@
         for f in $(locations //java:all_java_proto); do
             unzip "$$f" -x META-INF/MANIFEST.MF -d "$$WORK_DIR/java/runtime/src/main/java"
+            if [[ "$$OSTYPE" =~ ^darwin ]]; then shasum "$$f" >> $@ ; else sha1sum "$$f" >> $@ ; fi
         done
         rm -rf "$$WORK_DIR/java/serve/src/main/java/io/ray/serve/generated"
         for f in $(locations //java:serve_java_proto); do
             unzip "$$f" -x META-INF/MANIFEST.MF -d "$$WORK_DIR/java/serve/src/main/java"
+            if [[ "$$OSTYPE" =~ ^darwin ]]; then shasum "$$f" >> $@ ; else sha1sum "$$f" >> $@ ; fi
         done
-        date > $@
     """,
     local = 1,
     tags = ["no-cache"],
@@ -274,11 +316,12 @@ genrule(
         NATIVE_DEPS_DIR="$$WORK_DIR/java/runtime/native_dependencies/native/$$OS_NAME"
         rm -rf "$$NATIVE_DEPS_DIR"
         mkdir -p "$$NATIVE_DEPS_DIR"
+        echo "# gen_maven_deps" > $@
         for f in $(locations //java:java_native_deps); do
             chmod +w "$$f"
             cp "$$f" "$$NATIVE_DEPS_DIR"
+            if [[ "$$OSTYPE" =~ ^darwin ]]; then shasum "$$f" >> $@ ; else sha1sum "$$f" >> $@ ; fi
         done
-        date > $@
     """,
     local = 1,
     tags = ["no-cache"],
@@ -298,7 +341,16 @@ genrule(
         cp -f $(location //java:io_ray_ray_test_pom) "$$WORK_DIR/java/test/pom.xml"
         cp -f $(location //java:io_ray_ray_performance_test_pom) "$$WORK_DIR/java/performance_test/pom.xml"
         cp -f $(location //java:io_ray_ray_serve_pom) "$$WORK_DIR/java/serve/pom.xml"
-        date > $@
+
+        FILES=(
+            $(location //java:io_ray_ray_api_pom)
+            $(location //java:io_ray_ray_runtime_pom)
+            $(location //java:io_ray_ray_test_pom)
+            $(location //java:io_ray_ray_performance_test_pom)
+            $(location //java:io_ray_ray_serve_pom)
+        )
+        echo "# copy_pom_file" > $@
+        if [[ "$$OSTYPE" =~ ^darwin ]]; then shasum "$${FILES[@]}" > $@ ; else sha1sum "$${FILES[@]}" >> $@ ; fi
     """,
     local = 1,
     tags = ["no-cache"],
@@ -340,7 +392,9 @@ genrule(
         WORK_DIR="$$(pwd)"
         rm -rf "$$WORK_DIR/python/ray/jars" && mkdir -p "$$WORK_DIR/python/ray/jars"
         cp -f $(location //java:ray_dist_shaded.jar) "$$WORK_DIR/python/ray/jars/ray_dist.jar"
-        date > $@
+        echo "# ray_java_pkg" > $@
+        OUTPUT_JAR="$(location //java:ray_dist_shaded.jar)"
+        if [[ "$$OSTYPE" =~ ^darwin ]]; then shasum "$$OUTPUT_JAR" >> $@ ; else sha1sum "$$OUTPUT_JAR" >> $@ ; fi
     """,
     local = 1,
     tags = ["no-cache"],

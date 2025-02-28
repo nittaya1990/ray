@@ -13,80 +13,88 @@
 // limitations under the License.
 #pragma once
 
+#include <gtest/gtest_prod.h>
+
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
-#include "ray/common/asio/instrumented_io_context.h"
-#include "ray/common/asio/periodical_runner.h"
 #include "ray/common/id.h"
-#include "ray/common/task/scheduling_resources.h"
+#include "ray/common/ray_syncer/ray_syncer.h"
+#include "ray/common/scheduling/cluster_resource_data.h"
 #include "ray/gcs/gcs_server/gcs_init_data.h"
-#include "ray/gcs/gcs_server/gcs_resource_manager.h"
+#include "ray/gcs/gcs_server/gcs_node_manager.h"
 #include "ray/gcs/gcs_server/gcs_table_storage.h"
-#include "ray/gcs/pubsub/gcs_pub_sub.h"
+#include "ray/gcs/gcs_server/state_util.h"
+#include "ray/raylet/scheduling/cluster_resource_manager.h"
+#include "ray/raylet/scheduling/cluster_task_manager.h"
 #include "ray/rpc/client_call.h"
 #include "ray/rpc/gcs_server/gcs_rpc_server.h"
 #include "src/ray/protobuf/gcs.pb.h"
 
 namespace ray {
-namespace syncer {
-class RaySyncer;
-}
+
+using raylet::ClusterTaskManager;
+
 namespace gcs {
+class GcsNodeManager;
+class GcsServer;
+
+/// Ideally, the logic related to resource calculation should be moved from
+/// `gcs_resource_manager` to `cluster_resource_manager`, and all logic related to
+/// resource modification should directly depend on `cluster_resource_manager`, while
+/// `gcs_resource_manager` is still responsible for processing resource-related RPC
+/// request. We will split several small PR to achieve this goal, so as to prevent one PR
+/// from being too large to review.
+///
+/// 1). Remove `node_resource_usages_` related code as it could be calculated from
+/// `cluster_resource_manager`
+/// 2). Move all resource-write-related logic out from `gcs_resource_manager`
+/// 3). Move `placement_group_load_` from `gcs_resource_manager` to
+/// `placement_group_manager` and make `gcs_resource_manager` depend on
+/// `placement_group_manager`
+
 /// Gcs resource manager interface.
 /// It is responsible for handing node resource related rpc requests and it is used for
 /// actor and placement group scheduling. It obtains the available resources of nodes
 /// through heartbeat reporting. Non-thread safe.
-class GcsResourceManager : public rpc::NodeResourceInfoHandler {
+class GcsResourceManager : public rpc::NodeResourceInfoHandler,
+                           public syncer::ReceiverInterface {
  public:
   /// Create a GcsResourceManager.
-  ///
-  /// \param main_io_service The main event loop.
-  /// \param gcs_publisher GCS message publisher.
-  /// \param gcs_table_storage GCS table external storage accessor.
-  explicit GcsResourceManager(instrumented_io_context &main_io_service,
-                              std::shared_ptr<GcsPublisher> gcs_publisher,
-                              std::shared_ptr<gcs::GcsTableStorage> gcs_table_storage,
-                              // TODO(iycheng): Remove sync from GcsResourceManager
-                              syncer::RaySyncer *ray_syncer = nullptr);
+  explicit GcsResourceManager(instrumented_io_context &io_context,
+                              ClusterResourceManager &cluster_resource_manager,
+                              GcsNodeManager &gcs_node_manager,
+                              NodeID local_node_id,
+                              ClusterTaskManager *cluster_task_manager = nullptr);
 
-  virtual ~GcsResourceManager() {}
+  virtual ~GcsResourceManager() = default;
 
-  /// Handle get resource rpc request.
-  void HandleGetResources(const rpc::GetResourcesRequest &request,
-                          rpc::GetResourcesReply *reply,
-                          rpc::SendReplyCallback send_reply_callback) override;
-
-  /// Handle update resource rpc request.
-  void HandleUpdateResources(const rpc::UpdateResourcesRequest &request,
-                             rpc::UpdateResourcesReply *reply,
-                             rpc::SendReplyCallback send_reply_callback) override;
-
-  /// Handle delete resource rpc request.
-  void HandleDeleteResources(const rpc::DeleteResourcesRequest &request,
-                             rpc::DeleteResourcesReply *reply,
-                             rpc::SendReplyCallback send_reply_callback) override;
+  /// Handle the resource update.
+  void ConsumeSyncMessage(std::shared_ptr<const syncer::RaySyncMessage> message) override;
 
   /// Handle get available resources of all nodes.
+  /// Autoscaler-specific RPC called from Python.
   void HandleGetAllAvailableResources(
-      const rpc::GetAllAvailableResourcesRequest &request,
+      rpc::GetAllAvailableResourcesRequest request,
       rpc::GetAllAvailableResourcesReply *reply,
       rpc::SendReplyCallback send_reply_callback) override;
 
-  /// Handle report resource usage rpc come from raylet.
-  void HandleReportResourceUsage(const rpc::ReportResourceUsageRequest &request,
-                                 rpc::ReportResourceUsageReply *reply,
-                                 rpc::SendReplyCallback send_reply_callback) override;
+  /// Handle get total resources of all nodes.
+  /// Autoscaler-specific RPC called from Python.
+  void HandleGetAllTotalResources(rpc::GetAllTotalResourcesRequest request,
+                                  rpc::GetAllTotalResourcesReply *reply,
+                                  rpc::SendReplyCallback send_reply_callback) override;
+
+  /// Handle get ids of draining nodes.
+  /// Autoscaler-specific RPC called from Python.
+  void HandleGetDrainingNodes(rpc::GetDrainingNodesRequest request,
+                              rpc::GetDrainingNodesReply *reply,
+                              rpc::SendReplyCallback send_reply_callback) override;
 
   /// Handle get all resource usage rpc request.
-  void HandleGetAllResourceUsage(const rpc::GetAllResourceUsageRequest &request,
+  /// Autoscaler-specific RPC called from Python.
+  void HandleGetAllResourceUsage(rpc::GetAllResourceUsageRequest request,
                                  rpc::GetAllResourceUsageReply *reply,
                                  rpc::SendReplyCallback send_reply_callback) override;
-
-  /// Get the resources of all nodes in the cluster.
-  ///
-  /// \return The resources of all nodes in the cluster.
-  const absl::flat_hash_map<NodeID, std::shared_ptr<SchedulingResources>>
-      &GetClusterResources() const;
 
   /// Handle a node registration.
   ///
@@ -97,28 +105,6 @@ class GcsResourceManager : public rpc::NodeResourceInfoHandler {
   ///
   /// \param node_id The specified node id.
   void OnNodeDead(const NodeID &node_id);
-
-  /// Set the available resources of the specified node.
-  ///
-  /// \param node_id Id of a node.
-  /// \param resources Available resources of a node.
-  void SetAvailableResources(const NodeID &node_id, const ResourceSet &resources);
-
-  /// Acquire resources from the specified node. It will deduct directly from the node
-  /// resources.
-  ///
-  /// \param node_id Id of a node.
-  /// \param required_resources Resources to apply for.
-  /// \return True if acquire resources successfully. False otherwise.
-  bool AcquireResources(const NodeID &node_id, const ResourceSet &required_resources);
-
-  /// Release the resources of the specified node. It will be added directly to the node
-  /// resources.
-  ///
-  /// \param node_id Id of a node.
-  /// \param acquired_resources Resources to release.
-  /// \return True if release resources successfully. False otherwise.
-  bool ReleaseResources(const NodeID &node_id, const ResourceSet &acquired_resources);
 
   /// Initialize with the gcs tables data synchronously.
   /// This should be called when GCS server restarts after a failure.
@@ -131,7 +117,7 @@ class GcsResourceManager : public rpc::NodeResourceInfoHandler {
   std::string DebugString() const;
 
   /// Add resources changed listener.
-  void AddResourcesChangedListener(std::function<void()> listener);
+  void AddResourcesChangedListener(std::function<void()> &&listener);
 
   // Update node normal task resources.
   void UpdateNodeNormalTaskResources(const NodeID &node_id,
@@ -140,13 +126,26 @@ class GcsResourceManager : public rpc::NodeResourceInfoHandler {
   /// Update resource usage of given node.
   ///
   /// \param node_id Node id.
-  /// \param request Request containing resource usage.
-  void UpdateNodeResourceUsage(const NodeID &node_id,
-                               const rpc::ResourcesData &resources);
+  /// \param resource_view_sync_message The resource usage of the node.
+  void UpdateNodeResourceUsage(
+      const NodeID &node_id,
+      const syncer::ResourceViewSyncMessage &resource_view_sync_message);
 
   /// Process a new resource report from a node, independent of the rpc handler it came
   /// from.
-  void UpdateFromResourceReport(const rpc::ResourcesData &data);
+  ///
+  /// \param node_id Node id.
+  /// \param resource_view_sync_message The resource usage of the node.
+  void UpdateFromResourceView(
+      const NodeID &node_id,
+      const syncer::ResourceViewSyncMessage &resource_view_sync_message);
+
+  /// Update the resource usage of a node from syncer COMMANDS
+  ///
+  /// This is currently used for setting cluster full of actors info from syncer.
+  /// \param data The resource report.
+  void UpdateClusterFullOfActorsDetected(const NodeID &node_id,
+                                         bool cluster_full_of_actors_detected);
 
   /// Update the placement group load information so that it will be reported through
   /// heartbeat.
@@ -155,51 +154,53 @@ class GcsResourceManager : public rpc::NodeResourceInfoHandler {
   void UpdatePlacementGroupLoad(
       const std::shared_ptr<rpc::PlacementGroupLoad> placement_group_load);
 
- private:
-  /// Delete the scheduling resources of the specified node.
+  /// Update the resource loads.
   ///
-  /// \param node_id Id of a node.
-  /// \param deleted_resources Deleted resources of a node.
-  void DeleteResources(const NodeID &node_id,
-                       const std::vector<std::string> &deleted_resources);
+  /// \param data The resource loads reported by raylet.
+  void UpdateResourceLoads(const rpc::ResourcesData &data);
 
-  /// The runner to run function periodically.
-  PeriodicalRunner periodical_runner_;
+  /// Returns the mapping from node id to latest resource report.
+  ///
+  /// \returns The mapping from node id to latest resource report.
+  const absl::flat_hash_map<NodeID, rpc::ResourcesData> &NodeResourceReportView() const;
+
+  /// Get the placement group load info. This is used for autoscaler.
+  const std::shared_ptr<rpc::PlacementGroupLoad> GetPlacementGroupLoad() const {
+    if (placement_group_load_.has_value()) {
+      return placement_group_load_.value();
+    }
+    return nullptr;
+  }
+
+ private:
+  /// io context. This is to ensure thread safety. Ideally, all public
+  /// funciton needs to post job to this io_context.
+  instrumented_io_context &io_context_;
+
   /// Newest resource usage of all nodes.
   absl::flat_hash_map<NodeID, rpc::ResourcesData> node_resource_usages_;
 
-  /// A publisher for publishing gcs messages.
-  std::shared_ptr<GcsPublisher> gcs_publisher_;
-  /// Storage for GCS tables.
-  std::shared_ptr<gcs::GcsTableStorage> gcs_table_storage_;
-  /// Map from node id to the scheduling resources of the node.
-  absl::flat_hash_map<NodeID, std::shared_ptr<SchedulingResources>>
-      cluster_scheduling_resources_;
   /// Placement group load information that is used for autoscaler.
   absl::optional<std::shared_ptr<rpc::PlacementGroupLoad>> placement_group_load_;
-  /// Normal task resources could be uploaded by 1) Raylets' periodical reporters; 2)
-  /// Rejected RequestWorkerLeaseReply. So we need the timestamps to decide whether an
-  /// upload is latest.
-  absl::flat_hash_map<NodeID, int64_t> latest_resources_normal_task_timestamp_;
   /// The resources changed listeners.
   std::vector<std::function<void()>> resources_changed_listeners_;
 
   /// Debug info.
   enum CountType {
-    GET_RESOURCES_REQUEST = 0,
-    UPDATE_RESOURCES_REQUEST = 1,
-    DELETE_RESOURCES_REQUEST = 2,
-    GET_ALL_AVAILABLE_RESOURCES_REQUEST = 3,
-    REPORT_RESOURCE_USAGE_REQUEST = 4,
-    GET_ALL_RESOURCE_USAGE_REQUEST = 5,
-    CountType_MAX = 6,
+    GET_ALL_AVAILABLE_RESOURCES_REQUEST = 1,
+    REPORT_RESOURCE_USAGE_REQUEST = 2,
+    GET_ALL_RESOURCE_USAGE_REQUEST = 3,
+    GET_All_TOTAL_RESOURCES_REQUEST = 4,
+    CountType_MAX = 5,
   };
   uint64_t counts_[CountType::CountType_MAX] = {0};
 
-  // For the updates from placement group, it needs to report to the syncer
-  // so it can be broadcasted to other nodes.
-  // TODO (iycheng): remove this one once we change how pg is reported.
-  syncer::RaySyncer *ray_syncer_;
+  ClusterResourceManager &cluster_resource_manager_;
+  GcsNodeManager &gcs_node_manager_;
+  NodeID local_node_id_;
+  ClusterTaskManager *cluster_task_manager_;
+  /// Num of alive nodes in the cluster.
+  size_t num_alive_nodes_ = 0;
 };
 
 }  // namespace gcs

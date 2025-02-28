@@ -1,32 +1,35 @@
+import subprocess
 import sys
 import time
 
-import ray
-
-import pytest
 import grpc
-from grpc._channel import _InactiveRpcError
 import numpy as np
 import psutil
-import subprocess
+import pytest
+from grpc._channel import _InactiveRpcError
+from ray.util.state import list_tasks
+from ray._private.state_api_test_utils import verify_failed_task
 
-import ray.ray_constants as ray_constants
-
-from ray.cluster_utils import Cluster, cluster_not_supported
+import ray
+import ray._private.ray_constants as ray_constants
+import ray.experimental.internal_kv as internal_kv
 from ray import NodeID
-from ray.core.generated import node_manager_pb2
-from ray.core.generated import node_manager_pb2_grpc
-from ray.core.generated import gcs_service_pb2
-from ray.core.generated import gcs_service_pb2_grpc
 from ray._private.test_utils import (
-    init_error_pubsub,
+    SignalActor,
     get_error_message,
+    init_error_pubsub,
     run_string_as_driver,
     wait_for_condition,
+    kill_raylet,
 )
-from ray._private.gcs_utils import use_gcs_for_bootstrap
+from ray.cluster_utils import Cluster, cluster_not_supported
+from ray.core.generated import (
+    gcs_service_pb2,
+    gcs_service_pb2_grpc,
+    node_manager_pb2,
+    node_manager_pb2_grpc,
+)
 from ray.exceptions import LocalRayletDiedError
-import ray.experimental.internal_kv as internal_kv
 
 
 def search_raylet(cluster):
@@ -106,11 +109,58 @@ def test_retry_application_level_error(ray_start_regular):
         ray.get(r3)
 
 
+class CountError(Exception):
+    pass
+
+
+def test_retry_application_level_error_exception_filter(ray_start_regular):
+    @ray.remote
+    class Counter:
+        def __init__(self):
+            self.value = 0
+
+        def increment(self):
+            self.value += 1
+            return self.value
+
+    @ray.remote(max_retries=1, retry_exceptions=[CountError])
+    def func(counter):
+        if counter is None:
+            raise ValueError()
+        count = counter.increment.remote()
+        if ray.get(count) == 1:
+            raise CountError()
+        else:
+            return 2
+
+    # Exception that doesn't satisfy the predicate should cause the task to immediately
+    # fail.
+    r0 = func.remote(None)
+    with pytest.raises(ValueError):
+        ray.get(r0)
+
+    # Test against exceptions (CountError) that do satisfy the predicate.
+    counter1 = Counter.remote()
+    r1 = func.remote(counter1)
+    assert ray.get(r1) == 2
+
+    counter2 = Counter.remote()
+    r2 = func.options(max_retries=0).remote(counter2)
+    with pytest.raises(CountError):
+        ray.get(r2)
+
+    counter3 = Counter.remote()
+    r3 = func.options(retry_exceptions=False).remote(counter3)
+    with pytest.raises(CountError):
+        ray.get(r3)
+
+
 @pytest.mark.xfail(cluster_not_supported, reason="cluster not supported")
 def test_connect_with_disconnected_node(shutdown_only):
     config = {
-        "num_heartbeats_timeout": 50,
-        "raylet_heartbeat_period_milliseconds": 10,
+        "health_check_failure_threshold": 50,
+        "health_check_period_ms": 10,
+        "health_check_initial_delay_ms": 0,
     }
     cluster = Cluster()
     cluster.add_node(num_cpus=0, _system_config=config)
@@ -131,7 +181,7 @@ def test_connect_with_disconnected_node(shutdown_only):
     # This node is killed by SIGTERM, ray_monitor will not mark it again.
     removing_node = cluster.add_node(num_cpus=0)
     cluster.remove_node(removing_node, allow_graceful=True)
-    errors = get_error_message(p, 1, timeout=2)
+    errors = get_error_message(p, 1, ray_constants.REMOVED_NODE_ERROR, timeout=2)
     assert len(errors) == 0
     # There is no connection error to a dead node.
     errors = get_error_message(p, 1, timeout=2)
@@ -198,7 +248,9 @@ if __name__ == "__main__":
 def test_object_lost_error(ray_start_cluster, debug_enabled):
     cluster = ray_start_cluster
     system_config = {
-        "num_heartbeats_timeout": 3,
+        "health_check_failure_threshold": 3,
+        "health_check_period_ms": 1000,
+        "health_check_initial_delay_ms": 0,
     }
     if debug_enabled:
         system_config["record_ref_creation_sites"] = True
@@ -267,10 +319,11 @@ def test_object_lost_error(ray_start_cluster, debug_enabled):
         {
             "num_cpus": 0,
             "_system_config": {
-                "num_heartbeats_timeout": 10,
-                "raylet_heartbeat_period_milliseconds": 100,
+                "health_check_initial_delay_ms": 0,
+                "health_check_period_ms": 100,
+                "health_check_failure_threshold": 10,
             },
-        }
+        },
     ],
     indirect=True,
 )
@@ -313,14 +366,14 @@ def test_raylet_graceful_shutdown_through_rpc(ray_start_cluster_head, error_pubs
             assert not graceful
 
     """
-    Kill the first worker non-gracefully.
+    Kill the first worker ungracefully.
     """
     ip = worker.node_ip_address
     kill_raylet(ip, worker_node_port, graceful=False)
     p = error_pubsub
     errors = get_error_message(p, 1, ray_constants.REMOVED_NODE_ERROR, timeout=10)
     # Should print the heartbeat messages.
-    assert "has missed too many heartbeats from it" in errors[0].error_message
+    assert "has missed too many heartbeats from it" in errors[0]["error_message"]
     # NOTE the killed raylet is a zombie since the
     # parent process (the pytest script) hasn't called wait syscall.
     # For normal scenarios where raylet is created by
@@ -365,8 +418,9 @@ def test_raylet_graceful_shutdown_through_rpc(ray_start_cluster_head, error_pubs
         {
             "num_cpus": 0,
             "_system_config": {
-                "num_heartbeats_timeout": 10,
-                "raylet_heartbeat_period_milliseconds": 100,
+                "health_check_failure_threshold": 10,
+                "health_check_period_ms": 100,
+                "health_check_initial_delay_ms": 0,
             },
         }
     ],
@@ -400,14 +454,8 @@ def test_gcs_drain(ray_start_cluster_head, error_pubsub):
     Test batch drain.
     """
     # Prepare requests.
-    if use_gcs_for_bootstrap():
-        gcs_server_addr = cluster.gcs_address
-    else:
-        redis_cli = ray._private.services.create_redis_client(
-            cluster.redis_address, password=ray_constants.REDIS_DEFAULT_PASSWORD
-        )
-        gcs_server_addr = redis_cli.get("GcsServerAddress").decode()
-    options = (("grpc.enable_http_proxy", 0),)
+    gcs_server_addr = cluster.gcs_address
+    options = ray_constants.GLOBAL_GRPC_OPTIONS
     channel = grpc.insecure_channel(gcs_server_addr, options)
     stub = gcs_service_pb2_grpc.NodeInfoGcsServiceStub(channel)
     r = gcs_service_pb2.DrainNodeRequest()
@@ -463,9 +511,10 @@ def test_worker_start_timeout(monkeypatch, ray_start_cluster):
         # this delay will make worker start slow
         m.setenv(
             "RAY_testing_asio_delay_us",
-            "InternalKVGcsService.grpc_server.InternalKVGet" "=2000000:2000000",
+            "InternalKVGcsService.grpc_server.InternalKVGet=2000000:2000000",
         )
         m.setenv("RAY_worker_register_timeout_seconds", "1")
+        m.setenv("RAY_prestart_worker_first_driver", "false")
         cluster = ray_start_cluster
         cluster.add_node(num_cpus=4, object_store_memory=1e9)
         script = """
@@ -483,11 +532,11 @@ ray.get(task.remote(), timeout=3)
 
         # make sure log is correct
         assert (
-            "The process is still alive, probably " "it's hanging during start"
+            "The process is still alive, probably it's hanging during start"
         ) in e.value.output.decode()
         # worker will be killed so it won't try to register to raylet
         assert (
-            "Received a register request from an " "unknown worker shim process"
+            "Received a register request from an unknown worker shim process"
         ) not in e.value.output.decode()
 
 
@@ -509,20 +558,37 @@ def test_task_failure_when_driver_local_raylet_dies(ray_start_cluster):
 
     # The lease request should wait inside raylet
     # since there is no available resources.
-    ret = func.remote()
+    ret = func.options(name="task-local-raylet-dead").remote()
+
     # Waiting for the lease request to reach raylet.
-    time.sleep(1)
+    def task_running():
+        tasks = list_tasks(filters=[("name", "=", "task-local-raylet-dead")])
+        assert len(tasks) == 1
+        assert tasks[0]["state"] == "PENDING_NODE_ASSIGNMENT"
+        return True
+
+    wait_for_condition(task_running)
+
     head.kill_raylet()
     with pytest.raises(LocalRayletDiedError):
         ray.get(ret)
+
+    # Check the task failure states for observability.
+    wait_for_condition(
+        verify_failed_task,
+        name="task-local-raylet-dead",
+        error_type="LOCAL_RAYLET_DIED",
+        error_message="The worker failed to receive a response from the local raylet",
+    )
 
 
 def test_locality_aware_scheduling_for_dead_nodes(shutdown_only):
     """Test that locality-ware scheduling can handle dead nodes."""
     # Create a cluster with 4 nodes.
     config = {
-        "num_heartbeats_timeout": 5,
-        "raylet_heartbeat_period_milliseconds": 50,
+        "health_check_failure_threshold": 5,
+        "health_check_period_ms": 50,
+        "health_check_initial_delay_ms": 0,
     }
     cluster = Cluster()
     cluster.add_node(num_cpus=4, resources={"node1": 1}, _system_config=config)
@@ -568,7 +634,7 @@ def test_locality_aware_scheduling_for_dead_nodes(shutdown_only):
     # This function requires obj1 and obj2.
     @ray.remote
     def func(obj1, obj2):
-        return ray.worker.global_worker.node.unique_id
+        return ray._private.worker.global_worker.node.unique_id
 
     # This function should be scheduled to node2. As node2 has both objects.
     assert ray.get(func.remote(obj1, obj2)) == node2.unique_id
@@ -582,5 +648,164 @@ def test_locality_aware_scheduling_for_dead_nodes(shutdown_only):
     assert target_node == node3.unique_id or target_node == node4.unique_id
 
 
+def test_actor_task_fast_fail(ray_start_cluster):
+    # Explicitly set `max_task_retries=0` here to show the test scenario.
+    @ray.remote(max_restarts=1, max_task_retries=0)
+    class SlowActor:
+        def __init__(self, signal_actor):
+            if ray.get_runtime_context().was_current_actor_reconstructed:
+                ray.get(signal_actor.wait.remote())
+
+        def ping(self):
+            return "pong"
+
+    signal = SignalActor.remote()
+    actor = SlowActor.remote(signal)
+    ray.get(actor.ping.remote())
+    ray.kill(actor, no_restart=False)
+
+    # Wait for a while so that now the driver knows the actor is in
+    # RESTARTING state.
+    time.sleep(1)
+    # An actor task should fail quickly until the actor is restarted if
+    # `max_task_retries` is 0.
+    with pytest.raises(ray.exceptions.RayActorError):
+        ray.get(actor.ping.remote())
+
+    signal.send.remote()
+    # Wait for a while so that now the driver knows the actor is in
+    # ALIVE state.
+    time.sleep(1)
+    # An actor task should succeed.
+    ray.get(actor.ping.remote())
+
+
+def test_task_crash_after_raylet_dead_throws_node_died_error():
+    @ray.remote(max_retries=0)
+    def sleeper():
+        import os
+
+        time.sleep(3)
+        os.kill(os.getpid(), 9)
+
+    with ray.init():
+        ref = sleeper.remote()
+
+        raylet = ray.nodes()[0]
+        kill_raylet(raylet)
+
+        with pytest.raises(ray.exceptions.NodeDiedError) as error:
+            ray.get(ref)
+        message = str(error)
+        assert raylet["NodeManagerAddress"] in message
+
+
+def test_accessing_actor_after_cluster_crashed(shutdown_only):
+    ray.init()
+
+    @ray.remote
+    class A:
+        def f(self):
+            return
+
+    a = A.remote()
+
+    ray.get(a.f.remote())
+
+    ray.shutdown()
+    ray.init()
+    with pytest.raises(Exception) as exc_info:
+        ray.get(a.f.remote())
+    assert "It might be dead or it's from a different cluster" in exc_info.value.args[0]
+
+
+def test_internal_error_as_instance_of_cause_correct(shutdown_only):
+    """Verify as_instance_of_cause returns the correct exception
+    even when an exception is ray internal error.
+    """
+    ray.init()
+
+    @ray.remote
+    class A:
+        def kill(self):
+            import os
+
+            os._exit(1)
+
+        def get(self):
+            return 1
+
+    a = A.remote()
+
+    @ray.remote
+    class B:
+        def get_result(self, a):
+            return ray.get(a.get.remote())
+
+    b = B.remote()
+    a.kill.remote()
+    try:
+        ray.get(b.get_result.remote(a))
+    except Exception as e:
+        assert isinstance(e.as_instanceof_cause(), ray.exceptions.RayActorError)
+        assert isinstance(e.cause, ray.exceptions.RayActorError)
+        assert isinstance(e, ray.exceptions.RayActorError)
+
+
+@pytest.mark.parametrize(
+    "ray_start_cluster",
+    [
+        {
+            "num_cpus": 1,
+            "num_nodes": 1,
+        }
+    ],
+    indirect=True,
+)
+def test_shows_both_user_exception_system_error_same_time(ray_start_cluster):
+    @ray.remote(max_calls=1)
+    def f():
+        raise Exception("this is an exception")
+
+    with pytest.raises(Exception):
+        ray.get(f.remote())
+
+    # Wait for the task info to be propagated.
+    import time
+
+    time.sleep(1)
+
+    tasks = list_tasks(filters=[("name", "=", "f")], detail=True)
+    assert len(tasks) == 1, tasks
+    task = tasks[0]
+    assert task["state"] == "FAILED"
+    assert task["error_type"] == "TASK_EXECUTION_EXCEPTION"
+    # The error message should look like below (modulo line breaks), and we compare
+    # without the stacktrace:
+    #
+    # User exception:
+    # ray::f() (pid=70293, ip=127.0.0.1)
+    #   File "<YOUR_RAY_DIR>/python/ray/tests/test_exit_observability.py", line 465,
+    # in f
+    #     raise Exception("this is an exception")
+    # Exception: this is an exception
+    #
+    # System error:
+    # IntentionalSystemExit: Worker exits with an exit code 0. Exited because worker
+    # reached max_calls=1 for this method.
+    error_message = task["error_message"]
+    assert error_message.startswith("User exception:\nray::f()"), error_message
+    assert error_message.endswith(
+        "Exception: this is an exception\n\nSystem error:\n"
+        "IntentionalSystemExit: Worker exits with an exit "
+        "code 0. Exited because worker reached max_calls=1 for this method."
+    ), task
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main(["-v", __file__]))
+    import os
+
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

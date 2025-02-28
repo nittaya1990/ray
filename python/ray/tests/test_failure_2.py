@@ -1,4 +1,3 @@
-import logging
 import os
 import signal
 import sys
@@ -9,20 +8,19 @@ import numpy as np
 import pytest
 
 import ray
-from ray.experimental.internal_kv import _internal_kv_get
-from ray.ray_constants import DEBUG_AUTOSCALING_ERROR
+import ray._private.ray_constants as ray_constants
 import ray._private.utils
-import ray.ray_constants as ray_constants
-from ray.cluster_utils import cluster_not_supported
-import ray._private.gcs_pubsub as gcs_pubsub
+from ray._private.ray_constants import DEBUG_AUTOSCALING_ERROR
 from ray._private.test_utils import (
-    init_error_pubsub,
+    Semaphore,
     get_error_message,
     get_log_batch,
-    Semaphore,
-    wait_for_condition,
+    init_error_pubsub,
     run_string_as_driver_nonblocking,
+    wait_for_condition,
 )
+from ray.cluster_utils import cluster_not_supported
+from ray.experimental.internal_kv import _internal_kv_get
 
 
 def test_warning_for_too_many_actors(shutdown_only):
@@ -33,7 +31,7 @@ def test_warning_for_too_many_actors(shutdown_only):
 
     p = init_error_pubsub()
 
-    @ray.remote
+    @ray.remote(num_cpus=0)
     class Foo:
         def __init__(self):
             time.sleep(1000)
@@ -43,13 +41,13 @@ def test_warning_for_too_many_actors(shutdown_only):
     assert len(actor_group1) == num_cpus * 10
     errors = get_error_message(p, 1, ray_constants.WORKER_POOL_LARGE_ERROR)
     assert len(errors) == 1
-    assert errors[0].type == ray_constants.WORKER_POOL_LARGE_ERROR
+    assert errors[0]["type"] == ray_constants.WORKER_POOL_LARGE_ERROR
 
     actor_group2 = [Foo.remote() for _ in range(num_cpus * 3)]
     assert len(actor_group2) == num_cpus * 3
     errors = get_error_message(p, 1, ray_constants.WORKER_POOL_LARGE_ERROR)
     assert len(errors) == 1
-    assert errors[0].type == ray_constants.WORKER_POOL_LARGE_ERROR
+    assert errors[0]["type"] == ray_constants.WORKER_POOL_LARGE_ERROR
     p.close()
 
 
@@ -101,93 +99,10 @@ def test_warning_for_too_many_nested_tasks(shutdown_only):
     [g.remote(remote_waits, nested_waits) for _ in range(num_root_tasks)]
 
     errors = get_error_message(p, 1, ray_constants.WORKER_POOL_LARGE_ERROR)
+
     assert len(errors) == 1
-    assert errors[0].type == ray_constants.WORKER_POOL_LARGE_ERROR
+    assert errors[0]["type"] == ray_constants.WORKER_POOL_LARGE_ERROR
     p.close()
-
-
-def test_warning_for_many_duplicate_remote_functions_and_actors(shutdown_only):
-    ray.init(num_cpus=1)
-
-    @ray.remote
-    def create_remote_function():
-        @ray.remote
-        def g():
-            return 1
-
-        return ray.get(g.remote())
-
-    for _ in range(ray_constants.DUPLICATE_REMOTE_FUNCTION_THRESHOLD - 1):
-        ray.get(create_remote_function.remote())
-
-    import io
-
-    log_capture_string = io.StringIO()
-    ch = logging.StreamHandler(log_capture_string)
-
-    # TODO(rkn): It's terrible to have to rely on this implementation detail,
-    # the fact that the warning comes from ray._private.import_thread.logger.
-    # However, I didn't find a good way to capture the output for all loggers
-    # simultaneously.
-    ray._private.import_thread.logger.addHandler(ch)
-
-    ray.get(create_remote_function.remote())
-
-    start_time = time.time()
-    while time.time() < start_time + 10:
-        log_contents = log_capture_string.getvalue()
-        if len(log_contents) > 0:
-            break
-
-    ray._private.import_thread.logger.removeHandler(ch)
-
-    assert "remote function" in log_contents
-    assert (
-        "has been exported {} times.".format(
-            ray_constants.DUPLICATE_REMOTE_FUNCTION_THRESHOLD
-        )
-        in log_contents
-    )
-
-    # Now test the same thing but for actors.
-
-    @ray.remote
-    def create_actor_class():
-        # Require a GPU so that the actor is never actually created and we
-        # don't spawn an unreasonable number of processes.
-        @ray.remote(num_gpus=1)
-        class Foo:
-            pass
-
-        Foo.remote()
-
-    for _ in range(ray_constants.DUPLICATE_REMOTE_FUNCTION_THRESHOLD - 1):
-        ray.get(create_actor_class.remote())
-
-    log_capture_string = io.StringIO()
-    ch = logging.StreamHandler(log_capture_string)
-
-    # TODO(rkn): As mentioned above, it's terrible to have to rely on this
-    # implementation detail.
-    ray._private.import_thread.logger.addHandler(ch)
-
-    ray.get(create_actor_class.remote())
-
-    start_time = time.time()
-    while time.time() < start_time + 10:
-        log_contents = log_capture_string.getvalue()
-        if len(log_contents) > 0:
-            break
-
-    ray._private.import_thread.logger.removeHandler(ch)
-
-    assert "actor" in log_contents
-    assert (
-        "has been exported {} times.".format(
-            ray_constants.DUPLICATE_REMOTE_FUNCTION_THRESHOLD
-        )
-        in log_contents
-    )
 
 
 # Note that this test will take at least 10 seconds because it must wait for
@@ -212,7 +127,7 @@ def test_warning_for_dead_node(ray_start_cluster_2_nodes, error_pubsub):
 
     # Extract the client IDs from the error messages. This will need to be
     # changed if the error message changes.
-    warning_node_ids = {error.error_message.split(" ")[5] for error in errors}
+    warning_node_ids = {error["error_message"].split(" ")[5] for error in errors}
 
     assert node_ids == warning_node_ids
 
@@ -222,7 +137,7 @@ def test_warning_for_dead_node(ray_start_cluster_2_nodes, error_pubsub):
 )
 def test_warning_for_dead_autoscaler(ray_start_regular, error_pubsub):
     # Terminate the autoscaler process.
-    from ray.worker import _global_node
+    from ray._private.worker import _global_node
 
     autoscaler_process = _global_node.all_processes[ray_constants.PROCESS_TYPE_MONITOR][
         0
@@ -244,14 +159,14 @@ def test_raylet_crash_when_get(ray_start_regular):
     def sleep_to_kill_raylet():
         # Don't kill raylet before default workers get connected.
         time.sleep(2)
-        ray.worker._global_node.kill_raylet()
+        ray._private.worker._global_node.kill_raylet()
 
     object_ref = ray.put(np.zeros(200 * 1024, dtype=np.uint8))
-    ray.internal.free(object_ref)
+    ray._private.internal_api.free(object_ref)
 
     thread = threading.Thread(target=sleep_to_kill_raylet)
     thread.start()
-    with pytest.raises(ray.exceptions.ReferenceCountingAssertionError):
+    with pytest.raises(ray.exceptions.ObjectFreedError):
         ray.get(object_ref)
     thread.join()
 
@@ -278,9 +193,9 @@ def test_eviction(ray_start_cluster):
     obj = large_object.remote()
     assert isinstance(ray.get(obj), np.ndarray)
     # Evict the object.
-    ray.internal.free([obj])
+    ray._private.internal_api.free([obj])
     # ray.get throws an exception.
-    with pytest.raises(ray.exceptions.ReferenceCountingAssertionError):
+    with pytest.raises(ray.exceptions.ObjectFreedError):
         ray.get(obj)
 
     @ray.remote
@@ -348,8 +263,9 @@ def test_serialized_id(ray_start_cluster):
 )
 def test_fate_sharing(ray_start_cluster, use_actors, node_failure):
     config = {
-        "num_heartbeats_timeout": 10,
-        "raylet_heartbeat_period_milliseconds": 100,
+        "health_check_initial_delay_ms": 0,
+        "health_check_period_ms": 100,
+        "health_check_failure_threshold": 10,
     }
     cluster = ray_start_cluster
     # Head node with no resources.
@@ -425,43 +341,12 @@ def test_fate_sharing(ray_start_cluster, use_actors, node_failure):
         test_process_failure(use_actors)
 
 
-@pytest.mark.parametrize(
-    "ray_start_regular",
-    [{"_system_config": {"gcs_rpc_server_reconnect_timeout_s": 100}}],
-    indirect=True,
-)
-@pytest.mark.skipif(
-    gcs_pubsub.gcs_pubsub_enabled(),
-    reason="Logs are streamed via GCS pubsub when it is enabled, so logs "
-    "cannot be delivered after GCS is killed.",
-)
-def test_gcs_server_failiure_report(ray_start_regular, log_pubsub):
-    # Get gcs server pid to send a signal.
-    all_processes = ray.worker._global_node.all_processes
-    gcs_server_process = all_processes["gcs_server"][0].process
-    gcs_server_pid = gcs_server_process.pid
-
-    # TODO(mwtian): make sure logs are delivered after GCS is restarted.
-    if sys.platform == "win32":
-        sig = 9
-    else:
-        sig = signal.SIGBUS
-    os.kill(gcs_server_pid, sig)
-    # wait for 30 seconds, for the 1st batch of logs.
-    batches = get_log_batch(log_pubsub, 1, timeout=30)
-    assert gcs_server_process.poll() is not None
-    if sys.platform != "win32":
-        # Windows signal handler does not run when process is terminated
-        assert len(batches) == 1
-        assert batches[0]["pid"] == "gcs_server", batches
-
-
 def test_list_named_actors_timeout(monkeypatch, shutdown_only):
     with monkeypatch.context() as m:
         # defer for 3s
         m.setenv(
             "RAY_testing_asio_delay_us",
-            "ActorInfoGcsService.grpc_server.ListNamedActors" "=3000000:3000000",
+            "ActorInfoGcsService.grpc_server.ListNamedActors=3000000:3000000",
         )
         ray.init(_system_config={"gcs_server_request_timeout_seconds": 1})
 
@@ -535,4 +420,7 @@ time.sleep(60)
 if __name__ == "__main__":
     import pytest
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

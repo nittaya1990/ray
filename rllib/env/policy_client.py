@@ -14,14 +14,16 @@ from ray.rllib.env.external_env import ExternalEnv
 from ray.rllib.env.external_multi_agent_env import ExternalMultiAgentEnv
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.policy.sample_batch import MultiAgentBatch
-from ray.rllib.utils.annotations import PublicAPI
-from ray.rllib.utils.pre_checks.multi_agent import check_multi_agent
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.typing import (
     MultiAgentDict,
     EnvInfoDict,
     EnvObsType,
     EnvActionType,
 )
+
+# Backward compatibility.
+from ray.rllib.env.utils.external_env_protocol import RLlink as Commands
 
 logger = logging.getLogger(__name__)
 
@@ -35,41 +37,33 @@ except ImportError:
     )
 
 
-@PublicAPI
+@OldAPIStack
 class PolicyClient:
-    """REST client to interact with a RLlib policy server."""
+    """REST client to interact with an RLlib policy server."""
 
-    # Generic commands (for both modes).
-    ACTION_SPACE = "ACTION_SPACE"
-    OBSERVATION_SPACE = "OBSERVATION_SPACE"
-
-    # Commands for local inference mode.
-    GET_WORKER_ARGS = "GET_WORKER_ARGS"
-    GET_WEIGHTS = "GET_WEIGHTS"
-    REPORT_SAMPLES = "REPORT_SAMPLES"
-
-    # Commands for remote inference mode.
-    START_EPISODE = "START_EPISODE"
-    GET_ACTION = "GET_ACTION"
-    LOG_ACTION = "LOG_ACTION"
-    LOG_RETURNS = "LOG_RETURNS"
-    END_EPISODE = "END_EPISODE"
-
-    @PublicAPI
     def __init__(
-        self, address: str, inference_mode: str = "local", update_interval: float = 10.0
+        self,
+        address: str,
+        inference_mode: str = "local",
+        update_interval: float = 10.0,
+        session: Optional[requests.Session] = None,
     ):
         """Create a PolicyClient instance.
 
         Args:
-            address (str): Server to connect to (e.g., "localhost:9090").
-            inference_mode (str): Whether to use 'local' or 'remote' policy
+            address: Server to connect to (e.g., "localhost:9090").
+            inference_mode: Whether to use 'local' or 'remote' policy
                 inference for computing actions.
             update_interval (float or None): If using 'local' inference mode,
                 the policy is refreshed after this many seconds have passed,
                 or None for manual control via client.
+            session (requests.Session or None): If available the session object
+                is used to communicate with the policy server. Using a session
+                can lead to speedups as connections are reused. It is the
+                responsibility of the creator of the session to close it.
         """
         self.address = address
+        self.session = session
         self.env: ExternalEnv = None
         if inference_mode == "local":
             self.local = True
@@ -79,7 +73,6 @@ class PolicyClient:
         else:
             raise ValueError("inference_mode must be either 'local' or 'remote'")
 
-    @PublicAPI
     def start_episode(
         self, episode_id: Optional[str] = None, training_enabled: bool = True
     ) -> str:
@@ -88,11 +81,11 @@ class PolicyClient:
         Args:
             episode_id (Optional[str]): Unique string id for the episode or
                 None for it to be auto-assigned.
-            training_enabled (bool): Whether to use experiences for this
+            training_enabled: Whether to use experiences for this
                 episode to improve the policy.
 
         Returns:
-            episode_id (str): Unique string id for the episode.
+            episode_id: Unique string id for the episode.
         """
 
         if self.local:
@@ -102,23 +95,22 @@ class PolicyClient:
         return self._send(
             {
                 "episode_id": episode_id,
-                "command": PolicyClient.START_EPISODE,
+                "command": Commands.START_EPISODE,
                 "training_enabled": training_enabled,
             }
         )["episode_id"]
 
-    @PublicAPI
     def get_action(
         self, episode_id: str, observation: Union[EnvObsType, MultiAgentDict]
     ) -> Union[EnvActionType, MultiAgentDict]:
         """Record an observation and get the on-policy action.
 
         Args:
-            episode_id (str): Episode id returned from start_episode().
-            observation (obj): Current environment observation.
+            episode_id: Episode id returned from start_episode().
+            observation: Current environment observation.
 
         Returns:
-            action (obj): Action from the env action space.
+            action: Action from the env action space.
         """
 
         if self.local:
@@ -134,13 +126,12 @@ class PolicyClient:
         else:
             return self._send(
                 {
-                    "command": PolicyClient.GET_ACTION,
+                    "command": Commands.GET_ACTION,
                     "observation": observation,
                     "episode_id": episode_id,
                 }
             )["action"]
 
-    @PublicAPI
     def log_action(
         self,
         episode_id: str,
@@ -150,9 +141,9 @@ class PolicyClient:
         """Record an observation and (off-policy) action taken.
 
         Args:
-            episode_id (str): Episode id returned from start_episode().
-            observation (obj): Current environment observation.
-            action (obj): Action for the observation.
+            episode_id: Episode id returned from start_episode().
+            observation: Current environment observation.
+            action: Action for the observation.
         """
 
         if self.local:
@@ -161,14 +152,13 @@ class PolicyClient:
 
         self._send(
             {
-                "command": PolicyClient.LOG_ACTION,
+                "command": Commands.LOG_ACTION,
                 "observation": observation,
                 "action": action,
                 "episode_id": episode_id,
             }
         )
 
-    @PublicAPI
     def log_returns(
         self,
         episode_id: str,
@@ -200,7 +190,7 @@ class PolicyClient:
 
         self._send(
             {
-                "command": PolicyClient.LOG_RETURNS,
+                "command": Commands.LOG_RETURNS,
                 "reward": reward,
                 "info": info,
                 "episode_id": episode_id,
@@ -208,15 +198,14 @@ class PolicyClient:
             }
         )
 
-    @PublicAPI
     def end_episode(
         self, episode_id: str, observation: Union[EnvObsType, MultiAgentDict]
     ) -> None:
         """Record the end of an episode.
 
         Args:
-            episode_id (str): Episode id returned from start_episode().
-            observation (obj): Current environment observation.
+            episode_id: Episode id returned from start_episode().
+            observation: Current environment observation.
         """
 
         if self.local:
@@ -225,20 +214,24 @@ class PolicyClient:
 
         self._send(
             {
-                "command": PolicyClient.END_EPISODE,
+                "command": Commands.END_EPISODE,
                 "observation": observation,
                 "episode_id": episode_id,
             }
         )
 
-    @PublicAPI
     def update_policy_weights(self) -> None:
         """Query the server for new policy weights, if local inference is enabled."""
         self._update_local_policy(force=True)
 
     def _send(self, data):
         payload = pickle.dumps(data)
-        response = requests.post(self.address, data=payload)
+
+        if self.session is None:
+            response = requests.post(self.address, data=payload)
+        else:
+            response = self.session.post(self.address, data=payload)
+
         if response.status_code != 200:
             logger.error("Request failed {}: {}".format(response.text, data))
         response.raise_for_status()
@@ -252,7 +245,7 @@ class PolicyClient:
         logger.info("Querying server for rollout worker settings.")
         kwargs = self._send(
             {
-                "command": PolicyClient.GET_WORKER_ARGS,
+                "command": Commands.GET_WORKER_ARGS,
             }
         )["worker_args"]
         (self.rollout_worker, self.inference_thread) = _create_embedded_rollout_worker(
@@ -269,7 +262,7 @@ class PolicyClient:
             logger.info("Querying server for new policy weights.")
             resp = self._send(
                 {
-                    "command": PolicyClient.GET_WEIGHTS,
+                    "command": Commands.GET_WEIGHTS,
                 }
             )
             weights = resp["weights"]
@@ -311,20 +304,20 @@ class _LocalInferenceThread(threading.Thread):
                     )
                 self.send_fn(
                     {
-                        "command": PolicyClient.REPORT_SAMPLES,
+                        "command": Commands.REPORT_SAMPLES,
                         "samples": samples,
                         "metrics": metrics,
                     }
                 )
         except Exception as e:
-            logger.info("Error: inference worker thread died!", e)
+            logger.error("Error: inference worker thread died!", e)
 
 
 def _auto_wrap_external(real_env_creator):
     """Wrap an environment in the ExternalEnv interface if needed.
 
     Args:
-        real_env_creator (fn): Create an env given the env_config.
+        real_env_creator: Create an env given the env_config.
     """
 
     def wrapped_creator(env_config):
@@ -341,7 +334,7 @@ def _auto_wrap_external(real_env_creator):
             else:
                 external_cls = ExternalEnv
 
-            class ExternalEnvWrapper(external_cls):
+            class _ExternalEnvWrapper(external_cls):
                 def __init__(self, real_env):
                     super().__init__(
                         observation_space=real_env.observation_space,
@@ -353,7 +346,7 @@ def _auto_wrap_external(real_env_creator):
                     # client, run doesn't need to do anything.
                     time.sleep(999999)
 
-            return ExternalEnvWrapper(real_env)
+            return _ExternalEnvWrapper(real_env)
         return real_env
 
     return wrapped_creator
@@ -363,35 +356,37 @@ def _create_embedded_rollout_worker(kwargs, send_fn):
     """Create a local rollout worker and a thread that samples from it.
 
     Args:
-        kwargs (dict): args for the RolloutWorker constructor.
-        send_fn (fn): function to send a JSON request to the server.
+        kwargs: Args for the RolloutWorker constructor.
+        send_fn: Function to send a JSON request to the server.
     """
 
     # Since the server acts as an input datasource, we have to reset the
     # input config to the default, which runs env rollouts.
     kwargs = kwargs.copy()
-    del kwargs["input_creator"]
-
-    # Since the server also acts as an output writer, we might have to reset
-    # the output config to the default, i.e. "output": None, otherwise a
-    # local rollout worker might write to an unknown output directory
-    del kwargs["output_creator"]
+    kwargs["config"] = kwargs["config"].copy(copy_frozen=False)
+    config = kwargs["config"]
+    config.output = None
+    config.input_ = "sampler"
+    config.input_config = {}
 
     # If server has no env (which is the expected case):
     # Generate a dummy ExternalEnv here using RandomEnv and the
     # given observation/action spaces.
-    if kwargs["policy_config"].get("env") is None:
-        from ray.rllib.examples.env.random_env import RandomEnv, RandomMultiAgentEnv
-
-        config = {
-            "action_space": kwargs["policy_config"]["action_space"],
-            "observation_space": kwargs["policy_config"]["observation_space"],
-        }
-        _, is_ma = check_multi_agent(kwargs["policy_config"])
-        kwargs["env_creator"] = _auto_wrap_external(
-            lambda _: (RandomMultiAgentEnv if is_ma else RandomEnv)(config)
+    if config.env is None:
+        from ray.rllib.examples.envs.classes.random_env import (
+            RandomEnv,
+            RandomMultiAgentEnv,
         )
-        kwargs["policy_config"]["env"] = True
+
+        env_config = {
+            "action_space": config.action_space,
+            "observation_space": config.observation_space,
+        }
+        is_ma = config.is_multi_agent
+        kwargs["env_creator"] = _auto_wrap_external(
+            lambda _: (RandomMultiAgentEnv if is_ma else RandomEnv)(env_config)
+        )
+        # kwargs["config"].env = True
     # Otherwise, use the env specified by the server args.
     else:
         real_env_creator = kwargs["env_creator"]

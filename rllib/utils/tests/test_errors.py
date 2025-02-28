@@ -1,10 +1,9 @@
 import unittest
 
 import ray
-import ray.rllib.agents.impala as impala
-import ray.rllib.agents.pg as pg
+import ray.rllib.algorithms.impala as impala
+import ray.rllib.algorithms.ppo as ppo
 from ray.rllib.utils.error import EnvError
-from ray.rllib.utils.test_utils import framework_iterator
 
 
 class TestErrors(unittest.TestCase):
@@ -24,57 +23,61 @@ class TestErrors(unittest.TestCase):
         This test will only work ok on a CPU-only machine.
         """
 
-        config = impala.DEFAULT_CONFIG.copy()
-        env = "CartPole-v0"
-
-        for _ in framework_iterator(config):
-            self.assertRaisesRegex(
-                RuntimeError,
-                # (?s): "dot matches all" (also newlines).
-                "(?s)Found 0 GPUs on your machine.+To change the config",
-                lambda: impala.ImpalaTrainer(config=config, env=env),
+        config = (
+            impala.IMPALAConfig()
+            .api_stack(
+                enable_rl_module_and_learner=False,
+                enable_env_runner_and_connector_v2=False,
             )
+            .environment("CartPole-v1")
+        )
+
+        self.assertRaisesRegex(
+            RuntimeError,
+            # (?s): "dot matches all" (also newlines).
+            "(?s)Found 0 GPUs on your machine.+To change the config",
+            lambda: config.build(),
+        )
 
     def test_bad_envs(self):
         """Tests different "bad env" errors."""
-        config = pg.DEFAULT_CONFIG.copy()
-        config["num_workers"] = 0
+        config = (
+            ppo.PPOConfig().env_runners(num_env_runners=0)
+            # Non existing/non-registered gym env string.
+            .environment("Alien-Attack-v42")
+        )
 
-        # Non existing/non-registered gym env string.
-        env = "Alien-Attack-v42"
-        for _ in framework_iterator(config):
-            self.assertRaisesRegex(
-                EnvError,
-                f"The env string you provided \\('{env}'\\) is",
-                lambda: pg.PGTrainer(config=config, env=env),
-            )
+        self.assertRaisesRegex(
+            EnvError,
+            f"The env string you provided \\('{config.env}'\\) is",
+            lambda: config.build(),
+        )
 
         # Malformed gym env string (must have v\d at end).
-        env = "Alien-Attack-part-42"
-        for _ in framework_iterator(config):
-            self.assertRaisesRegex(
-                EnvError,
-                f"The env string you provided \\('{env}'\\) is",
-                lambda: pg.PGTrainer(config=config, env=env),
-            )
+        config.environment("Alien-Attack-part-42")
+        self.assertRaisesRegex(
+            EnvError,
+            f"The env string you provided \\('{config.env}'\\) is",
+            lambda: config.build(),
+        )
 
         # Non-existing class in a full-class-path.
-        env = "ray.rllib.examples.env.random_env.RandomEnvThatDoesntExist"
-        for _ in framework_iterator(config):
-            self.assertRaisesRegex(
-                EnvError,
-                f"The env string you provided \\('{env}'\\) is",
-                lambda: pg.PGTrainer(config=config, env=env),
-            )
+        config.environment(
+            "ray.rllib.examples.envs.classes.random_env.RandomEnvThatDoesntExist"
+        )
+        self.assertRaisesRegex(
+            EnvError,
+            f"The env string you provided \\('{config.env}'\\) is",
+            lambda: config.build(),
+        )
 
         # Non-existing module inside a full-class-path.
-        env = "ray.rllib.examples.env.module_that_doesnt_exist.SomeEnv"
-        for _ in framework_iterator(config):
-            self.assertRaisesRegex(
-                EnvError,
-                f"The env string you provided \\('{env}'\\) is",
-                lambda: pg.PGTrainer(config=config, env=env),
-            )
+        config.environment("ray.rllib.examples.envs.module_that_doesnt_exist.SomeEnv")
+        self.assertRaisesRegex(
+            EnvError,
+            f"The env string you provided \\('{config.env}'\\) is",
+            lambda: config.build(),
+        )
 
 
 if __name__ == "__main__":

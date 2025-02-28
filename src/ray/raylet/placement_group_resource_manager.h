@@ -17,8 +17,10 @@
 #include "absl/container/flat_hash_map.h"
 #include "ray/common/bundle_spec.h"
 #include "ray/common/id.h"
-#include "ray/common/task/scheduling_resources.h"
+#include "ray/common/placement_group.h"
+#include "ray/common/scheduling/resource_set.h"
 #include "ray/raylet/scheduling/cluster_resource_scheduler.h"
+#include "ray/util/util.h"
 
 namespace ray {
 
@@ -29,13 +31,6 @@ enum CommitState {
   PREPARED,
   /// Resources are COMMITTED.
   COMMITTED
-};
-
-struct pair_hash {
-  template <class T1, class T2>
-  std::size_t operator()(const std::pair<T1, T2> &pair) const {
-    return std::hash<T1>()(pair.first) ^ std::hash<T2>()(pair.second);
-  }
 };
 
 struct BundleTransactionState {
@@ -69,7 +64,10 @@ class PlacementGroupResourceManager {
   /// Return back all the bundle resource.
   ///
   /// \param bundle_spec Specification of bundle whose resources will be returned.
-  virtual void ReturnBundle(const BundleSpecification &bundle_spec) = 0;
+  /// \return ok status if it succeeds to return a bundle. Invalid if it is
+  /// in a transient state that cannot return a bundle. The caller should
+  /// retry in this case.
+  virtual Status ReturnBundle(const BundleSpecification &bundle_spec) = 0;
 
   /// Return back all the bundle(which is unused) resource.
   ///
@@ -90,15 +88,8 @@ class NewPlacementGroupResourceManager : public PlacementGroupResourceManager {
   /// Create a new placement group resource manager.
   ///
   /// \param cluster_resource_scheduler_: The resource allocator of new scheduler.
-  /// \param update_resources: Called when a new custom resource is created.
-  /// \param delete_resources: Called when a custom resource is deleted.
   NewPlacementGroupResourceManager(
-      std::shared_ptr<ClusterResourceScheduler> cluster_resource_scheduler,
-      std::function<
-          void(const ray::gcs::NodeResourceInfoAccessor::ResourceMap &resources)>
-          update_resources,
-      std::function<void(const std::vector<std::string> &resource_names)>
-          delete_resources);
+      std::shared_ptr<ClusterResourceScheduler> cluster_resource_scheduler);
 
   virtual ~NewPlacementGroupResourceManager() = default;
 
@@ -108,7 +99,7 @@ class NewPlacementGroupResourceManager : public PlacementGroupResourceManager {
   void CommitBundles(const std::vector<std::shared_ptr<const BundleSpecification>>
                          &bundle_specs) override;
 
-  void ReturnBundle(const BundleSpecification &bundle_spec) override;
+  Status ReturnBundle(const BundleSpecification &bundle_spec) override;
 
   const std::shared_ptr<ClusterResourceScheduler> GetResourceScheduler() const {
     return cluster_resource_scheduler_;
@@ -116,13 +107,6 @@ class NewPlacementGroupResourceManager : public PlacementGroupResourceManager {
 
  private:
   std::shared_ptr<ClusterResourceScheduler> cluster_resource_scheduler_;
-
-  /// Called when a new custom resource is created.
-  std::function<void(const ray::gcs::NodeResourceInfoAccessor::ResourceMap &resources)>
-      update_resources_;
-
-  /// Called when a custom resource is deleted.
-  std::function<void(const std::vector<std::string> &resource_names)> delete_resources_;
 
   /// Tracking placement group bundles and their states. This mapping is the source of
   /// truth for the new scheduler.

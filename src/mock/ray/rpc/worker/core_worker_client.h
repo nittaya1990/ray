@@ -15,104 +15,134 @@
 namespace ray {
 namespace rpc {
 
-class MockWorkerAddress : public WorkerAddress {
- public:
-};
-
-}  // namespace rpc
-}  // namespace ray
-
-namespace ray {
-namespace rpc {
-
 class MockCoreWorkerClientInterface : public ray::pubsub::MockSubscriberClientInterface,
                                       public CoreWorkerClientInterface {
  public:
-  MOCK_METHOD(const rpc::Address &, Addr, (), (const, override));
-  MOCK_METHOD(void, PushActorTask,
-              (std::unique_ptr<PushTaskRequest> request, bool skip_queue,
-               const ClientCallback<PushTaskReply> &callback),
+  MOCK_METHOD(void,
+              PushActorTask,
+              (std::unique_ptr<PushTaskRequest> request,
+               bool skip_queue,
+               ClientCallback<PushTaskReply> &&callback),
               (override));
-  MOCK_METHOD(void, PushNormalTask,
+  MOCK_METHOD(void,
+              PushNormalTask,
               (std::unique_ptr<PushTaskRequest> request,
                const ClientCallback<PushTaskReply> &callback),
               (override));
-  MOCK_METHOD(void, DirectActorCallArgWaitComplete,
+  MOCK_METHOD(void,
+              NumPendingTasks,
+              (std::unique_ptr<NumPendingTasksRequest> request,
+               const ClientCallback<NumPendingTasksReply> &callback,
+               int64_t timeout_ms),
+              (override));
+  MOCK_METHOD(void,
+              DirectActorCallArgWaitComplete,
               (const DirectActorCallArgWaitCompleteRequest &request,
                const ClientCallback<DirectActorCallArgWaitCompleteReply> &callback),
               (override));
-  MOCK_METHOD(void, GetObjectStatus,
+  MOCK_METHOD(void,
+              GetObjectStatus,
               (const GetObjectStatusRequest &request,
                const ClientCallback<GetObjectStatusReply> &callback),
               (override));
-  MOCK_METHOD(void, WaitForActorOutOfScope,
-              (const WaitForActorOutOfScopeRequest &request,
-               const ClientCallback<WaitForActorOutOfScopeReply> &callback),
+  MOCK_METHOD(void,
+              WaitForActorRefDeleted,
+              (const WaitForActorRefDeletedRequest &request,
+               const ClientCallback<WaitForActorRefDeletedReply> &callback),
               (override));
-  MOCK_METHOD(void, PubsubLongPolling,
+  MOCK_METHOD(void,
+              PubsubLongPolling,
               (const PubsubLongPollingRequest &request,
                const ClientCallback<PubsubLongPollingReply> &callback),
               (override));
-  MOCK_METHOD(void, PubsubCommandBatch,
+  MOCK_METHOD(void,
+              PubsubCommandBatch,
               (const PubsubCommandBatchRequest &request,
                const ClientCallback<PubsubCommandBatchReply> &callback),
               (override));
-  MOCK_METHOD(void, UpdateObjectLocationBatch,
+  MOCK_METHOD(void,
+              UpdateObjectLocationBatch,
               (const UpdateObjectLocationBatchRequest &request,
                const ClientCallback<UpdateObjectLocationBatchReply> &callback),
               (override));
-  MOCK_METHOD(void, GetObjectLocationsOwner,
+  MOCK_METHOD(void,
+              GetObjectLocationsOwner,
               (const GetObjectLocationsOwnerRequest &request,
                const ClientCallback<GetObjectLocationsOwnerReply> &callback),
               (override));
-  MOCK_METHOD(void, KillActor,
+  MOCK_METHOD(void,
+              KillActor,
               (const KillActorRequest &request,
                const ClientCallback<KillActorReply> &callback),
               (override));
-  MOCK_METHOD(void, CancelTask,
+  MOCK_METHOD(void,
+              CancelTask,
               (const CancelTaskRequest &request,
                const ClientCallback<CancelTaskReply> &callback),
               (override));
-  MOCK_METHOD(void, RemoteCancelTask,
+  MOCK_METHOD(void,
+              RemoteCancelTask,
               (const RemoteCancelTaskRequest &request,
                const ClientCallback<RemoteCancelTaskReply> &callback),
               (override));
-  MOCK_METHOD(void, GetCoreWorkerStats,
+  MOCK_METHOD(void,
+              GetCoreWorkerStats,
               (const GetCoreWorkerStatsRequest &request,
                const ClientCallback<GetCoreWorkerStatsReply> &callback),
               (override));
-  MOCK_METHOD(void, LocalGC,
+  MOCK_METHOD(void,
+              LocalGC,
               (const LocalGCRequest &request,
                const ClientCallback<LocalGCReply> &callback),
               (override));
-  MOCK_METHOD(void, SpillObjects,
+  MOCK_METHOD(void,
+              SpillObjects,
               (const SpillObjectsRequest &request,
                const ClientCallback<SpillObjectsReply> &callback),
               (override));
-  MOCK_METHOD(void, RestoreSpilledObjects,
+  MOCK_METHOD(void,
+              RestoreSpilledObjects,
               (const RestoreSpilledObjectsRequest &request,
                const ClientCallback<RestoreSpilledObjectsReply> &callback),
               (override));
-  MOCK_METHOD(void, DeleteSpilledObjects,
+  MOCK_METHOD(void,
+              DeleteSpilledObjects,
               (const DeleteSpilledObjectsRequest &request,
                const ClientCallback<DeleteSpilledObjectsReply> &callback),
               (override));
-  MOCK_METHOD(void, AddSpilledUrl,
-              (const AddSpilledUrlRequest &request,
-               const ClientCallback<AddSpilledUrlReply> &callback),
-              (override));
-  MOCK_METHOD(void, PlasmaObjectReady,
+  MOCK_METHOD(void,
+              PlasmaObjectReady,
               (const PlasmaObjectReadyRequest &request,
                const ClientCallback<PlasmaObjectReadyReply> &callback),
               (override));
-  MOCK_METHOD(void, Exit,
+  MOCK_METHOD(void,
+              Exit,
               (const ExitRequest &request, const ClientCallback<ExitReply> &callback),
               (override));
-  MOCK_METHOD(void, AssignObjectOwner,
+  MOCK_METHOD(void,
+              AssignObjectOwner,
               (const AssignObjectOwnerRequest &request,
                const ClientCallback<AssignObjectOwnerReply> &callback),
               (override));
   MOCK_METHOD(int64_t, ClientProcessedUpToSeqno, (), (override));
+};
+
+class MockCoreWorkerClientConfigurableRunningTasks
+    : public MockCoreWorkerClientInterface {
+ public:
+  explicit MockCoreWorkerClientConfigurableRunningTasks(int num_running_tasks)
+      : num_running_tasks_(num_running_tasks) {}
+
+  void NumPendingTasks(std::unique_ptr<NumPendingTasksRequest> request,
+                       const ClientCallback<NumPendingTasksReply> &callback,
+                       int64_t timeout_ms = -1) override {
+    NumPendingTasksReply reply;
+    reply.set_num_pending_tasks(num_running_tasks_);
+    callback(Status::OK(), std::move(reply));
+  }
+
+ private:
+  int num_running_tasks_;
 };
 
 }  // namespace rpc

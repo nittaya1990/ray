@@ -1,49 +1,36 @@
-import jsonschema
+import copy
 import logging
 import os
 import sys
 import tempfile
+from typing import Dict, Any
 import unittest
 import urllib
-import yaml
-import copy
 from unittest.mock import MagicMock, Mock, patch
+
+import jsonschema
 import pytest
+import yaml
 from click.exceptions import ClickException
 
+from unittest import mock
+from ray._private.test_utils import load_test_config, recursive_fnmatch
 from ray.autoscaler._private._azure.config import (
     _configure_key_pair as _azure_configure_key_pair,
 )
 from ray.autoscaler._private.gcp import config as gcp_config
+from ray.autoscaler._private.providers import _NODE_PROVIDERS
 from ray.autoscaler._private.util import (
+    fill_node_type_min_max_workers,
+    merge_setup_commands,
     prepare_config,
     validate_config,
-    _get_default_config,
-    merge_setup_commands,
-    fill_node_type_min_max_workers,
 )
-from ray.autoscaler._private.providers import _NODE_PROVIDERS
-from ray.autoscaler._private._kubernetes.node_provider import KubernetesNodeProvider
-from ray.autoscaler.tags import NODE_TYPE_LEGACY_HEAD, NODE_TYPE_LEGACY_WORKER
-
-from ray._private.test_utils import load_test_config, recursive_fnmatch
 
 RAY_PATH = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
 CONFIG_PATHS = recursive_fnmatch(os.path.join(RAY_PATH, "autoscaler"), "*.yaml")
 
 CONFIG_PATHS += recursive_fnmatch(os.path.join(RAY_PATH, "tune", "examples"), "*.yaml")
-
-
-def ignore_k8s_operator_configs(paths):
-    return [
-        path
-        for path in paths
-        if "kubernetes/operator_configs" not in path
-        and "kubernetes/job-example.yaml" not in path
-    ]
-
-
-CONFIG_PATHS = ignore_k8s_operator_configs(CONFIG_PATHS)
 
 EXPECTED_LOCAL_CONFIG_STR = """
 cluster_name: minimal-manual
@@ -86,11 +73,19 @@ worker_setup_commands: []
 """  # noqa E501
 
 
+def fake_fillout_available_node_types_resources(config: Dict[str, Any]) -> None:
+    """A cheap way to fill out the resources field (the same way a node
+    provider would autodetect them) as far as schema validation is concerned."""
+    available_node_types = config.get("available_node_types", {})
+    for value in available_node_types.values():
+        value["resources"] = value.get("resources", {"filler": 1})
+
+
 class AutoscalingConfigTest(unittest.TestCase):
     def testValidateDefaultConfig(self):
         for config_path in CONFIG_PATHS:
             try:
-                if "aws/example-multi-node-type.yaml" in config_path:
+                if os.path.join("aws", "example-multi-node-type.yaml") in config_path:
                     # aws tested in testValidateDefaultConfigAWSMultiNodeTypes.
                     continue
                 if "local" in config_path:
@@ -105,10 +100,8 @@ class AutoscalingConfigTest(unittest.TestCase):
                 with open(config_path) as f:
                     config = yaml.safe_load(f)
                 config = prepare_config(config)
-                if config["provider"]["type"] == "kubernetes":
-                    KubernetesNodeProvider.fillout_available_node_types_resources(
-                        config
-                    )
+                if config["provider"]["type"] == "aws":
+                    fake_fillout_available_node_types_resources(config)
                 validate_config(config)
             except Exception:
                 logging.exception("")
@@ -155,22 +148,38 @@ class AutoscalingConfigTest(unittest.TestCase):
             "cpu_4_ondemand": new_config["available_node_types"]["cpu_4_ondemand"],
             "cpu_16_spot": new_config["available_node_types"]["cpu_16_spot"],
             "gpu_8_ondemand": new_config["available_node_types"]["gpu_8_ondemand"],
+            "neuron_core_inf_1_ondemand": {
+                "node_config": {
+                    "InstanceType": "inf2.xlarge",
+                    "ImageId": "latest_dlami",
+                },
+                "max_workers": 2,
+            },
         }
         orig_new_config = copy.deepcopy(new_config)
         expected_available_node_types = orig_new_config["available_node_types"]
         expected_available_node_types["cpu_4_ondemand"]["resources"] = {"CPU": 4}
         expected_available_node_types["cpu_16_spot"]["resources"] = {
             "CPU": 16,
-            "memory": 41231686041,
+            "memory": 48103633715,
             "Custom1": 1,
             "is_spot": 1,
         }
         expected_available_node_types["gpu_8_ondemand"]["resources"] = {
             "CPU": 32,
-            "memory": 157195803033,
+            "memory": 183395103539,
             "GPU": 4,
             "accelerator_type:V100": 1,
         }
+        expected_available_node_types["neuron_core_inf_1_ondemand"]["resources"] = {
+            "CPU": 4,
+            "memory": 12025908428,
+            "neuron_cores": 2,
+            "accelerator_type:aws-neuron-core": 1,
+        }
+        expected_available_node_types["cpu_16_spot"]["min_workers"] = 0
+        expected_available_node_types["gpu_8_ondemand"]["min_workers"] = 0
+        expected_available_node_types["neuron_core_inf_1_ondemand"]["min_workers"] = 0
 
         boto3_dict = {
             "InstanceTypes": [
@@ -189,6 +198,14 @@ class AutoscalingConfigTest(unittest.TestCase):
                     "VCpuInfo": {"DefaultVCpus": 32},
                     "MemoryInfo": {"SizeInMiB": 249856},
                     "GpuInfo": {"Gpus": [{"Name": "V100", "Count": 4}]},
+                },
+                {
+                    "InstanceType": "inf2.xlarge",
+                    "VCpuInfo": {"DefaultVCpus": 4},
+                    "MemoryInfo": {"SizeInMiB": 16384},
+                    "AcceleratorInfo": {
+                        "Accelerators": [{"Name": "Inferentia", "Count": 1}]
+                    },
                 },
             ]
         }
@@ -210,7 +227,9 @@ class AutoscalingConfigTest(unittest.TestCase):
                     new_config
                 )
                 validate_config(new_config)
-                expected_available_node_types == new_config["available_node_types"]
+                assert (
+                    expected_available_node_types == new_config["available_node_types"]
+                )
             except Exception:
                 self.fail("Config did not pass multi node types auto fill test!")
 
@@ -262,7 +281,34 @@ class AutoscalingConfigTest(unittest.TestCase):
         # Check that worker config numbers were clipped to 3.
         assert prepared_config == expected_prepared
 
-    def testValidateNetworkConfig(self):
+        not_enough_workers_config = copy.deepcopy(base_config)
+
+        # Max workers is less than than the three available ips.
+        # The user is probably has probably made an error. Make sure we log a warning.
+        not_enough_workers_config["max_workers"] = 0
+        not_enough_workers_config["min_workers"] = 0
+        with mock.patch(
+            "ray.autoscaler._private.local.config.cli_logger.warning"
+        ) as warning:
+            prepared_config = prepare_config(not_enough_workers_config)
+            warning.assert_called_with(
+                "The value of `max_workers` supplied (0) is less"
+                " than the number of available worker ips (3)."
+                " At most 0 Ray worker nodes will connect to the cluster."
+            )
+        expected_prepared = yaml.safe_load(EXPECTED_LOCAL_CONFIG_STR)
+        # We logged a warning.
+        # However, prepare_config does not repair the strange config setting:
+        expected_prepared["max_workers"] = 0
+        expected_prepared["available_node_types"]["local.cluster.node"][
+            "max_workers"
+        ] = 0
+        expected_prepared["available_node_types"]["local.cluster.node"][
+            "min_workers"
+        ] = 0
+        assert prepared_config == expected_prepared
+
+    def testValidateNetworkConfigForBackwardsCompatibility(self):
         web_yaml = (
             "https://raw.githubusercontent.com/ray-project/ray/"
             "master/python/ray/autoscaler/aws/example-full.yaml"
@@ -383,44 +429,6 @@ class AutoscalingConfigTest(unittest.TestCase):
             == 2
         )
 
-    def testFillEdgeLegacyConfigs(self):
-        # Test edge cases: legacy configs which specify workers but not head
-        # or vice-versa.
-        no_head = load_test_config("test_no_head.yaml")
-        aws_defaults = _get_default_config(no_head["provider"])
-        head_prepared = prepare_config(no_head)
-        assert (
-            head_prepared["available_node_types"]["ray-legacy-head-node-type"][
-                "node_config"
-            ]
-            == aws_defaults["available_node_types"]["ray.head.default"]["node_config"]
-        )
-        assert head_prepared["head_node"] == {}
-        # Custom worker config preserved
-        node_types = head_prepared["available_node_types"]
-        worker_type = node_types["ray-legacy-worker-node-type"]
-        assert (
-            worker_type["node_config"]
-            == head_prepared["worker_nodes"]
-            == {"foo": "bar"}
-        )
-
-        no_workers = load_test_config("test_no_workers.yaml")
-        workers_prepared = prepare_config(no_workers)
-        assert (
-            workers_prepared["available_node_types"]["ray-legacy-worker-node-type"][
-                "node_config"
-            ]
-            == aws_defaults["available_node_types"]["ray.worker.default"]["node_config"]
-        )
-        assert workers_prepared["worker_nodes"] == {}
-        # Custom head config preserved
-        node_types = workers_prepared["available_node_types"]
-        head_type = node_types["ray-legacy-head-node-type"]
-        assert (
-            head_type["node_config"] == workers_prepared["head_node"] == {"baz": "qux"}
-        )
-
     @pytest.mark.skipif(sys.platform.startswith("win"), reason="Fails on Windows.")
     def testExampleFull(self):
         """
@@ -436,58 +444,6 @@ class AutoscalingConfigTest(unittest.TestCase):
             merge_setup_commands(config_copy)
             fill_node_type_min_max_workers(config_copy)
             assert config_copy == prepare_config(config)
-
-    @pytest.mark.skipif(sys.platform.startswith("win"), reason="Fails on Windows.")
-    def testLegacyYaml(self):
-        # Test correct default-merging behavior for legacy yamls.
-        providers = ["aws", "azure"]
-        for provider in providers:
-            path = os.path.join(
-                RAY_PATH, "autoscaler", provider, "example-full-legacy.yaml"
-            )
-            legacy_config = yaml.safe_load(open(path).read())
-            # custom head and workers
-            legacy_config["head_node"] = {"blahblah": 0}
-            legacy_config["worker_nodes"] = {"halbhalhb": 0}
-            legacy_config_copy = copy.deepcopy(legacy_config)
-            prepared_legacy = prepare_config(legacy_config_copy)
-            assert (
-                prepared_legacy["available_node_types"][NODE_TYPE_LEGACY_HEAD][
-                    "max_workers"
-                ]
-                == 0
-            )
-            assert (
-                prepared_legacy["available_node_types"][NODE_TYPE_LEGACY_HEAD][
-                    "min_workers"
-                ]
-                == 0
-            )
-            assert (
-                prepared_legacy["available_node_types"][NODE_TYPE_LEGACY_HEAD][
-                    "node_config"
-                ]
-                == legacy_config["head_node"]
-            )
-
-            assert (
-                prepared_legacy["available_node_types"][NODE_TYPE_LEGACY_WORKER][
-                    "max_workers"
-                ]
-                == 2
-            )
-            assert (
-                prepared_legacy["available_node_types"][NODE_TYPE_LEGACY_WORKER][
-                    "min_workers"
-                ]
-                == 0
-            )
-            assert (
-                prepared_legacy["available_node_types"][NODE_TYPE_LEGACY_WORKER][
-                    "node_config"
-                ]
-                == legacy_config["worker_nodes"]
-            )
 
     @pytest.mark.skipif(sys.platform.startswith("win"), reason="Fails on Windows.")
     def testAzureKeyPair(self):
@@ -694,7 +650,9 @@ class AutoscalingConfigTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    import pytest
     import sys
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

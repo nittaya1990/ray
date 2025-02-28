@@ -26,6 +26,16 @@ std::pair<rpc::Address, bool> LocalityAwareLeasePolicy::GetBestNodeForTask(
     return std::make_pair(fallback_rpc_address_, false);
   }
 
+  if (spec.IsNodeAffinitySchedulingStrategy()) {
+    // The explicit node affinity scheduling strategy
+    // has higher priority than locality aware scheduling.
+    if (auto addr = node_addr_factory_(spec.GetNodeAffinitySchedulingStrategyNodeId())) {
+      return std::make_pair(addr.value(), false);
+    }
+    return std::make_pair(fallback_rpc_address_, false);
+  }
+
+  // Pick node based on locality.
   if (auto node_id = GetBestNodeIdForTask(spec)) {
     if (auto addr = node_addr_factory_(node_id.value())) {
       return std::make_pair(addr.value(), true);
@@ -44,7 +54,7 @@ absl::optional<NodeID> LocalityAwareLeasePolicy::GetBestNodeIdForTask(
   absl::optional<NodeID> max_bytes_node;
   // Finds the node with the maximum number of object bytes local.
   for (const ObjectID &object_id : object_ids) {
-    if (auto locality_data = locality_data_provider_->GetLocalityData(object_id)) {
+    if (auto locality_data = locality_data_provider_.GetLocalityData(object_id)) {
       for (const NodeID &node_id : locality_data->nodes_containing_object) {
         auto &bytes = bytes_local_table[node_id];
         bytes += locality_data->object_size;

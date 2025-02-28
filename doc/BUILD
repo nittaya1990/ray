@@ -1,5 +1,10 @@
 load("//bazel:python.bzl", "py_test_run_all_subdirectory")
 load("//bazel:python.bzl", "py_test_run_all_notebooks")
+load("//bazel:python.bzl", "doctest")
+load("@py_deps_buildkite//:requirements.bzl", ci_require = "requirement")
+load("@rules_python//python:defs.bzl", "py_test")
+
+exports_files(["test_myst_doc.py"])
 
 # --------------------------------------------------------------------
 # Tests from the doc directory.
@@ -7,143 +12,227 @@ load("//bazel:python.bzl", "py_test_run_all_notebooks")
 # root directory.
 # --------------------------------------------------------------------
 
-# Support for Dask has been dropped in 3.6.
 py_test(
-    name = "dask_xgboost",
+    name = "highly_parallel",
     size = "medium",
-    main = "test_myst_doc.py",
     srcs = ["test_myst_doc.py"],
-    tags = ["exclusive", "team:ml", "py37"],
+    args = [
+        "--path",
+        "doc/source/ray-core/examples/highly_parallel.ipynb",
+    ],
     data = ["//doc/source/ray-core/examples:core_examples"],
-    args = ["--path", "doc/source/ray-core/examples/dask_xgboost/dask_xgboost.ipynb",
-            "--smoke-test", "--address ''", "--num-actors 4", "--cpus-per-actor 1", "--num-actors-inference 4",
-            "--cpus-per-actor-inference 1"]
-)
-
-# Support for Modin has been dropped in 3.6.
-py_test(
-    name = "modin_xgboost",
-    size = "medium",
     main = "test_myst_doc.py",
-    srcs = ["test_myst_doc.py"],
-    tags = ["exclusive", "team:ml", "py37"],
-    data = ["//doc/source/ray-core/examples:core_examples"],
-    args = ["--path", "doc/source/ray-core/examples/modin_xgboost/modin_xgboost.ipynb",
-            "--smoke-test", "--address ''", "--num-actors 4",
-            "--cpus-per-actor 1", "--num-actors-inference 4",
-            "--cpus-per-actor-inference 1"]
-)
-
-### Ray Data
-py_test(
-    name = "quick_start",
-    size = "small",
-    srcs = ["source/data/doc_code/quick_start.py"],
-    tags = ["exclusive", "team:ml"]
-)
-
-py_test(
-    name = "big_data_ingestion",
-    size = "small",
-    main = "test_myst_doc.py",
-    srcs = ["test_myst_doc.py"],
-    args = ["--path", "doc/source/data/examples/big_data_ingestion.ipynb"],
-    data = ["//doc/source/data/examples:data_examples"],
-    tags = ["exclusive", "team:core", "py37"]
-)
-
-py_test(
-    name = "datasets_train",
-    size = "medium",
-    srcs = ["source/ray-core/_examples/datasets_train/datasets_train.py"],
-    tags = ["exclusive", "team:ml", "py37", "datasets_train"],
-    args = ["--smoke-test", "--num-workers=2", "--use-gpu"]
+    tags = [
+        "exclusive",
+        "highly_parallel",
+        "team:ml",
+    ],
 )
 
 py_test(
     name = "plot_hyperparameter",
     size = "small",
-    main = "test_myst_doc.py",
     srcs = ["test_myst_doc.py"],
-    args = ["--path", "doc/source/ray-core/examples/plot_hyperparameter.ipynb"],
+    args = [
+        "--path",
+        "doc/source/ray-core/examples/plot_hyperparameter.ipynb",
+    ],
     data = ["//doc/source/ray-core/examples:core_examples"],
-    tags = ["exclusive", "team:ml"]
+    main = "test_myst_doc.py",
+    tags = [
+        "exclusive",
+        "team:ml",
+    ],
+)
+
+py_test(
+    name = "automl_for_time_series",
+    size = "medium",
+    srcs = ["test_myst_doc.py"],
+    args = [
+        "--path",
+        "doc/source/ray-core/examples/automl_for_time_series.ipynb",
+    ],
+    data = ["//doc/source/ray-core/examples:core_examples"],
+    main = "test_myst_doc.py",
+    tags = [
+        "exclusive",
+        "team:ml",
+        "timeseries_libs",
+    ],
+)
+
+py_test(
+    name = "batch_prediction",
+    size = "medium",
+    srcs = ["test_myst_doc.py"],
+    args = [
+        "--path",
+        "doc/source/ray-core/examples/batch_prediction.ipynb",
+    ],
+    data = ["//doc/source/ray-core/examples:core_examples"],
+    main = "test_myst_doc.py",
+    tags = [
+        "exclusive",
+        "team:ml",
+    ],
 )
 
 py_test(
     name = "plot_parameter_server",
     size = "medium",
-    main = "test_myst_doc.py",
     srcs = ["test_myst_doc.py"],
-    args = ["--path", "doc/source/ray-core/examples/plot_parameter_server.ipynb"],
+    args = [
+        "--path",
+        "doc/source/ray-core/examples/plot_parameter_server.ipynb",
+    ],
     data = ["//doc/source/ray-core/examples:core_examples"],
-    tags = ["exclusive", "team:ml"]
+    main = "test_myst_doc.py",
+    tags = [
+        "exclusive",
+        "team:ml",
+    ],
 )
 
 py_test(
     name = "plot_pong_example",
     size = "large",
-    main = "test_myst_doc.py",
     srcs = ["test_myst_doc.py"],
-    args = ["--path", "doc/source/ray-core/examples/plot_pong_example.ipynb"],
+    args = [
+        "--path",
+        "doc/source/ray-core/examples/plot_pong_example.ipynb",
+    ],
     data = ["//doc/source/ray-core/examples:core_examples"],
-    tags = ["exclusive", "team:ml"]
-)
-
-py_test(
-    name = "progress_bar",
     main = "test_myst_doc.py",
-    srcs = ["test_myst_doc.py"],
-    size = "small",
-    args = ["--path", "doc/source/ray-core/examples/progress_bar.ipynb"],
-    data = ["//doc/source/ray-core/examples:core_examples"],
-    tags = ["exclusive", "team:ml"]
+    tags = [
+        "exclusive",
+        "team:ml",
+    ],
 )
 
+# --------------------------------------------------------------------
+# Test all doc/source/ray-observability/doc_code code included in rst/md files.
+# --------------------------------------------------------------------
 
-# Directory: source/ray-core/doc_code
-py_test(
-    name = "doc_code_tf_example",
-    size = "small",
-    main = "source/ray-core/doc_code/tf_example.py",
-    srcs = ["source/ray-core/doc_code/tf_example.py"],
-    tags = ["exclusive", "tf", "team:ml"]
+py_test_run_all_subdirectory(
+    size = "medium",
+    include = ["source/ray-observability/doc_code/*.py"],
+    exclude = ["source/ray-observability/doc_code/ray-distributed-debugger.py"],
+    extra_srcs = [],
+    tags = [
+        "exclusive",
+        "team:core",
+    ],
 )
 
-py_test(
-    name = "doc_code_torch_example",
-    size = "small",
-    main = "source/ray-core/doc_code/torch_example.py",
-    srcs = ["source/ray-core/doc_code/torch_example.py"],
-    tags = ["exclusive", "pytorch", "team:ml"]
-)
-
-py_test(
-    name = "doc_code_metrics_example",
-    size = "small",
-    main = "source/ray-core/doc_code/metrics_example.py",
-    srcs = ["source/ray-core/doc_code/metrics_example.py"],
-    tags = ["exclusive", "team:serve"]
-)
+# --------------------------------------------------------------------
+# Test all doc/source/ray-core/doc_code code included in rst/md files.
+# --------------------------------------------------------------------
 
 py_test(
     name = "doc_code_runtime_env_example",
     size = "small",
-    main = "source/ray-core/doc_code/runtime_env_example.py",
     srcs = ["source/ray-core/doc_code/runtime_env_example.py"],
-    tags = ["exclusive", "post_wheel_build", "team:serve"]
+    main = "source/ray-core/doc_code/runtime_env_example.py",
+    tags = [
+        "exclusive",
+        "post_wheel_build",
+        "team:serve",
+    ],
+)
+
+py_test(
+    name = "doc_code_ray_oom_prevention",
+    size = "medium",
+    srcs = ["source/ray-core/doc_code/ray_oom_prevention.py"],
+    main = "source/ray-core/doc_code/ray_oom_prevention.py",
+    tags = [
+        "exclusive",
+        "mem_pressure",
+        "team:core",
+    ],
+)
+
+py_test_run_all_subdirectory(
+    size = "medium",
+    include = ["source/ray-core/doc_code/*.py"],
+    exclude = [
+        "source/ray-core/doc_code/runtime_env_example.py",
+        "source/ray-core/doc_code/cross_language.py",
+        "source/ray-core/doc_code/ray_oom_prevention.py",
+    ],
+    extra_srcs = [],
+    tags = [
+        "exclusive",
+        "team:core",
+    ],
 )
 
 # --------------------------------------------------------------------
-# Test all doc/source/tune/examples notebooks.
+# Test all doc/source/serve/doc_code code included in rst/md files.
 # --------------------------------------------------------------------
 
-py_test_run_all_notebooks(
+py_test_run_all_subdirectory(
     size = "medium",
-    include = ["doc/source/tune/examples/*.ipynb"],
+    include = ["source/serve/doc_code/**/*.py"],
+    exclude = [
+        "source/serve/doc_code/aws_neuron_core_inference_serve.py",
+        "source/serve/doc_code/aws_neuron_core_inference_serve_stable_diffusion.py",
+        "source/serve/doc_code/intel_gaudi_inference_serve.py",
+        "source/serve/doc_code/intel_gaudi_inference_serve_deepspeed.py",
+        "source/serve/doc_code/intel_gaudi_inference_client.py",
+        "source/serve/doc_code/distilbert.py",
+        "source/serve/doc_code/stable_diffusion.py",
+        "source/serve/doc_code/vllm_openai_example.py",
+        "source/serve/doc_code/object_detection.py",
+        "source/serve/doc_code/http_guide/streaming_example.py",
+        "source/serve/doc_code/http_guide/websockets_example.py",
+        "source/serve/doc_code/vllm_example.py",
+    ],
+    extra_srcs = [],
+    tags = [
+        "exclusive",
+        "team:serve",
+    ],
+)
+
+py_test_run_all_subdirectory(
+    size = "medium",
+    include = [
+        "source/serve/doc_code/http_guide/streaming_example.py",
+        "source/serve/doc_code/http_guide/websockets_example.py",
+    ],
+    env = {"RAY_SERVE_ENABLE_EXPERIMENTAL_STREAMING": "1"},
     exclude = [],
-    data = ["//doc/source/tune/examples:tune_examples"],
-    tags = ["exclusive", "team:ml"],
+    extra_srcs = [],
+    tags = [
+        "exclusive",
+        "team:serve",
+    ],
+)
+
+py_test_run_all_subdirectory(
+    size = "medium",
+    include = [
+        "source/serve/doc_code/distilbert.py",
+        # TODO: Re-enable after fixing diffusers dependency in runtime_env
+        # "source/serve/doc_code/stable_diffusion.py",
+        "source/serve/doc_code/object_detection.py",
+    ],
+    env = {"RAY_SERVE_PROXY_READY_CHECK_TIMEOUT_S": "60"},
+    exclude = [
+        "source/serve/doc_code/aws_neuron_core_inference_serve.py",
+        "source/serve/doc_code/aws_neuron_core_inference_serve_stable_diffusion.py",
+        "source/serve/doc_code/intel_gaudi_inference_serve.py",
+        "source/serve/doc_code/intel_gaudi_inference_serve_deepspeed.py",
+        "source/serve/doc_code/intel_gaudi_inference_client.py",
+    ],
+    extra_srcs = [],
+    tags = [
+        "exclusive",
+        "gpu",
+        "team:serve",
+    ],
 )
 
 # --------------------------------------------------------------------
@@ -155,5 +244,234 @@ py_test_run_all_subdirectory(
     include = ["source/tune/doc_code/*.py"],
     exclude = [],
     extra_srcs = [],
-    tags = ["exclusive", "team:ml"],
+    tags = [
+        "exclusive",
+        "team:ml",
+    ],
+)
+
+# --------------------------------------------------------------------
+# Test all doc/source/rllib/doc_code code included in rst/md files.
+# --------------------------------------------------------------------
+
+py_test_run_all_subdirectory(
+    size = "medium",
+    include = ["source/rllib/doc_code/*.py"],
+    exclude = [],
+    extra_srcs = [],
+    tags = [
+        "exclusive",
+        "team:rllib",
+    ],
+)
+
+# --------------------------------------------------------------------
+# Test all doc/source/train/doc_code code included in rst/md files.
+# --------------------------------------------------------------------
+
+py_test_run_all_subdirectory(
+    size = "large",
+    include = ["source/train/doc_code/*.py"],
+    exclude = [
+        "source/train/doc_code/hvd_trainer.py",  # CI do not have Horovod
+    ],
+    extra_srcs = [],
+    tags = [
+        "exclusive",
+        "team:ml",
+    ],
+)
+
+# --------------------------------------------------------------------
+# Test all doc/source/data/doc_code code included in rst/md files.
+# --------------------------------------------------------------------
+
+py_test_run_all_subdirectory(
+    size = "large",
+    include = ["source/data/doc_code/*.py"],
+    exclude = [],
+    extra_srcs = [],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+)
+
+# --------------------------------------------------------------------
+# Test all doc/source/ray-more-libs/doc_code code included in rst/md files.
+# --------------------------------------------------------------------
+
+py_test_run_all_subdirectory(
+    size = "large",
+    include = ["source/ray-more-libs/doc_code/*.py"],
+    exclude = [],
+    extra_srcs = [],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+)
+
+# --------------
+# Run GPU tests
+# --------------
+
+py_test(
+    name = "pytorch_resnet_finetune",
+    size = "large",
+    srcs = ["test_myst_doc.py"],
+    args = [
+        "--path",
+        "doc/source/train/examples/pytorch/pytorch_resnet_finetune.ipynb",
+    ],
+    data = ["//doc/source/train/examples/pytorch:train_pytorch_examples"],
+    main = "test_myst_doc.py",
+    tags = [
+        "exclusive",
+        "gpu",
+        "ray_air",
+        "team:ml",
+    ],
+)
+
+# --------------------------------------------------------------------
+# Test all doc/external code
+# --------------------------------------------------------------------
+
+py_test_run_all_subdirectory(
+    size = "enormous",
+    include = ["external/*.py"],
+    exclude = ["external/test_hashes.py"],
+    extra_srcs = [],
+    tags = [
+        "exclusive",
+        "external",
+        "team:ml",
+    ],
+)
+
+py_test(
+    name = "test_external_hashes",
+    srcs = ["external/test_hashes.py"],
+    data = glob(
+        ["external/*.py"],
+        exclude = ["external/test_hashes.py"],
+    ),
+    exec_compatible_with = ["//:hermetic_python"],
+    main = "external/test_hashes.py",
+    tags = ["team:ml"],
+    deps = [
+        ci_require("pytest"),
+        ci_require("bazel-runfiles"),
+    ],
+)
+
+# --------------------------------------------------------------------
+# Tests code snippets in user guides.
+# --------------------------------------------------------------------
+
+doctest(
+    size = "large",
+    files = glob(
+        include = [
+            "source/**/*.rst",
+            "source/**/*.md",
+        ],
+        exclude = [
+            "source/ray-contribute/getting-involved.rst",
+            "source/ray-contribute/testing-tips.rst",
+            "source/ray-core/handling-dependencies.rst",
+            "source/ray-core/tasks/nested-tasks.rst",
+            "source/ray-observability/user-guides/ray-tracing.rst",
+            "source/ray-observability/user-guides/cli-sdk.rst",
+            "source/serve/advanced-guides/inplace-updates.md",
+            "source/serve/deploy-many-models/multi-app.md",
+            "source/serve/production-guide/deploy-vm.md",
+            "source/serve/production-guide/fault-tolerance.md",
+            "source/data/batch_inference.rst",
+            "source/data/transforming-data.rst",
+            "source/train/**/*.rst",
+            "source/train/**/*.md",
+            "source/workflows/**/*.rst",
+            "source/workflows/**/*.md",
+            "source/rllib/**/*.rst",
+            "source/rllib/**/*.md",
+            "source/templates/04_finetuning_llms_with_deepspeed/README.md",
+        ],
+    ),
+    tags = ["team:none"],
+)
+
+doctest(
+    name = "doctest[train]",
+    files = glob(
+        include = [
+            "source/train/**/*.rst",
+            "source/train/**/*.md",
+        ],
+        exclude = [
+            # GPU
+            "source/train/user-guides/data-loading-preprocessing.rst",
+            "source/train/user-guides/using-gpus.rst",
+            "source/train/horovod.rst",  # CI do not have Horovod
+        ]
+    ),
+    tags = ["team:ml"],
+)
+
+doctest(
+    name = "doctest[train]",
+    files = [
+        "source/train/user-guides/data-loading-preprocessing.rst",
+        "source/train/user-guides/using-gpus.rst",
+    ],
+    gpu = True,
+    tags = ["team:ml"],
+)
+
+doctest(
+    name = "doctest[workflow]",
+    files = glob(
+        include = [
+            "source/workflows/**/*.rst",
+            "source/workflows/**/*.md",
+        ],
+    ),
+    tags = ["team:core"],
+)
+
+doctest(
+    name = "doctest[rllib]",
+    size = "large",
+    files = glob(
+        include = [
+            "source/rllib/**/*.rst",
+            "source/rllib/**/*.md",
+        ],
+        exclude = [
+            "source/rllib/getting-started.rst",
+        ]
+    ),
+    data = ["//rllib:cartpole-v1_large"],
+    tags = ["team:rllib"],
+)
+
+doctest(
+    name = "doctest[rllib2]",
+    size = "large",
+    files = glob(
+        include = [
+            "source/rllib/getting-started.rst",
+        ],
+    ),
+    tags = ["team:rllib"],
+)
+
+doctest(
+    files = [
+        "source/data/batch_inference.rst",
+        "source/data/transforming-data.rst",
+    ],
+    gpu = True,
+    tags = ["team:data"],
 )

@@ -1,4 +1,5 @@
 from collections import defaultdict
+from ray.util.client.server.server_pickler import loads_from_client
 import ray
 import logging
 import grpc
@@ -16,7 +17,6 @@ from ray.util.client.common import (
     _propagate_error_in_context,
     OrderedResponseCache,
 )
-from ray.util.client import CURRENT_PROTOCOL_VERSION
 from ray.util.debug import log_once
 from ray._private.client_mode_hook import disable_client_hook
 
@@ -32,7 +32,7 @@ def _get_reconnecting_from_context(context: Any) -> bool:
     """
     Get `reconnecting` from gRPC metadata, or False if missing.
     """
-    metadata = {k: v for k, v in context.invocation_metadata()}
+    metadata = dict(context.invocation_metadata())
     val = metadata.get("reconnecting")
     if val is None or val not in ("True", "False"):
         logger.error(
@@ -55,12 +55,16 @@ def _should_cache(req: ray_client_pb2.DataRequest) -> bool:
              wrapped up the data connection by this point.
         - puts: We should only cache when we receive the final chunk, since
              any earlier chunks won't generate a response
+        - tasks: We should only cache when we receive the final chunk,
+             since any earlier chunks won't generate a response
     """
     req_type = req.WhichOneof("type")
     if req_type == "get" and req.get.asynchronous:
         return False
     if req_type == "put":
         return req.put.chunk_id == req.put.total_chunks - 1
+    if req_type == "task":
+        return req.task.chunk_id == req.task.total_chunks - 1
     return req_type not in ("acknowledge", "connection_cleanup")
 
 
@@ -86,7 +90,7 @@ def fill_queue(
 
 class ChunkCollector:
     """
-    Helper class for collecting chunks from PutObject calls
+    Helper class for collecting chunks from PutObject or ClientTask messages
     """
 
     def __init__(self):
@@ -94,14 +98,17 @@ class ChunkCollector:
         self.last_seen_chunk_id = -1
         self.data = bytearray()
 
-    def add_chunk(self, req: ray_client_pb2.DataRequest):
+    def add_chunk(
+        self,
+        req: ray_client_pb2.DataRequest,
+        chunk: Union[ray_client_pb2.PutRequest, ray_client_pb2.ClientTask],
+    ):
         if self.curr_req_id is not None and self.curr_req_id != req.req_id:
             raise RuntimeError(
                 "Expected to receive a chunk from request with id "
                 f"{self.curr_req_id}, but found {req.req_id} instead."
             )
         self.curr_req_id = req.req_id
-        chunk = req.put
         next_chunk = self.last_seen_chunk_id + 1
         if chunk.chunk_id < next_chunk:
             # Repeated chunk, ignore
@@ -139,13 +146,16 @@ class DataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
         self.stopped = Event()
         # Helper for collecting chunks from PutObject calls. Assumes that
         # that put requests from different objects aren't interleaved.
-        self.chunk_collector = ChunkCollector()
+        self.put_request_chunk_collector = ChunkCollector()
+        # Helper for collecting chunks from ClientTask calls. Assumes that
+        # schedule requests from different remote calls aren't interleaved.
+        self.client_task_chunk_collector = ChunkCollector()
 
     def Datapath(self, request_iterator, context):
         start_time = time.time()
         # set to True if client shuts down gracefully
         cleanup_requested = False
-        metadata = {k: v for k, v in context.invocation_metadata()}
+        metadata = dict(context.invocation_metadata())
         client_id = metadata.get("client_id")
         if client_id is None:
             logger.error("Client connecting with no client_id")
@@ -213,13 +223,16 @@ class DataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
                         get_resp = self.basic_service._get_object(req.get, client_id)
                     resp = ray_client_pb2.DataResponse(get=get_resp)
                 elif req_type == "put":
-                    if not self.chunk_collector.add_chunk(req):
+                    if not self.put_request_chunk_collector.add_chunk(req, req.put):
                         # Put request still in progress
                         continue
                     put_resp = self.basic_service._put_object(
-                        self.chunk_collector.data, req.put.client_ref_id, client_id
+                        self.put_request_chunk_collector.data,
+                        req.put.client_ref_id,
+                        client_id,
+                        req.put.owner_id,
                     )
-                    self.chunk_collector.reset()
+                    self.put_request_chunk_collector.reset()
                     resp = ray_client_pb2.DataResponse(put=put_resp)
                 elif req_type == "release":
                     released = []
@@ -249,8 +262,20 @@ class DataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
                     continue
                 elif req_type == "task":
                     with self.clients_lock:
-                        resp_ticket = self.basic_service.Schedule(req.task, context)
+                        task = req.task
+                        if not self.client_task_chunk_collector.add_chunk(req, task):
+                            # Not all serialized arguments have arrived
+                            continue
+                        arglist, kwargs = loads_from_client(
+                            self.client_task_chunk_collector.data, self.basic_service
+                        )
+                        self.client_task_chunk_collector.reset()
+                        resp_ticket = self.basic_service.Schedule(
+                            req.task, arglist, kwargs, context
+                        )
                         resp = ray_client_pb2.DataResponse(task_ticket=resp_ticket)
+                        del arglist
+                        del kwargs
                 elif req_type == "terminate":
                     with self.clients_lock:
                         response = self.basic_service.Terminate(req.terminate, context)
@@ -388,5 +413,4 @@ class DataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
             ),
             ray_version=ray.__version__,
             ray_commit=ray.__commit__,
-            protocol_version=CURRENT_PROTOCOL_VERSION,
         )

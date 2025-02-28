@@ -7,7 +7,7 @@ class TestSoftImports(unittest.TestCase):
 
     def testSoftImports(self):
         import ray.tune.schedulers  # noqa: F401
-        from ray.tune.suggest import SEARCH_ALG_IMPORT
+        from ray.tune.search import SEARCH_ALG_IMPORT
 
         for name, import_func in SEARCH_ALG_IMPORT.items():
             print(f"testing searcher {name}")
@@ -15,7 +15,7 @@ class TestSoftImports(unittest.TestCase):
 
             # ensure that the dependencies aren't actually installed
             if searcher and name not in ("variant_generator", "random"):
-                with self.assertRaises(AssertionError):
+                with self.assertRaises((AssertionError, ImportError)):
                     searcher()
 
 

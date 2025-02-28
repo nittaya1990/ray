@@ -8,6 +8,7 @@ import time
 import pytest
 
 import ray
+from ray._private.client_mode_hook import client_mode_should_convert
 from ray._private.test_utils import (
     SignalActor,
     kill_actor_and_wait_for_failure,
@@ -129,7 +130,7 @@ async def test_asyncio_get(ray_start_regular_shared, event_loop):
 
     @ray.remote
     def task_throws():
-        1 / 0
+        _ = 1 / 0
 
     with pytest.raises(ray.exceptions.RayTaskError):
         await task_throws.remote().as_future()
@@ -147,7 +148,7 @@ async def test_asyncio_get(ray_start_regular_shared, event_loop):
             return "a" * (str_len)
 
         def throw_error(self):
-            1 / 0
+            _ = 1 / 0
 
     actor = Actor.remote()
 
@@ -218,13 +219,14 @@ async def test_asyncio_exit_actor(ray_start_regular_shared):
             ray.actor.exit_actor()
 
         async def ping(self):
-            return "pong"
+            return os.getpid()
 
         async def loop_forever(self):
             while True:
                 await asyncio.sleep(5)
 
     a = Actor.options(max_task_retries=0).remote()
+    pid = ray.get(a.ping.remote())
     a.loop_forever.remote()
     # Make sure exit_actor exits immediately, not once all tasks completed.
     with pytest.raises(ray.exceptions.RayError):
@@ -239,23 +241,32 @@ async def test_asyncio_exit_actor(ray_start_regular_shared):
     @ray.remote
     def check_actor_gone_now():
         def cond():
-            return ray.state.actors()[a._ray_actor_id.hex()]["State"] != 2
+            return ray._private.state.actors()[a._ray_actor_id.hex()]["State"] != 2
 
         wait_for_condition(cond)
 
     ray.get(check_actor_gone_now.remote())
 
+    # Make sure there is no process leak
+    wait_for_pid_to_exit(pid)
 
-def test_asyncio_exit_actor_no_process_leak(ray_start_regular_shared):
-    @ray.remote
+
+def test_asyncio_exit_actor_with_concurrency_group(ray_start_regular_shared):
+    @ray.remote(concurrency_groups={"async": 2})
     class Actor:
-        def getpid(self):
+        async def getpid(self):
             return os.getpid()
 
         async def exit(self):
             ray.actor.exit_actor()
 
+        @ray.method(concurrency_group="async")
+        async def loop_forever(self):
+            while True:
+                await asyncio.sleep(5)
+
     a = Actor.remote()
+    a.loop_forever.remote()
     pid = ray.get(a.getpid.remote())
     with pytest.raises(ray.exceptions.RayActorError):
         ray.get(a.exit.remote())
@@ -282,6 +293,38 @@ def test_async_callback(ray_start_regular_shared):
     wait_for_condition(lambda: "completed-2" in global_set)
 
 
+@pytest.mark.parametrize("raise_in_callback", [False, True])
+@pytest.mark.skipif(
+    client_mode_should_convert(), reason="Different ref counting in Ray client."
+)
+def test_on_completed_callback_refcount(ray_start_regular_shared, raise_in_callback):
+    """Check that the _on_completed callback is ref counted properly."""
+    signal = SignalActor.remote()
+
+    def callback(result):
+        if raise_in_callback:
+            raise Exception("ruh-roh")
+
+    @ray.remote
+    def wait():
+        ray.get(signal.wait.remote())
+
+    ref = wait.remote()
+
+    initial_refcount = sys.getrefcount(callback)
+    ref._on_completed(callback)
+
+    # Python ref count should be incremented to avoid the callback being GC'd while the
+    # C++ core worker holds a ref to it.
+    assert sys.getrefcount(callback) > initial_refcount
+
+    # Trigger the task to finish so the callback should execute.
+    ray.get(signal.send.remote())
+
+    # Now the refcount should drop back down to the initial count.
+    wait_for_condition(lambda: sys.getrefcount(callback) == initial_refcount)
+
+
 def test_async_function_errored(ray_start_regular_shared):
     with pytest.raises(ValueError):
 
@@ -303,7 +346,7 @@ async def test_async_obj_unhandled_errors(ray_start_regular_shared):
         num_exceptions += 1
 
     # Test we report unhandled exceptions.
-    ray.worker._unhandled_error_handler = interceptor
+    ray._private.worker._unhandled_error_handler = interceptor
     x1 = f.remote()
     # NOTE: Unhandled exception is from waiting for the value of x1's ObjectID
     # in x1's destructor, and receiving an exception from f() instead.
@@ -338,7 +381,57 @@ def test_asyncio_actor_with_large_concurrency(ray_start_regular_shared):
     assert sync_id == async_id
 
 
+def test_asyncio_actor_shutdown_when_non_async_method_mixed(ray_start_regular_shared):
+    # It is a regression test.
+    # https://github.com/ray-project/ray/issues/32376
+    # Make sure the core worker doesn't crash when
+    # exit_actor is used when async & regular actor tasks
+    # are executed.
+    @ray.remote
+    class A:
+        async def f(self):
+            await asyncio.sleep(1)
+            ray.actor.exit_actor()
+
+        def ping(self):
+            pass
+
+    a = A.remote()
+    a.f.remote()
+
+    with pytest.raises(
+        ray.exceptions.RayActorError,
+        match=("exit_actor"),
+    ):
+        ray.get([a.ping.remote() for _ in range(10000)])
+
+
+def test_asyncio_actor_argument_collision(ray_start_regular_shared):
+    """Regression test for https://github.com/ray-project/ray/issues/41272."""
+
+    @ray.remote
+    class A:
+        async def hi_async(self, task_id: str, specified_cgname: str):
+            return f"Hi from async: {task_id}! cgname: {specified_cgname}."
+
+        def hi_sync(self, task_id: str, *, specified_cgname: str):
+            return f"Hi from sync: {task_id}! cgname: {specified_cgname}."
+
+    a = A.remote()
+    assert (
+        ray.get(a.hi_async.remote(task_id="TEST", specified_cgname="test2"))
+        == "Hi from async: TEST! cgname: test2."
+    )
+    assert (
+        ray.get(a.hi_sync.remote(task_id="TEST", specified_cgname="test2"))
+        == "Hi from sync: TEST! cgname: test2."
+    )
+
+
 if __name__ == "__main__":
     import pytest
 
-    sys.exit(pytest.main(["-v", __file__]))
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))

@@ -18,12 +18,12 @@
 
 #include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/asio/periodical_runner.h"
-#include "ray/gcs/redis_context.h"
 
 namespace ray {
-
 namespace gcs {
-class RedisGcsClient;
+
+// Forward declaration.
+class RedisClient;
 
 /// GcsRedisFailureDetector is responsible for monitoring redis and binding GCS server and
 /// redis life cycle together. GCS client subscribes to redis messages and it cannot sense
@@ -39,23 +39,26 @@ class GcsRedisFailureDetector {
   /// \param redis_context The redis context is used to ping redis.
   /// \param callback Callback that will be called when redis is detected as not alive.
   explicit GcsRedisFailureDetector(instrumented_io_context &io_service,
-                                   std::shared_ptr<RedisContext> redis_context,
+                                   std::shared_ptr<RedisClient> redis_client,
                                    std::function<void()> callback);
 
   /// Start detecting redis.
   void Start();
+
+  /// Stop detecting redis.
+  void Stop();
 
  protected:
   /// Check that if redis is inactive.
   void DetectRedis();
 
  private:
-  /// A redis context is used to ping redis.
-  /// TODO(ffbin): We will use redis client later.
-  std::shared_ptr<RedisContext> redis_context_;
+  instrumented_io_context &io_service_;
+
+  std::shared_ptr<RedisClient> redis_client_;
 
   /// The runner to run function periodically.
-  PeriodicalRunner periodical_runner_;
+  std::shared_ptr<PeriodicalRunner> periodical_runner_;
 
   /// A function is called when redis is detected to be unavailable.
   std::function<void()> callback_;

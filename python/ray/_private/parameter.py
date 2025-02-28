@@ -1,9 +1,13 @@
 import logging
 import os
+from typing import Dict, List, Optional
 
-import numpy as np
+import ray._private.ray_constants as ray_constants
+from ray._private.utils import (
+    validate_node_labels,
+    check_ray_client_dependencies_installed,
+)
 
-import ray.ray_constants as ray_constants
 
 logger = logging.getLogger(__name__)
 
@@ -12,21 +16,22 @@ class RayParams:
     """A class used to store the parameters used by Ray.
 
     Attributes:
-        redis_address (str): The address of the Redis server to connect to. If
+        redis_address: The address of the Redis server to connect to. If
             this address is not provided, then this command will start Redis, a
             raylet, a plasma store, a plasma manager, and some workers.
             It will also kill these processes when Python exits.
-        redis_port (int): The port that the primary Redis shard should listen
+        redis_port: The port that the primary Redis shard should listen
             to. If None, then it will fall back to
-            ray.ray_constants.DEFAULT_PORT, or a random port if the default is
+            ray._private.ray_constants.DEFAULT_PORT, or a random port if the default is
             not available.
         redis_shard_ports: A list of the ports to use for the non-primary Redis
             shards. If None, then it will fall back to the ports right after
             redis_port, or random ports if those are not available.
-        num_cpus (int): Number of CPUs to configure the raylet with.
-        num_gpus (int): Number of GPUs to configure the raylet with.
+        num_cpus: Number of CPUs to configure the raylet with.
+        num_gpus: Number of GPUs to configure the raylet with.
         resources: A dictionary mapping the name of a resource to the quantity
             of that resource available.
+        labels: The key-value labels of the node.
         memory: Total available memory for workers requesting memory.
         object_store_memory: The amount of memory (in bytes) to start the
             object store with.
@@ -37,26 +42,26 @@ class RayParams:
         object_manager_port int: The port to use for the object manager.
         node_manager_port: The port to use for the node manager.
         gcs_server_port: The port to use for the GCS server.
-        node_ip_address (str): The IP address of the node that we are on.
-        raylet_ip_address (str): The IP address of the raylet that this node
+        node_ip_address: The IP address of the node that we are on.
+        raylet_ip_address: The IP address of the raylet that this node
             connects to.
-        min_worker_port (int): The lowest port number that workers will bind
+        min_worker_port: The lowest port number that workers will bind
             on. If not set or set to 0, random ports will be chosen.
-        max_worker_port (int): The highest port number that workers will bind
+        max_worker_port: The highest port number that workers will bind
             on. If set, min_worker_port must also be set.
-        worker_port_list (str): An explicit list of ports to be used for
+        worker_port_list: An explicit list of ports to be used for
             workers (comma-separated). Overrides min_worker_port and
             max_worker_port.
-        ray_client_server_port (int): The port number the ray client server
+        ray_client_server_port: The port number the ray client server
             will bind on. If not set, the ray client server will not
             be started.
-        object_ref_seed (int): Used to seed the deterministic generation of
+        object_ref_seed: Used to seed the deterministic generation of
             object refs. The same value can be used across multiple runs of the
             same job in order to generate the object refs in a consistent
             manner. However, the same ID should not be used for different jobs.
-        redirect_output (bool): True if stdout and stderr for non-worker
+        redirect_output: True if stdout and stderr for non-worker
             processes should be redirected to files and false otherwise.
-        external_addresses (str): The address of external Redis server to
+        external_addresses: The address of external Redis server to
             connect to, in format of "ip1:port1,ip2:port2,...".  If this
             address is provided, then ray won't start Redis instances in the
             head node but use external Redis server(s) instead.
@@ -64,13 +69,15 @@ class RayParams:
             the primary Redis shard.
         redis_max_clients: If provided, attempt to configure Redis with this
             maxclients number.
-        redis_password (str): Prevents external clients without the password
+        redis_username: Prevents external clients without the username
+            from connecting to Redis if provided.
+        redis_password: Prevents external clients without the password
             from connecting to Redis if provided.
         plasma_directory: A directory where the Plasma memory mapped files will
             be created.
-        worker_path (str): The path of the source code that will be run by the
+        worker_path: The path of the source code that will be run by the
             worker.
-        setup_worker_path (str): The path of the Python file that will set up
+        setup_worker_path: The path of the Python file that will set up
             the environment for the worker process.
         huge_pages: Boolean flag indicating whether to start the Object
             Store with hugetlbfs support. Requires plasma_directory.
@@ -86,92 +93,113 @@ class RayParams:
             Defaults to 8265.
         dashboard_agent_listen_port: The port for dashboard agents to listen on
             for HTTP requests.
-        logging_level: Logging level, default will be logging.INFO.
-        logging_format: Logging format, default contains a timestamp,
-            filename, line number, and message. See ray_constants.py.
-        plasma_store_socket_name (str): If provided, it will specify the socket
+            Defaults to 52365.
+        dashboard_grpc_port: The port for the dashboard head process to listen
+            for gRPC on.
+            Defaults to random available port.
+        runtime_env_agent_port: The port at which the runtime env agent
+            listens to for HTTP.
+            Defaults to random available port.
+        plasma_store_socket_name: If provided, it specifies the socket
             name used by the plasma store.
-        raylet_socket_name (str): If provided, it will specify the socket path
+        raylet_socket_name: If provided, it specifies the socket path
             used by the raylet process.
-        temp_dir (str): If provided, it will specify the root temporary
-            directory for the Ray process.
-        runtime_env_dir_name (str): If provided, specifies the directory that
+        temp_dir: If provided, it will specify the root temporary
+            directory for the Ray process. Must be an absolute path.
+        storage: Specify a URI for persistent cluster-wide storage. This storage path
+            must be accessible by all nodes of the cluster, otherwise an error will be
+            raised.
+        runtime_env_dir_name: If provided, specifies the directory that
             will be created in the session dir to hold runtime_env files.
-        include_log_monitor (bool): If True, then start a log monitor to
+        include_log_monitor: If True, then start a log monitor to
             monitor the log files for all processes on this node and push their
             contents to Redis.
         autoscaling_config: path to autoscaling config file.
-        metrics_agent_port(int): The port to bind metrics agent.
-        metrics_export_port(int): The port at which metrics are exposed
+        metrics_agent_port: The port to bind metrics agent.
+        metrics_export_port: The port at which metrics are exposed
             through a Prometheus endpoint.
-        no_monitor(bool): If True, the ray autoscaler monitor for this cluster
+        no_monitor: If True, the ray autoscaler monitor for this cluster
             will not be started.
-        _system_config (dict): Configuration for overriding RayConfig
+        _system_config: Configuration for overriding RayConfig
             defaults. Used to set system configuration and for experimental Ray
             core feature flags.
-        enable_object_reconstruction (bool): Enable plasma reconstruction on
+        enable_object_reconstruction: Enable plasma reconstruction on
             failure.
-        start_initial_python_workers_for_first_job (bool): If true, start
-            initial Python workers for the first job on the node.
-        ray_debugger_external (bool): If true, make the Ray debugger for a
+        ray_debugger_external: If true, make the Ray debugger for a
             worker available externally to the node it is running on. This will
             bind on 0.0.0.0 instead of localhost.
-        env_vars (dict): Override environment variables for the raylet.
+        env_vars: Override environment variables for the raylet.
+        session_name: The name of the session of the ray cluster.
+        webui: The url of the UI.
+        cluster_id: The cluster ID in hex string.
+        enable_physical_mode: Whether physical mode is enabled, which applies
+            constraint to tasks' resource consumption. As of now, only memory resource
+            is supported.
     """
 
     def __init__(
         self,
-        redis_address=None,
-        gcs_address=None,
-        num_cpus=None,
-        num_gpus=None,
-        resources=None,
-        memory=None,
-        object_store_memory=None,
-        redis_max_memory=None,
-        redis_port=None,
-        redis_shard_ports=None,
-        object_manager_port=None,
-        node_manager_port=0,
-        gcs_server_port=None,
-        node_ip_address=None,
-        raylet_ip_address=None,
-        min_worker_port=None,
-        max_worker_port=None,
-        worker_port_list=None,
-        ray_client_server_port=None,
-        object_ref_seed=None,
+        redis_address: Optional[str] = None,
+        gcs_address: Optional[str] = None,
+        num_cpus: Optional[int] = None,
+        num_gpus: Optional[int] = None,
+        resources: Optional[Dict[str, float]] = None,
+        labels: Optional[Dict[str, str]] = None,
+        memory: Optional[float] = None,
+        object_store_memory: Optional[float] = None,
+        redis_max_memory: Optional[float] = None,
+        redis_port: Optional[int] = None,
+        redis_shard_ports: Optional[List[int]] = None,
+        object_manager_port: Optional[int] = None,
+        node_manager_port: int = 0,
+        gcs_server_port: Optional[int] = None,
+        node_ip_address: Optional[str] = None,
+        node_name: Optional[str] = None,
+        raylet_ip_address: Optional[str] = None,
+        min_worker_port: Optional[int] = None,
+        max_worker_port: Optional[int] = None,
+        worker_port_list: Optional[List[int]] = None,
+        ray_client_server_port: Optional[int] = None,
+        object_ref_seed: Optional[int] = None,
         driver_mode=None,
-        redirect_output=None,
-        external_addresses=None,
-        num_redis_shards=None,
-        redis_max_clients=None,
-        redis_password=ray_constants.REDIS_DEFAULT_PASSWORD,
-        plasma_directory=None,
-        worker_path=None,
-        setup_worker_path=None,
-        huge_pages=False,
-        include_dashboard=None,
-        dashboard_host=ray_constants.DEFAULT_DASHBOARD_IP,
-        dashboard_port=ray_constants.DEFAULT_DASHBOARD_PORT,
-        dashboard_agent_listen_port=0,
-        logging_level=logging.INFO,
-        logging_format=ray_constants.LOGGER_FORMAT,
-        plasma_store_socket_name=None,
-        raylet_socket_name=None,
-        temp_dir=None,
-        runtime_env_dir_name=None,
-        include_log_monitor=None,
-        autoscaling_config=None,
-        start_initial_python_workers_for_first_job=False,
-        ray_debugger_external=False,
-        _system_config=None,
-        enable_object_reconstruction=False,
-        metrics_agent_port=None,
-        metrics_export_port=None,
+        redirect_output: Optional[bool] = None,
+        external_addresses: Optional[List[str]] = None,
+        num_redis_shards: Optional[int] = None,
+        redis_max_clients: Optional[int] = None,
+        redis_username: Optional[str] = ray_constants.REDIS_DEFAULT_USERNAME,
+        redis_password: Optional[str] = ray_constants.REDIS_DEFAULT_PASSWORD,
+        plasma_directory: Optional[str] = None,
+        worker_path: Optional[str] = None,
+        setup_worker_path: Optional[str] = None,
+        huge_pages: Optional[bool] = False,
+        include_dashboard: Optional[bool] = None,
+        dashboard_host: Optional[str] = ray_constants.DEFAULT_DASHBOARD_IP,
+        dashboard_port: Optional[bool] = ray_constants.DEFAULT_DASHBOARD_PORT,
+        dashboard_agent_listen_port: Optional[
+            int
+        ] = ray_constants.DEFAULT_DASHBOARD_AGENT_LISTEN_PORT,
+        runtime_env_agent_port: Optional[int] = None,
+        dashboard_grpc_port: Optional[int] = None,
+        plasma_store_socket_name: Optional[str] = None,
+        raylet_socket_name: Optional[str] = None,
+        temp_dir: Optional[str] = None,
+        storage: Optional[str] = None,
+        runtime_env_dir_name: Optional[str] = None,
+        include_log_monitor: Optional[str] = None,
+        autoscaling_config: Optional[str] = None,
+        ray_debugger_external: bool = False,
+        _system_config: Optional[Dict[str, str]] = None,
+        enable_object_reconstruction: Optional[bool] = False,
+        metrics_agent_port: Optional[int] = None,
+        metrics_export_port: Optional[int] = None,
         tracing_startup_hook=None,
-        no_monitor=False,
-        env_vars=None,
+        no_monitor: Optional[bool] = False,
+        env_vars: Optional[Dict[str, str]] = None,
+        session_name: Optional[str] = None,
+        webui: Optional[str] = None,
+        cluster_id: Optional[str] = None,
+        node_id: Optional[str] = None,
+        enable_physical_mode: bool = False,
     ):
         self.redis_address = redis_address
         self.gcs_address = gcs_address
@@ -187,6 +215,7 @@ class RayParams:
         self.node_manager_port = node_manager_port
         self.gcs_server_port = gcs_server_port
         self.node_ip_address = node_ip_address
+        self.node_name = node_name
         self.raylet_ip_address = raylet_ip_address
         self.min_worker_port = min_worker_port
         self.max_worker_port = max_worker_port
@@ -197,6 +226,7 @@ class RayParams:
         self.external_addresses = external_addresses
         self.num_redis_shards = num_redis_shards
         self.redis_max_clients = redis_max_clients
+        self.redis_username = redis_username
         self.redis_password = redis_password
         self.plasma_directory = plasma_directory
         self.worker_path = worker_path
@@ -206,9 +236,14 @@ class RayParams:
         self.dashboard_host = dashboard_host
         self.dashboard_port = dashboard_port
         self.dashboard_agent_listen_port = dashboard_agent_listen_port
+        self.dashboard_grpc_port = dashboard_grpc_port
+        self.runtime_env_agent_port = runtime_env_agent_port
         self.plasma_store_socket_name = plasma_store_socket_name
         self.raylet_socket_name = raylet_socket_name
         self.temp_dir = temp_dir
+        self.storage = storage or os.environ.get(
+            ray_constants.RAY_STORAGE_ENVIRONMENT_VARIABLE
+        )
         self.runtime_env_dir_name = (
             runtime_env_dir_name or ray_constants.DEFAULT_RUNTIME_ENV_DIR_NAME
         )
@@ -219,14 +254,17 @@ class RayParams:
         self.tracing_startup_hook = tracing_startup_hook
         self.no_monitor = no_monitor
         self.object_ref_seed = object_ref_seed
-        self.start_initial_python_workers_for_first_job = (
-            start_initial_python_workers_for_first_job
-        )
         self.ray_debugger_external = ray_debugger_external
         self.env_vars = env_vars
+        self.session_name = session_name
+        self.webui = webui
         self._system_config = _system_config or {}
         self._enable_object_reconstruction = enable_object_reconstruction
+        self.labels = labels
         self._check_usage()
+        self.cluster_id = cluster_id
+        self.node_id = node_id
+        self.enable_physical_mode = enable_physical_mode
 
         # Set the internal config options for object reconstruction.
         if enable_object_reconstruction:
@@ -262,7 +300,7 @@ class RayParams:
                     setattr(self, arg, kwargs[arg])
             else:
                 raise ValueError(
-                    "Invalid RayParams parameter in" " update_if_absent: %s" % arg
+                    f"Invalid RayParams parameter in update_if_absent: {arg}"
                 )
 
         self._check_usage()
@@ -291,6 +329,8 @@ class RayParams:
             "dashboard": wrap_port(self.dashboard_port),
             "dashboard_agent_grpc": wrap_port(self.metrics_agent_port),
             "dashboard_agent_http": wrap_port(self.dashboard_agent_listen_port),
+            "dashboard_grpc": wrap_port(self.dashboard_grpc_port),
+            "runtime_env_agent": wrap_port(self.runtime_env_agent_port),
             "metrics_export": wrap_port(self.metrics_export_port),
         }
         redis_shard_ports = self.redis_shard_ports
@@ -317,13 +357,10 @@ class RayParams:
                 if port in self.reserved_ports:
                     raise ValueError(
                         f"Ray component {comp} is trying to use "
-                        f"a port number {port} that is used by "
-                        "other components.\n"
-                        f"Port information: "
-                        f"{self._format_ports(pre_selected_ports)}\n"
-                        "If you allocate ports, "
-                        "please make sure the same port is not used by "
-                        "multiple components."
+                        f"a port number {port} that is used by other components.\n"
+                        f"Port information: {self._format_ports(pre_selected_ports)}\n"
+                        "If you allocate ports, please make sure the same port "
+                        "is not used by multiple components."
                     )
                 self.reserved_ports.add(port)
 
@@ -335,13 +372,13 @@ class RayParams:
                 except ValueError as e:
                     raise ValueError(
                         "worker_port_list must be a comma-separated "
-                        + "list of integers: {}".format(e)
+                        f"list of integers: {e}"
                     ) from None
 
                 if port < 1024 or port > 65535:
                     raise ValueError(
                         "Ports in worker_port_list must be "
-                        "between 1024 and 65535. Got: {}".format(port)
+                        f"between 1024 and 65535. Got: {port}"
                     )
 
         # Used primarily for testing.
@@ -355,13 +392,13 @@ class RayParams:
                 self.min_worker_port < 1024 or self.min_worker_port > 65535
             ):
                 raise ValueError(
-                    "min_worker_port must be 0 or an integer " "between 1024 and 65535."
+                    "min_worker_port must be 0 or an integer between 1024 and 65535."
                 )
 
         if self.max_worker_port is not None:
             if self.min_worker_port is None:
                 raise ValueError(
-                    "If max_worker_port is set, min_worker_port " "must also be set."
+                    "If max_worker_port is set, min_worker_port must also be set."
                 )
             elif self.max_worker_port != 0:
                 if self.max_worker_port < 1024 or self.max_worker_port > 65535:
@@ -371,10 +408,15 @@ class RayParams:
                     )
                 elif self.max_worker_port <= self.min_worker_port:
                     raise ValueError(
-                        "max_worker_port must be higher than " "min_worker_port."
+                        "max_worker_port must be higher than min_worker_port."
                     )
-
         if self.ray_client_server_port is not None:
+            if not check_ray_client_dependencies_installed():
+                raise ValueError(
+                    "Ray Client requires pip package `ray[client]`. "
+                    "If you installed the minimal Ray (e.g. `pip install ray`), "
+                    "please reinstall by executing `pip install ray[client]`."
+                )
             if (
                 self.ray_client_server_port < 1024
                 or self.ray_client_server_port > 65535
@@ -383,33 +425,45 @@ class RayParams:
                     "ray_client_server_port must be an integer "
                     "between 1024 and 65535."
                 )
+        if self.runtime_env_agent_port is not None:
+            if (
+                self.runtime_env_agent_port < 1024
+                or self.runtime_env_agent_port > 65535
+            ):
+                raise ValueError(
+                    "runtime_env_agent_port must be an integer "
+                    "between 1024 and 65535."
+                )
 
         if self.resources is not None:
-            assert "CPU" not in self.resources, (
-                "'CPU' should not be included in the resource dictionary. Use "
-                "num_cpus instead."
-            )
-            assert "GPU" not in self.resources, (
-                "'GPU' should not be included in the resource dictionary. Use "
-                "num_gpus instead."
+
+            def build_error(resource, alternative):
+                return (
+                    f"{self.resources} -> `{resource}` cannot be a "
+                    "custom resource because it is one of the default resources "
+                    f"({ray_constants.DEFAULT_RESOURCES}). "
+                    f"Use `{alternative}` instead. For example, use `ray start "
+                    f"--{alternative.replace('_', '-')}=1` instead of "
+                    f"`ray start --resources={{'{resource}': 1}}`"
+                )
+
+            assert "CPU" not in self.resources, build_error("CPU", "num_cpus")
+            assert "GPU" not in self.resources, build_error("GPU", "num_gpus")
+            assert "memory" not in self.resources, build_error("memory", "memory")
+            assert "object_store_memory" not in self.resources, build_error(
+                "object_store_memory", "object_store_memory"
             )
 
         if self.redirect_output is not None:
             raise DeprecationWarning("The redirect_output argument is deprecated.")
 
-        # Parse the numpy version.
-        numpy_version = np.__version__.split(".")
-        numpy_major, numpy_minor = int(numpy_version[0]), int(numpy_version[1])
-        if numpy_major <= 1 and numpy_minor < 16:
-            logger.warning(
-                "Using ray with numpy < 1.16.0 will result in slow "
-                "serialization. Upgrade numpy if using with ray."
-            )
+        if self.temp_dir is not None and not os.path.isabs(self.temp_dir):
+            raise ValueError("temp_dir must be absolute path or None.")
+
+        validate_node_labels(self.labels)
 
     def _format_ports(self, pre_selected_ports):
-        """Format the pre selected ports information to be more
-        human readable.
-        """
+        """Format the pre-selected ports information to be more human-readable."""
         ports = pre_selected_ports.copy()
 
         for comp, port_list in ports.items():
@@ -421,7 +475,6 @@ class RayParams:
             elif comp == "worker_ports":
                 min_port = port_list[0]
                 max_port = port_list[len(port_list) - 1]
-                port_range_str = None
                 if len(port_list) < 50:
                     port_range_str = str(port_list)
                 else:

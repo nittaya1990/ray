@@ -9,6 +9,7 @@ from ray_release.exception import (
 from ray_release.logger import logger
 from ray_release.cluster_manager.cluster_manager import ClusterManager
 from ray_release.util import format_link, anyscale_cluster_env_build_url
+from ray_release.retry import retry
 
 REPORT_S = 30.0
 
@@ -19,65 +20,68 @@ class MinimalClusterManager(ClusterManager):
     Builds app config and compute template but does not start or stop session.
     """
 
-    def create_cluster_env(self, _repeat: bool = True):
+    @retry(
+        init_delay_sec=10,
+        jitter_sec=5,
+        max_retry_count=2,
+        exceptions=(ClusterEnvCreateError,),
+    )
+    def create_cluster_env(self):
         assert self.cluster_env_id is None
 
-        if self.cluster_env:
-            assert self.cluster_env_name
+        assert self.cluster_env_name
 
-            logger.info(
-                f"Test uses a cluster env with name "
-                f"{self.cluster_env_name}. Looking up existing "
-                f"cluster envs with this name."
-            )
+        logger.info(
+            f"Test uses a cluster env with name "
+            f"{self.cluster_env_name}. Looking up existing "
+            f"cluster envs with this name."
+        )
 
-            paging_token = None
-            while not self.cluster_env_id:
-                result = self.sdk.search_cluster_environments(
-                    dict(
-                        project_id=self.project_id,
-                        name=dict(equals=self.cluster_env_name),
-                        paging=dict(count=50, token=paging_token),
-                    )
+        paging_token = None
+        while not self.cluster_env_id:
+            result = self.sdk.search_cluster_environments(
+                dict(
+                    name=dict(equals=self.cluster_env_name),
+                    paging=dict(count=50, paging_token=paging_token),
+                    project_id=None,
                 )
-                paging_token = result.metadata.next_paging_token
+            )
+            paging_token = result.metadata.next_paging_token
 
-                for res in result.results:
-                    if res.name == self.cluster_env_name:
-                        self.cluster_env_id = res.id
-                        logger.info(
-                            f"Cluster env already exists with ID "
-                            f"{self.cluster_env_id}"
-                        )
-                        break
-
-                if not paging_token or self.cluster_env_id:
+            for res in result.results:
+                if res.name == self.cluster_env_name:
+                    self.cluster_env_id = res.id
+                    logger.info(
+                        f"Cluster env already exists with ID " f"{self.cluster_env_id}"
+                    )
                     break
 
-            if not self.cluster_env_id:
-                logger.info("Cluster env not found. Creating new one.")
-                try:
-                    result = self.sdk.create_cluster_environment(
-                        dict(
-                            name=self.cluster_env_name,
-                            project_id=self.project_id,
-                            config_json=self.cluster_env,
-                        )
+            if not paging_token or self.cluster_env_id:
+                break
+
+        if not self.cluster_env_id:
+            logger.info("Cluster env not found. Creating new one.")
+            try:
+                result = self.sdk.create_byod_cluster_environment(
+                    dict(
+                        name=self.cluster_env_name,
+                        config_json=dict(
+                            docker_image=self.test.get_anyscale_byod_image(),
+                            ray_version="nightly",
+                            env_vars=self.test.get_byod_runtime_env(),
+                        ),
                     )
-                    self.cluster_env_id = result.result.id
-                except Exception as e:
-                    if _repeat:
-                        logger.warning(
-                            f"Got exception when trying to create cluster "
-                            f"env: {e}. Sleeping for 10 seconds and then "
-                            f"try again once..."
-                        )
-                        time.sleep(10)
-                        return self.create_cluster_env(_repeat=False)
+                )
+                self.cluster_env_id = result.result.id
+            except Exception as e:
+                logger.warning(
+                    f"Got exception when trying to create cluster "
+                    f"env: {e}. Sleeping for 10 seconds with jitter and then "
+                    f"try again..."
+                )
+                raise ClusterEnvCreateError("Could not create cluster env.") from e
 
-                    raise ClusterEnvCreateError("Could not create cluster env.") from e
-
-                logger.info(f"Cluster env created with ID {self.cluster_env_id}")
+            logger.info(f"Cluster env created with ID {self.cluster_env_id}")
 
     def build_cluster_env(self, timeout: float = 600.0):
         assert self.cluster_env_id
@@ -86,27 +90,42 @@ class MinimalClusterManager(ClusterManager):
         # Fetch build
         build_id = None
         last_status = None
+        error_message = None
+        config_json = None
         result = self.sdk.list_cluster_environment_builds(self.cluster_env_id)
-        for build in sorted(result.results, key=lambda b: b.created_at):
-            build_id = build.id
-            last_status = build.status
+        if not result or not result.results:
+            raise ClusterEnvBuildError(f"No build found for cluster env: {result}")
 
-            if build.status == "failed":
-                continue
+        build = sorted(result.results, key=lambda b: b.created_at)[-1]
+        build_id = build.id
+        last_status = build.status
+        error_message = build.error_message
+        config_json = build.config_json
 
-            if build.status == "succeeded":
-                logger.info(
-                    f"Link to cluster env build: "
-                    f"{format_link(anyscale_cluster_env_build_url(build_id))}"
-                )
-                self.cluster_env_build_id = build_id
-                return
+        if last_status == "succeeded":
+            logger.info(
+                f"Link to succeeded cluster env build: "
+                f"{format_link(anyscale_cluster_env_build_url(build_id))}"
+            )
+            self.cluster_env_build_id = build_id
+            return
 
         if last_status == "failed":
-            raise ClusterEnvBuildError("Cluster env build failed.")
+            logger.info(f"Previous cluster env build failed: {error_message}")
+            logger.info("Starting new cluster env build...")
 
-        if not build_id:
-            raise ClusterEnvBuildError("No build found for cluster env.")
+            # Retry build
+            result = self.sdk.create_cluster_environment_build(
+                dict(
+                    cluster_environment_id=self.cluster_env_id, config_json=config_json
+                )
+            )
+            build_id = result.result.id
+
+            logger.info(
+                f"Link to created cluster env build: "
+                f"{format_link(anyscale_cluster_env_build_url(build_id))}"
+            )
 
         # Build found but not failed/finished yet
         completed = False
@@ -133,7 +152,8 @@ class MinimalClusterManager(ClusterManager):
             if build.status == "failed":
                 raise ClusterEnvBuildError(
                     f"Cluster env build failed. Please see "
-                    f"{anyscale_cluster_env_build_url(build_id)} for details"
+                    f"{anyscale_cluster_env_build_url(build_id)} for details. "
+                    f"Error message: {build.error_message}"
                 )
 
             if build.status == "succeeded":
@@ -158,12 +178,6 @@ class MinimalClusterManager(ClusterManager):
 
         self.cluster_env_build_id = build_id
 
-    def fetch_build_info(self):
-        assert self.cluster_env_build_id
-
-        result = self.sdk.get_cluster_environment_build(self.cluster_env_build_id)
-        self.cluster_env = result.result.config_json
-
     def create_cluster_compute(self, _repeat: bool = True):
         assert self.cluster_compute_id is None
 
@@ -183,7 +197,7 @@ class MinimalClusterManager(ClusterManager):
                         project_id=self.project_id,
                         name=dict(equals=self.cluster_compute_name),
                         include_anonymous=True,
-                        paging=dict(token=paging_token),
+                        paging=dict(paging_token=paging_token),
                     )
                 )
                 paging_token = result.metadata.next_paging_token
@@ -284,8 +298,8 @@ class MinimalClusterManager(ClusterManager):
     def start_cluster(self, timeout: float = 600.0):
         pass
 
-    def terminate_cluster(self):
+    def terminate_cluster_ex(self, wait: bool = False):
         pass
 
     def get_cluster_address(self) -> str:
-        return f"anyscale://{self.cluster_name}"
+        return f"anyscale://{self.project_name}/{self.cluster_name}"

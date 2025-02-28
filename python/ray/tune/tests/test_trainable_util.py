@@ -1,95 +1,17 @@
 import copy
-from collections import OrderedDict
-import os
-import pytest
 import sys
-import shutil
 import unittest
+from collections import OrderedDict
 from unittest.mock import patch
 
-import ray
-import ray._private.utils
-import ray.cloudpickle as cloudpickle
-from ray.tune.utils.util import wait_for_gpu
-from ray.tune.utils.util import flatten_dict, unflatten_dict, unflatten_list_dict
-from ray.tune.utils.trainable import TrainableUtil
+import pytest
 
-
-@pytest.mark.parametrize(
-    "checkpoint_path",
-    [
-        "~/tmp/exp/trial/checkpoint0",
-        "~/tmp/exp/trial/checkpoint0/",
-        "~/tmp/exp/trial/checkpoint0/checkpoint",
-        "~/tmp/exp/trial/checkpoint0/foo/bar/baz",
-    ],
+from ray.tune.utils.util import (
+    flatten_dict,
+    unflatten_dict,
+    unflatten_list_dict,
+    wait_for_gpu,
 )
-@pytest.mark.parametrize("logdir", ["~/tmp/exp/trial", "~/tmp/exp/trial/"])
-def test_find_rel_checkpoint_dir(checkpoint_path, logdir):
-    assert (
-        TrainableUtil.find_rel_checkpoint_dir(logdir, checkpoint_path) == "checkpoint0/"
-    )
-
-
-class TrainableUtilTest(unittest.TestCase):
-    def setUp(self):
-        self.checkpoint_dir = os.path.join(
-            ray._private.utils.get_user_temp_dir(), "tune", "MyTrainable123"
-        )
-        self.checkpoint_dir = TrainableUtil.make_checkpoint_dir(
-            self.checkpoint_dir, "0"
-        )
-
-    def tearDown(self):
-        self.addCleanup(shutil.rmtree, self.checkpoint_dir)
-        ray.shutdown()
-
-    def testFindMetadata(self):
-        def tune_one(config=None, checkpoint_dir=None):
-            with ray.tune.checkpoint_dir(step=1):
-                pass
-            ray.tune.report(score=1)
-
-        name = "AnalysisTest"
-        ray.init(local_mode=True)
-        ray.tune.run(tune_one, local_dir=self.checkpoint_dir, name=name)
-
-        a = ray.tune.ExperimentAnalysis(
-            os.path.join(self.checkpoint_dir, name),
-            default_metric="score",
-            default_mode="max",
-        )
-        df = a.dataframe()
-        checkpoint_dir = a.get_best_checkpoint(df["logdir"].iloc[0]).local_path
-        assert checkpoint_dir.endswith("/checkpoint_000001/")
-
-    def testFindCheckpointDir(self):
-        checkpoint_path = os.path.join(self.checkpoint_dir, "0/my/nested/chkpt")
-        os.makedirs(checkpoint_path)
-        found_dir = TrainableUtil.find_checkpoint_dir(checkpoint_path)
-        self.assertEqual(self.checkpoint_dir, found_dir)
-
-        with self.assertRaises(FileNotFoundError):
-            parent = os.path.dirname(found_dir)
-            TrainableUtil.find_checkpoint_dir(parent)
-
-    def testPickleCheckpoint(self):
-        for i in range(5):
-            path = os.path.join(self.checkpoint_dir, str(i))
-            with open(path, "w") as f:
-                f.write(str(i))
-
-        checkpoint_path = os.path.join(self.checkpoint_dir, "0")
-
-        data_dict = TrainableUtil.pickle_checkpoint(checkpoint_path)
-        loaded = cloudpickle.loads(data_dict)
-
-        checkpoint_name = os.path.basename(checkpoint_path)
-        self.assertEqual(loaded["checkpoint_name"], checkpoint_name)
-
-        for i in range(5):
-            path = os.path.join(self.checkpoint_dir, str(i))
-            self.assertEqual(loaded["data"][str(i)], open(path, "rb").read())
 
 
 class FlattenDictTest(unittest.TestCase):
@@ -188,6 +110,12 @@ class UnflattenDictTest(unittest.TestCase):
         )
         assert result == [{"a": [{"b": 1}, 2]}, [3, 4, {"c": 5}], 6]
 
+    def test_unflatten_noop(self):
+        """Unflattening an already unflattened dict should be a noop."""
+        unflattened = {"a": 1, "b": {"c": {"d": [1, 2]}, "e": 3}, "f": {"g": 3}}
+        assert unflattened == unflatten_dict(unflattened)
+        assert unflattened == unflatten_list_dict(unflattened)
+
     def test_raises_error_on_key_conflict(self):
         """Ensure that an informative exception is raised on key conflict."""
         with self.assertRaisesRegex(TypeError, r"Cannot unflatten dict"):
@@ -253,6 +181,4 @@ class GPUTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    import pytest
-
     sys.exit(pytest.main(["-v", __file__]))

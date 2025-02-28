@@ -1,3 +1,10 @@
+# @OldAPIStack
+
+# ***********************************************************************************
+# IMPORTANT NOTE: This script uses the old API stack and will soon be replaced by
+# `ray.rllib.examples.multi_agent.pettingzoo_shared_value_function.py`!
+# ***********************************************************************************
+
 """An example of customizing PPO to leverage a centralized critic.
 
 Here the model and policy are hard-coded to implement a centralized critic
@@ -14,35 +21,35 @@ modifies the environment.
 """
 
 import argparse
+from gymnasium.spaces import Discrete
 import numpy as np
-from gym.spaces import Discrete
 import os
 
 import ray
 from ray import tune
-from ray.rllib.agents.maml.maml_torch_policy import KLCoeffMixin as TorchKLCoeffMixin
-from ray.rllib.agents.ppo.ppo import PPOTrainer
-from ray.rllib.agents.ppo.ppo_tf_policy import (
-    PPOTFPolicy,
-    KLCoeffMixin,
-    ppo_surrogate_loss as tf_loss,
+from ray.tune.result import TRAINING_ITERATION
+from ray.rllib.algorithms.ppo.ppo import PPO, PPOConfig
+from ray.rllib.algorithms.ppo.ppo_tf_policy import (
+    PPOTF1Policy,
+    PPOTF2Policy,
 )
-from ray.rllib.agents.ppo.ppo_torch_policy import PPOTorchPolicy
+from ray.rllib.algorithms.ppo.ppo_torch_policy import PPOTorchPolicy
 from ray.rllib.evaluation.postprocessing import compute_advantages, Postprocessing
-from ray.rllib.examples.env.two_step_game import TwoStepGame
-from ray.rllib.examples.models.centralized_critic_models import (
+from ray.rllib.examples.envs.classes.multi_agent.two_step_game import TwoStepGame
+from ray.rllib.examples._old_api_stack.models.centralized_critic_models import (
     CentralizedCriticModel,
     TorchCentralizedCriticModel,
 )
 from ray.rllib.models import ModelCatalog
 from ray.rllib.policy.sample_batch import SampleBatch
-from ray.rllib.policy.tf_policy import LearningRateSchedule, EntropyCoeffSchedule
-from ray.rllib.policy.torch_policy import (
-    LearningRateSchedule as TorchLR,
-    EntropyCoeffSchedule as TorchEntropyCoeffSchedule,
-)
 from ray.rllib.utils.annotations import override
 from ray.rllib.utils.framework import try_import_tf, try_import_torch
+from ray.rllib.utils.metrics import (
+    ENV_RUNNER_RESULTS,
+    EPISODE_RETURN_MEAN,
+    NUM_ENV_STEPS_SAMPLED_LIFETIME,
+)
+from ray.rllib.utils.numpy import convert_to_numpy
 from ray.rllib.utils.test_utils import check_learning_achieved
 from ray.rllib.utils.tf_utils import explained_variance, make_tf_callable
 from ray.rllib.utils.torch_utils import convert_to_torch_tensor
@@ -56,8 +63,8 @@ OPPONENT_ACTION = "opponent_action"
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "--framework",
-    choices=["tf", "tf2", "tfe", "torch"],
-    default="tf",
+    choices=["tf", "tf2", "torch"],
+    default="torch",
     help="The DL framework specifier.",
 )
 parser.add_argument(
@@ -99,7 +106,7 @@ def centralized_critic_postprocessing(
         not pytorch and policy.loss_initialized()
     ):
         assert other_agent_batches is not None
-        [(_, opponent_batch)] = list(other_agent_batches.values())
+        [(_, _, opponent_batch)] = list(other_agent_batches.values())
 
         # also record the opponent obs and actions in the trajectory
         sample_batch[OPPONENT_OBS] = opponent_batch[SampleBatch.CUR_OBS]
@@ -122,10 +129,12 @@ def centralized_critic_postprocessing(
                 .numpy()
             )
         else:
-            sample_batch[SampleBatch.VF_PREDS] = policy.compute_central_vf(
-                sample_batch[SampleBatch.CUR_OBS],
-                sample_batch[OPPONENT_OBS],
-                sample_batch[OPPONENT_ACTION],
+            sample_batch[SampleBatch.VF_PREDS] = convert_to_numpy(
+                policy.compute_central_vf(
+                    sample_batch[SampleBatch.CUR_OBS],
+                    sample_batch[OPPONENT_OBS],
+                    sample_batch[OPPONENT_ACTION],
+                )
             )
     else:
         # Policy hasn't been initialized yet, use zeros.
@@ -135,7 +144,7 @@ def centralized_critic_postprocessing(
             sample_batch[SampleBatch.REWARDS], dtype=np.float32
         )
 
-    completed = sample_batch["dones"][-1]
+    completed = sample_batch[SampleBatch.TERMINATEDS][-1]
     if completed:
         last_r = 0.0
     else:
@@ -152,44 +161,26 @@ def centralized_critic_postprocessing(
 
 
 # Copied from PPO but optimizing the central value function.
-def loss_with_central_critic(policy, model, dist_class, train_batch):
-    CentralizedValueMixin.__init__(policy)
-    func = tf_loss if not policy.config["framework"] == "torch" else PPOTorchPolicy.loss
-
+def loss_with_central_critic(policy, base_policy, model, dist_class, train_batch):
+    # Save original value function.
     vf_saved = model.value_function
+
+    # Calculate loss with a custom value function.
     model.value_function = lambda: policy.model.central_value_function(
         train_batch[SampleBatch.CUR_OBS],
         train_batch[OPPONENT_OBS],
         train_batch[OPPONENT_ACTION],
     )
-
     policy._central_value_out = model.value_function()
-    loss = func(policy, model, dist_class, train_batch)
+    loss = base_policy.loss(model, dist_class, train_batch)
 
+    # Restore original value function.
     model.value_function = vf_saved
 
     return loss
 
 
-def setup_tf_mixins(policy, obs_space, action_space, config):
-    # Copied from PPOTFPolicy (w/o ValueNetworkMixin).
-    KLCoeffMixin.__init__(policy, config)
-    EntropyCoeffSchedule.__init__(
-        policy, config["entropy_coeff"], config["entropy_coeff_schedule"]
-    )
-    LearningRateSchedule.__init__(policy, config["lr"], config["lr_schedule"])
-
-
-def setup_torch_mixins(policy, obs_space, action_space, config):
-    # Copied from PPOTorchPolicy  (w/o ValueNetworkMixin).
-    TorchKLCoeffMixin.__init__(policy, config)
-    TorchEntropyCoeffSchedule.__init__(
-        policy, config["entropy_coeff"], config["entropy_coeff_schedule"]
-    )
-    TorchLR.__init__(policy, config["lr"], config["lr_schedule"])
-
-
-def central_vf_stats(policy, train_batch, grads):
+def central_vf_stats(policy, train_batch):
     # Report the explained variance of the central value function.
     return {
         "vf_explained_var": explained_variance(
@@ -198,29 +189,51 @@ def central_vf_stats(policy, train_batch, grads):
     }
 
 
-CCPPOTFPolicy = PPOTFPolicy.with_updates(
-    name="CCPPOTFPolicy",
-    postprocess_fn=centralized_critic_postprocessing,
-    loss_fn=loss_with_central_critic,
-    before_loss_init=setup_tf_mixins,
-    grad_stats_fn=central_vf_stats,
-    mixins=[
-        LearningRateSchedule,
-        EntropyCoeffSchedule,
-        KLCoeffMixin,
-        CentralizedValueMixin,
-    ],
-)
+def get_ccppo_policy(base):
+    class CCPPOTFPolicy(CentralizedValueMixin, base):
+        def __init__(self, observation_space, action_space, config):
+            base.__init__(self, observation_space, action_space, config)
+            CentralizedValueMixin.__init__(self)
+
+        @override(base)
+        def loss(self, model, dist_class, train_batch):
+            # Use super() to get to the base PPO policy.
+            # This special loss function utilizes a shared
+            # value function defined on self, and the loss function
+            # defined on PPO policies.
+            return loss_with_central_critic(
+                self, super(), model, dist_class, train_batch
+            )
+
+        @override(base)
+        def postprocess_trajectory(
+            self, sample_batch, other_agent_batches=None, episode=None
+        ):
+            return centralized_critic_postprocessing(
+                self, sample_batch, other_agent_batches, episode
+            )
+
+        @override(base)
+        def stats_fn(self, train_batch: SampleBatch):
+            stats = super().stats_fn(train_batch)
+            stats.update(central_vf_stats(self, train_batch))
+            return stats
+
+    return CCPPOTFPolicy
 
 
-class CCPPOTorchPolicy(PPOTorchPolicy):
+CCPPOStaticGraphTFPolicy = get_ccppo_policy(PPOTF1Policy)
+CCPPOEagerTFPolicy = get_ccppo_policy(PPOTF2Policy)
+
+
+class CCPPOTorchPolicy(CentralizedValueMixin, PPOTorchPolicy):
     def __init__(self, observation_space, action_space, config):
-        super().__init__(observation_space, action_space, config)
-        self.compute_central_vf = self.model.central_value_function
+        PPOTorchPolicy.__init__(self, observation_space, action_space, config)
+        CentralizedValueMixin.__init__(self)
 
     @override(PPOTorchPolicy)
     def loss(self, model, dist_class, train_batch):
-        return loss_with_central_critic(self, model, dist_class, train_batch)
+        return loss_with_central_critic(self, super(), model, dist_class, train_batch)
 
     @override(PPOTorchPolicy)
     def postprocess_trajectory(
@@ -231,17 +244,20 @@ class CCPPOTorchPolicy(PPOTorchPolicy):
         )
 
 
-class CCTrainer(PPOTrainer):
-    @override(PPOTrainer)
-    def get_default_policy_class(self, config):
+class CentralizedCritic(PPO):
+    @classmethod
+    @override(PPO)
+    def get_default_policy_class(cls, config):
         if config["framework"] == "torch":
             return CCPPOTorchPolicy
+        elif config["framework"] == "tf":
+            return CCPPOStaticGraphTFPolicy
         else:
-            return CCPPOTFPolicy
+            return CCPPOEagerTFPolicy
 
 
 if __name__ == "__main__":
-    ray.init()
+    ray.init(local_mode=True)
     args = parser.parse_args()
 
     ModelCatalog.register_custom_model(
@@ -251,46 +267,53 @@ if __name__ == "__main__":
         else CentralizedCriticModel,
     )
 
-    config = {
-        "env": TwoStepGame,
-        "batch_mode": "complete_episodes",
-        # Use GPUs iff `RLLIB_NUM_GPUS` env var set to > 0.
-        "num_gpus": int(os.environ.get("RLLIB_NUM_GPUS", "0")),
-        "num_workers": 0,
-        "multiagent": {
-            "policies": {
+    config = (
+        PPOConfig()
+        .api_stack(
+            enable_env_runner_and_connector_v2=False,
+            enable_rl_module_and_learner=False,
+        )
+        .environment(TwoStepGame)
+        .framework(args.framework)
+        .env_runners(batch_mode="complete_episodes", num_env_runners=0)
+        .training(model={"custom_model": "cc_model"})
+        .multi_agent(
+            policies={
                 "pol1": (
                     None,
                     Discrete(6),
                     TwoStepGame.action_space,
-                    {
-                        "framework": args.framework,
-                    },
+                    # `framework` would also be ok here.
+                    PPOConfig.overrides(framework_str=args.framework),
                 ),
                 "pol2": (
                     None,
                     Discrete(6),
                     TwoStepGame.action_space,
-                    {
-                        "framework": args.framework,
-                    },
+                    # `framework` would also be ok here.
+                    PPOConfig.overrides(framework_str=args.framework),
                 ),
             },
-            "policy_mapping_fn": (lambda aid, **kwargs: "pol1" if aid == 0 else "pol2"),
-        },
-        "model": {
-            "custom_model": "cc_model",
-        },
-        "framework": args.framework,
-    }
+            policy_mapping_fn=lambda agent_id, episode, worker, **kwargs: "pol1"
+            if agent_id == 0
+            else "pol2",
+        )
+        # Use GPUs iff `RLLIB_NUM_GPUS` env var set to > 0.
+        .resources(num_gpus=int(os.environ.get("RLLIB_NUM_GPUS", "0")))
+    )
 
     stop = {
-        "training_iteration": args.stop_iters,
-        "timesteps_total": args.stop_timesteps,
-        "episode_reward_mean": args.stop_reward,
+        TRAINING_ITERATION: args.stop_iters,
+        NUM_ENV_STEPS_SAMPLED_LIFETIME: args.stop_timesteps,
+        f"{ENV_RUNNER_RESULTS}/{EPISODE_RETURN_MEAN}": args.stop_reward,
     }
 
-    results = tune.run(CCTrainer, config=config, stop=stop, verbose=1)
+    tuner = tune.Tuner(
+        CentralizedCritic,
+        param_space=config.to_dict(),
+        run_config=tune.RunConfig(stop=stop, verbose=1),
+    )
+    results = tuner.fit()
 
     if args.as_test:
         check_learning_achieved(results, args.stop_reward)

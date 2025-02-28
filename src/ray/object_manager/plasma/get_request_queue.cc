@@ -18,7 +18,8 @@ namespace plasma {
 
 GetRequest::GetRequest(instrumented_io_context &io_context,
                        const std::shared_ptr<ClientInterface> &client,
-                       const std::vector<ObjectID> &object_ids, bool is_from_worker,
+                       const std::vector<ObjectID> &object_ids,
+                       bool is_from_worker,
                        int64_t num_unique_objects_to_wait_for)
     : client(client),
       object_ids(object_ids.begin(), object_ids.end()),
@@ -51,20 +52,27 @@ bool GetRequest::IsRemoved() const { return is_removed_; }
 
 void GetRequestQueue::AddRequest(const std::shared_ptr<ClientInterface> &client,
                                  const std::vector<ObjectID> &object_ids,
-                                 int64_t timeout_ms, bool is_from_worker) {
+                                 int64_t timeout_ms,
+                                 bool is_from_worker) {
   const absl::flat_hash_set<ObjectID> unique_ids(object_ids.begin(), object_ids.end());
   // Create a get request for this object.
-  auto get_request = std::make_shared<GetRequest>(io_context_, client, object_ids,
-                                                  is_from_worker, unique_ids.size());
+  auto get_request = std::make_shared<GetRequest>(
+      io_context_, client, object_ids, is_from_worker, unique_ids.size());
   for (const auto &object_id : unique_ids) {
     // Check if this object is already present
     // locally. If so, record that the object is being used and mark it as accounted for.
     auto entry = object_lifecycle_mgr_.GetObject(object_id);
     if (entry && entry->Sealed()) {
       // Update the get request to take into account the present object.
-      entry->ToPlasmaObject(&get_request->objects[object_id], /* checksealed */ true);
+      auto *plasma_object = &get_request->objects[object_id];
+      entry->ToPlasmaObject(plasma_object, /* checksealed */ true);
       get_request->num_unique_objects_satisfied += 1;
-      object_satisfied_callback_(object_id, get_request);
+
+      std::optional<MEMFD_TYPE> fallback_allocated_fd = std::nullopt;
+      if (entry->GetAllocation().fallback_allocated) {
+        fallback_allocated_fd = entry->GetAllocation().fd;
+      }
+      object_satisfied_callback_(object_id, fallback_allocated_fd, get_request);
     } else {
       // Add a placeholder plasma object to the get request to indicate that the
       // object is not present. This will be parsed by the client. We set the
@@ -162,9 +170,15 @@ void GetRequestQueue::MarkObjectSealed(const ObjectID &object_id) {
     auto get_request = get_requests[index];
     auto entry = object_lifecycle_mgr_.GetObject(object_id);
     RAY_CHECK(entry != nullptr);
-    entry->ToPlasmaObject(&get_request->objects[object_id], /* check sealed */ true);
+    auto *plasma_object = &get_request->objects[object_id];
+    entry->ToPlasmaObject(plasma_object, /* check sealed */ true);
     get_request->num_unique_objects_satisfied += 1;
-    object_satisfied_callback_(object_id, get_request);
+
+    std::optional<MEMFD_TYPE> fallback_allocated_fd = std::nullopt;
+    if (entry->GetAllocation().fallback_allocated) {
+      fallback_allocated_fd = entry->GetAllocation().fd;
+    }
+    object_satisfied_callback_(object_id, fallback_allocated_fd, get_request);
     // If this get request is done, reply to the client.
     if (get_request->num_unique_objects_satisfied ==
         get_request->num_unique_objects_to_wait_for) {

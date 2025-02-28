@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdlib>
 #include <iostream>
+#include <limits>
 
 #include "gflags/gflags.h"
 #include "ray/common/ray_config.h"
@@ -20,26 +22,81 @@
 #include "ray/gcs/store_client/redis_store_client.h"
 #include "ray/stats/stats.h"
 #include "ray/util/event.h"
+#include "ray/util/stream_redirection_options.h"
+#include "ray/util/stream_redirection_utils.h"
 #include "ray/util/util.h"
 #include "src/ray/protobuf/gcs_service.pb.h"
 
 DEFINE_string(redis_address, "", "The ip address of redis.");
+DEFINE_bool(redis_enable_ssl, false, "Use tls/ssl in redis connection.");
 DEFINE_int32(redis_port, -1, "The port of redis.");
 DEFINE_string(log_dir, "", "The path of the dir where log files are created.");
+DEFINE_string(ray_log_filepath,
+              "",
+              "The log filepath to dump gcs server log, which is written via `RAY_LOG`.");
+DEFINE_string(
+    ray_err_log_filepath,
+    "",
+    "The filepath to dump gcs server error log, which is written via `RAY_LOG`.");
 DEFINE_int32(gcs_server_port, 0, "The port of gcs server.");
 DEFINE_int32(metrics_agent_port, -1, "The port of metrics agent.");
 DEFINE_string(config_list, "", "The config list of raylet.");
-DEFINE_string(redis_password, "", "The password of redis.");
-DEFINE_bool(retry_redis, false, "Whether we retry to connect to the redis.");
-DEFINE_string(node_ip_address, "", "The ip address of the node.");
+DEFINE_string(redis_username, "", "The username of Redis.");
+DEFINE_string(redis_password, "", "The password of Redis.");
+DEFINE_bool(retry_redis, false, "Whether to retry to connect to Redis.");
+DEFINE_string(node_ip_address, "", "The IP address of the node.");
+DEFINE_string(session_name,
+              "",
+              "session_name: The session name (ClusterID) of the cluster.");
+DEFINE_string(ray_commit, "", "The commit hash of Ray.");
 
 int main(int argc, char *argv[]) {
-  InitShutdownRAII ray_log_shutdown_raii(ray::RayLog::StartRayLog,
-                                         ray::RayLog::ShutDownRayLog, argv[0],
-                                         ray::RayLogLevel::INFO, /*log_dir=*/"");
-  ray::RayLog::InstallFailureSignalHandler(argv[0]);
-
   gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+  if (!FLAGS_ray_log_filepath.empty()) {
+    ray::StreamRedirectionOption stdout_redirection_options;
+    stdout_redirection_options.file_path = FLAGS_ray_log_filepath;
+    stdout_redirection_options.rotation_max_size =
+        ray::RayLog::GetRayLogRotationMaxBytesOrDefault();
+    stdout_redirection_options.rotation_max_file_count =
+        ray::RayLog::GetRayLogRotationBackupCountOrDefault();
+    ray::RedirectStdout(stdout_redirection_options);
+  }
+
+  if (!FLAGS_ray_err_log_filepath.empty()) {
+    ray::StreamRedirectionOption stderr_redirection_options;
+    stderr_redirection_options.file_path = FLAGS_ray_err_log_filepath;
+    stderr_redirection_options.rotation_max_size =
+        ray::RayLog::GetRayLogRotationMaxBytesOrDefault();
+    stderr_redirection_options.rotation_max_file_count =
+        ray::RayLog::GetRayLogRotationBackupCountOrDefault();
+    ray::RedirectStderr(stderr_redirection_options);
+  }
+
+  // Backward compatibility notes:
+  // By default, GCS server flushes all logging and stdout/stderr to a single file called
+  // `gcs_server.out`, without log rotations. To keep backward compatibility at best
+  // effort, we use the same filename as output, and disable log rotation by default.
+
+  // For compatibility, by default GCS server dumps logging into a single file with no
+  // rotation.
+  InitShutdownRAII ray_log_shutdown_raii(
+      ray::RayLog::StartRayLog,
+      ray::RayLog::ShutDownRayLog,
+      argv[0],
+      ray::RayLogLevel::INFO,
+      /*log_filepath=*/"",
+      /*err_log_filepath=*/"",
+      /*log_rotation_max_size=*/std::numeric_limits<size_t>::max(),
+      /*log_rotation_file_num=*/1);
+  ray::RayLog::InstallFailureSignalHandler(argv[0]);
+  ray::RayLog::InstallTerminateHandler();
+
+  RAY_LOG(INFO)
+          .WithField("ray_version", kRayVersion)
+          .WithField("ray_commit", FLAGS_ray_commit)
+      << "Ray cluster metadata";
+
   const std::string redis_address = FLAGS_redis_address;
   const int redis_port = static_cast<int>(FLAGS_redis_port);
   const std::string log_dir = FLAGS_log_dir;
@@ -49,29 +106,48 @@ int main(int argc, char *argv[]) {
   RAY_CHECK(absl::Base64Unescape(FLAGS_config_list, &config_list))
       << "config_list is not a valid base64-encoded string.";
   const std::string redis_password = FLAGS_redis_password;
+  const std::string redis_username = FLAGS_redis_username;
   const bool retry_redis = FLAGS_retry_redis;
   const std::string node_ip_address = FLAGS_node_ip_address;
+  const std::string session_name = FLAGS_session_name;
   gflags::ShutDownCommandLineFlags();
 
   RayConfig::instance().initialize(config_list);
+  ray::asio::testing::init();
+  ray::rpc::testing::init();
 
   // IO Service for main loop.
-  instrumented_io_context main_service;
+  SetThreadName("gcs_server");
+  instrumented_io_context main_service(/*enable_lag_probe=*/true);
   // Ensure that the IO service keeps running. Without this, the main_service will exit
   // as soon as there is no more work to be processed.
   boost::asio::io_service::work work(main_service);
 
-  const ray::stats::TagsType global_tags = {
-      {ray::stats::ComponentKey, "gcs_server"},
-      {ray::stats::VersionKey, kRayVersion},
-      {ray::stats::NodeAddressKey, node_ip_address}};
-  ray::stats::Init(global_tags, metrics_agent_port);
+  ray::stats::enable_grpc_metrics_collection_if_needed("gcs");
+
+  const ray::stats::TagsType global_tags = {{ray::stats::ComponentKey, "gcs_server"},
+                                            {ray::stats::WorkerIdKey, ""},
+                                            {ray::stats::VersionKey, kRayVersion},
+                                            {ray::stats::NodeAddressKey, node_ip_address},
+                                            {ray::stats::SessionNameKey, session_name}};
+  ray::stats::Init(global_tags, metrics_agent_port, WorkerID::Nil());
 
   // Initialize event framework.
   if (RayConfig::instance().event_log_reporter_enabled() && !log_dir.empty()) {
-    ray::RayEventInit(ray::rpc::Event_SourceType::Event_SourceType_GCS,
-                      std::unordered_map<std::string, std::string>(), log_dir,
-                      RayConfig::instance().event_level());
+    // This GCS server process emits GCS standard events, and
+    // Node, Actor, and Driver Job export events
+    // so the various source types are passed to RayEventInit. The type of an
+    // event is determined by the schema of its event data.
+    const std::vector<ray::SourceTypeVariant> source_types = {
+        ray::rpc::Event_SourceType::Event_SourceType_GCS,
+        ray::rpc::ExportEvent_SourceType::ExportEvent_SourceType_EXPORT_NODE,
+        ray::rpc::ExportEvent_SourceType_EXPORT_ACTOR,
+        ray::rpc::ExportEvent_SourceType::ExportEvent_SourceType_EXPORT_DRIVER_JOB};
+    ray::RayEventInit(source_types,
+                      absl::flat_hash_map<std::string, std::string>(),
+                      log_dir,
+                      RayConfig::instance().event_level(),
+                      RayConfig::instance().emit_event_to_log_file());
   }
 
   ray::gcs::GcsServerConfig gcs_server_config;
@@ -81,12 +157,14 @@ int main(int argc, char *argv[]) {
       RayConfig::instance().gcs_server_rpc_server_thread_num();
   gcs_server_config.redis_address = redis_address;
   gcs_server_config.redis_port = redis_port;
+  gcs_server_config.enable_redis_ssl = FLAGS_redis_enable_ssl;
   gcs_server_config.redis_password = redis_password;
+  gcs_server_config.redis_username = redis_username;
   gcs_server_config.retry_redis = retry_redis;
   gcs_server_config.node_ip_address = node_ip_address;
-  gcs_server_config.grpc_pubsub_enabled = RayConfig::instance().gcs_grpc_based_pubsub();
   gcs_server_config.log_dir = log_dir;
   gcs_server_config.raylet_config_list = config_list;
+  gcs_server_config.session_name = session_name;
   ray::gcs::GcsServer gcs_server(gcs_server_config, main_service);
 
   // Destroy the GCS server on a SIGTERM. The pointer to main_service is
@@ -95,9 +173,10 @@ int main(int argc, char *argv[]) {
   auto handler = [&main_service, &gcs_server](const boost::system::error_code &error,
                                               int signal_number) {
     RAY_LOG(INFO) << "GCS server received SIGTERM, shutting down...";
+    main_service.stop();
+    ray::rpc::DrainServerCallExecutor();
     gcs_server.Stop();
     ray::stats::Shutdown();
-    main_service.stop();
   };
   boost::asio::signal_set signals(main_service);
 #ifdef _WIN32

@@ -18,7 +18,9 @@
 #include <grpcpp/resource_quota.h>
 #include <grpcpp/support/channel_arguments.h>
 
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "ray/common/status.h"
 #include "ray/rpc/grpc_client.h"
@@ -37,16 +39,19 @@ class ObjectManagerClient {
   /// \param[in] address Address of the node manager server.
   /// \param[in] port Port of the node manager server.
   /// \param[in] client_call_manager The `ClientCallManager` used for managing requests.
-  ObjectManagerClient(const std::string &address, const int port,
-                      ClientCallManager &client_call_manager, int num_connections = 4)
+  ObjectManagerClient(const std::string &address,
+                      const int port,
+                      ClientCallManager &client_call_manager,
+                      int num_connections =
+                          ::RayConfig::instance().object_manager_client_connection_num())
       : num_connections_(num_connections) {
-    push_rr_index_ = rand() % num_connections_;
-    pull_rr_index_ = rand() % num_connections_;
-    freeobjects_rr_index_ = rand() % num_connections_;
+    push_rr_index_ = std::rand() % num_connections_;
+    pull_rr_index_ = std::rand() % num_connections_;
+    freeobjects_rr_index_ = std::rand() % num_connections_;
     grpc_clients_.reserve(num_connections_);
     for (int i = 0; i < num_connections_; i++) {
-      grpc_clients_.emplace_back(new GrpcClient<ObjectManagerService>(
-          address, port, client_call_manager, num_connections_));
+      grpc_clients_.emplace_back(
+          new GrpcClient<ObjectManagerService>(address, port, client_call_manager));
     }
   };
 
@@ -54,7 +59,8 @@ class ObjectManagerClient {
   ///
   /// \param request The request message.
   /// \param callback The callback function that handles reply from server
-  VOID_RPC_CLIENT_METHOD(ObjectManagerService, Push,
+  VOID_RPC_CLIENT_METHOD(ObjectManagerService,
+                         Push,
                          grpc_clients_[push_rr_index_++ % num_connections_],
                          /*method_timeout_ms*/ -1, )
 
@@ -62,7 +68,8 @@ class ObjectManagerClient {
   ///
   /// \param request The request message
   /// \param callback The callback function that handles reply from server
-  VOID_RPC_CLIENT_METHOD(ObjectManagerService, Pull,
+  VOID_RPC_CLIENT_METHOD(ObjectManagerService,
+                         Pull,
                          grpc_clients_[pull_rr_index_++ % num_connections_],
                          /*method_timeout_ms*/ -1, )
 
@@ -70,7 +77,8 @@ class ObjectManagerClient {
   ///
   /// \param request The request message
   /// \param callback  The callback function that handles reply
-  VOID_RPC_CLIENT_METHOD(ObjectManagerService, FreeObjects,
+  VOID_RPC_CLIENT_METHOD(ObjectManagerService,
+                         FreeObjects,
                          grpc_clients_[freeobjects_rr_index_++ % num_connections_],
                          /*method_timeout_ms*/ -1, )
 
